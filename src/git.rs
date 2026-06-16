@@ -1,0 +1,1127 @@
+// Flavio
+//
+// Git-based Content Management System
+// Copyright: 2026, Valerian Saliou <valerian@valeriansaliou.name>
+// License: Mozilla Public License v2.0 (MPL v2.0)
+
+use chrono::{DateTime, Utc};
+use git2::{Delta, DiffFindOptions, DiffFormat, DiffOptions, Oid, Repository, Signature, Sort};
+use serde::Serialize;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use crate::error::AppError;
+
+/// A node in the repository file tree returned by the list endpoint.
+/// Serialises with a `"type"` discriminant field so clients can distinguish
+/// files from directories without inspecting the presence of `children`.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TreeNode {
+    File {
+        name: String,
+        size: usize,
+    },
+    Directory {
+        name: String,
+        children: Vec<TreeNode>,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommitAuthor {
+    pub name: String,
+    pub email: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommitSummary {
+    pub sha: String,
+    pub message: String,
+    pub author: CommitAuthor,
+    pub committed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommitDetail {
+    pub sha: String,
+    pub message: String,
+    pub author: CommitAuthor,
+    pub committed_at: DateTime<Utc>,
+    pub files: Vec<CommitFileDetail>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommitFileDetail {
+    pub path: String,
+    /// "created" | "updated" | "deleted" | "moved"
+    pub change: String,
+    /// Only present for moved files — the previous path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_path: Option<String>,
+    /// Full file content at this commit. Empty string for deleted files.
+    pub content: String,
+    /// Unified diff for this file.
+    pub diff: String,
+}
+
+/// Describes a single file change that occurred in a commit.
+/// Used internally to drive hook delivery.
+#[derive(Debug, Clone)]
+pub enum FileChange {
+    Created {
+        path: String,
+        content: String,
+    },
+    Updated {
+        path: String,
+        content: String,
+    },
+    Deleted {
+        path: String,
+    },
+    Moved {
+        from_path: String,
+        to_path: String,
+        content: String,
+    },
+}
+
+/// Internal record used while building per-file commit details.
+struct DeltaRecord {
+    status: Delta,
+    old_oid: Oid,
+    new_oid: Oid,
+    old_path: Option<PathBuf>,
+    new_path: Option<PathBuf>,
+}
+
+/// Removes `.git/index.lock` if it is older than the configured threshold.
+/// A stale lock is left behind when a process is killed mid-operation.
+pub fn cleanup_stale_index_lock(repo_path: &Path) -> Result<(), AppError> {
+    const STALE_LOCK_THRESHOLD_SECS: u64 = 30;
+
+    let lock_path = repo_path.join(".git").join("index.lock");
+
+    let metadata = match std::fs::metadata(&lock_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(AppError::Io(err)),
+    };
+
+    let modified_time = metadata.modified()?;
+
+    let lock_age = std::time::SystemTime::now()
+        .duration_since(modified_time)
+        .unwrap_or_default();
+
+    if lock_age.as_secs() > STALE_LOCK_THRESHOLD_SECS {
+        tracing::warn!(
+            "Removing stale git lock file at {:?} (age: {}s)",
+            lock_path,
+            lock_age.as_secs()
+        );
+
+        if let Err(err) = std::fs::remove_file(&lock_path) {
+            // Another worker may have cleaned the lock in the meantime.
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(AppError::Io(err));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Walks `repos_root` once on startup and removes any leftover `.git/index.lock`
+/// regardless of age — no live operation can hold a lock at boot.
+pub fn cleanup_all_stale_locks(repos_root: &Path) {
+    let read_dir = match std::fs::read_dir(repos_root) {
+        Ok(read_dir) => read_dir,
+        Err(_) => return,
+    };
+
+    for dir_entry_result in read_dir {
+        let Ok(dir_entry) = dir_entry_result else {
+            continue;
+        };
+
+        let lock_path = dir_entry.path().join(".git").join("index.lock");
+
+        if lock_path.exists() {
+            tracing::warn!(
+                "Removing stale git lock file found on startup: {:?}",
+                lock_path
+            );
+
+            if let Err(remove_err) = std::fs::remove_file(&lock_path) {
+                tracing::error!(
+                    "Failed to remove stale lock {:?}: {}",
+                    lock_path,
+                    remove_err
+                );
+            }
+        }
+    }
+}
+
+/// Repository helper to generate a Git authorship signature.
+fn git_signature<'a>(
+    author_name: &'a str,
+    author_email: &'a str,
+) -> Result<Signature<'a>, AppError> {
+    if author_name.trim().is_empty() {
+        return Err(AppError::InvalidOperation {
+            reason: "author.name must not be empty".to_string(),
+        });
+    }
+    if author_email.trim().is_empty() {
+        return Err(AppError::InvalidOperation {
+            reason: "author.email must not be empty".to_string(),
+        });
+    }
+
+    tracing::trace!(author_name = %author_name, author_email = %author_email, "creating git signature");
+
+    Signature::now(author_name, author_email).map_err(AppError::Git)
+}
+
+/// Repository helper to convert a timestamp from a Git time.
+fn timestamp_from_git_time(git_time: git2::Time) -> DateTime<Utc> {
+    DateTime::from_timestamp(git_time.seconds(), 0).unwrap_or(DateTime::UNIX_EPOCH)
+}
+
+/// Opens an existing tenant repository, mapping a missing directory to a
+/// 404-friendly `TenantNotFound` error rather than a generic git failure.
+fn open_tenant_repo(repo_path: &Path, tenant_id: &str) -> Result<Repository, AppError> {
+    if !repo_path.exists() {
+        tracing::debug!(
+            tenant_id = %tenant_id,
+            "tenant repository not found"
+        );
+
+        return Err(AppError::TenantNotFound {
+            tenant_id: tenant_id.to_string(),
+        });
+    }
+
+    tracing::trace!(tenant_id = %tenant_id, path = %repo_path.display(), "opening tenant repository");
+
+    Repository::open(repo_path).map_err(AppError::Git)
+}
+
+/// Opens an existing repo or initialises a new one with an empty root commit
+/// so that HEAD is always valid for subsequent operations.
+pub fn open_or_init_repo(
+    repo_path: &Path,
+    author_name: &str,
+    author_email: &str,
+) -> Result<Repository, AppError> {
+    if repo_path.join(".git").exists() {
+        tracing::trace!(path = %repo_path.display(), "opening existing repository");
+
+        return Repository::open(repo_path).map_err(AppError::Git);
+    }
+
+    tracing::info!(path = %repo_path.display(), "initialising new tenant repository");
+
+    std::fs::create_dir_all(repo_path)?;
+
+    let repo = Repository::init(repo_path)?;
+    let signature = git_signature(author_name, author_email)?;
+
+    // An empty tree is required for the root commit so that HEAD is valid.
+    tracing::trace!(path = %repo_path.display(), "writing empty tree for root commit");
+
+    let empty_tree_id = {
+        let mut index = repo.index()?;
+        index.write_tree()?
+    };
+    let empty_tree = repo.find_tree(empty_tree_id)?;
+
+    let root_oid = repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        "chore: initialize",
+        &empty_tree,
+        &[],
+    )?;
+
+    tracing::debug!(path = %repo_path.display(), sha = %root_oid, "root commit created");
+
+    drop(empty_tree);
+
+    Ok(repo)
+}
+
+/// Reads a blob's content from `tree` at `file_path` and decodes it as UTF-8.
+fn blob_content_from_tree(
+    repo: &Repository,
+    tree: &git2::Tree<'_>,
+    file_path: &str,
+) -> Result<String, AppError> {
+    tracing::trace!(path = %file_path, "reading blob from tree");
+
+    let tree_entry =
+        tree.get_path(Path::new(file_path))
+            .map_err(|_err| AppError::FileNotFound {
+                path: file_path.to_string(),
+            })?;
+
+    let blob = repo.find_blob(tree_entry.id())?;
+
+    tracing::trace!(path = %file_path, blob_id = %tree_entry.id(), size = blob.size(), "blob found");
+
+    std::str::from_utf8(blob.content())
+        .map(|text| text.to_string())
+        .map_err(|_err| AppError::InvalidUtf8 {
+            path: file_path.to_string(),
+        })
+}
+
+/// Returns the file content as recorded in HEAD's tree (not from the working
+/// tree) so the response always reflects the last successfully committed state.
+pub fn read_file(repo_path: &Path, tenant_id: &str, file_path: &str) -> Result<String, AppError> {
+    tracing::debug!(tenant_id = %tenant_id, path = %file_path, "reading file");
+
+    let repo = open_tenant_repo(repo_path, tenant_id)?;
+    let head_commit = repo.head()?.peel_to_commit()?;
+
+    tracing::trace!(tenant_id = %tenant_id, path = %file_path, head_sha = %head_commit.id(), "resolved HEAD for read");
+
+    let head_tree = head_commit.tree()?;
+
+    blob_content_from_tree(&repo, &head_tree, file_path)
+}
+
+pub fn list_files(repo_path: &Path, tenant_id: &str) -> Result<Vec<TreeNode>, AppError> {
+    tracing::debug!(tenant_id = %tenant_id, "listing files");
+
+    let repo = open_tenant_repo(repo_path, tenant_id)?;
+    let head_commit = repo.head()?.peel_to_commit()?;
+
+    tracing::trace!(tenant_id = %tenant_id, head_sha = %head_commit.id(), "resolved HEAD for file listing");
+
+    let head_tree = head_commit.tree()?;
+
+    // Collect flat (path, size) pairs first, then build the tree in one pass.
+    let mut flat: Vec<(String, usize)> = Vec::new();
+
+    head_tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+        if entry.kind() != Some(git2::ObjectType::Blob) {
+            return git2::TreeWalkResult::Ok;
+        }
+
+        let name = entry.name().unwrap_or("");
+        let path = format!("{}{}", root, name);
+
+        let size = repo
+            .find_blob(entry.id())
+            .map(|blob| blob.size())
+            .unwrap_or(0);
+
+        tracing::trace!(tenant_id = %tenant_id, path = %path, size = size, "indexed file entry");
+
+        flat.push((path, size));
+
+        git2::TreeWalkResult::Ok
+    })?;
+
+    tracing::debug!(tenant_id = %tenant_id, count = flat.len(), "file listing complete, building tree");
+
+    Ok(build_tree(flat))
+}
+
+/// Builds a recursive `TreeNode` tree from a flat list of (path, size) pairs.
+/// Directories are sorted before files at each level; entries within each
+/// group are sorted alphabetically. Uses `BTreeMap` to keep insertion order
+/// deterministic regardless of the order git walks the tree.
+fn build_tree(flat: Vec<(String, usize)>) -> Vec<TreeNode> {
+    // Intermediate mutable tree built from BTreeMaps before serialisation.
+    enum NodeBuilder {
+        File(usize),
+        Dir(BTreeMap<String, NodeBuilder>),
+    }
+
+    fn insert(dir: &mut BTreeMap<String, NodeBuilder>, components: &[&str], size: usize) {
+        match components {
+            [] => {}
+            [name] => {
+                dir.insert(name.to_string(), NodeBuilder::File(size));
+            }
+            [name, rest @ ..] => {
+                let child = dir
+                    .entry(name.to_string())
+                    .or_insert_with(|| NodeBuilder::Dir(BTreeMap::new()));
+
+                if let NodeBuilder::Dir(children) = child {
+                    insert(children, rest, size);
+                }
+            }
+        }
+    }
+
+    fn convert(name: String, node: NodeBuilder) -> TreeNode {
+        match node {
+            NodeBuilder::File(size) => TreeNode::File { name, size },
+            NodeBuilder::Dir(children) => {
+                // Directories first, then files; each group sorted by name.
+                let mut dirs: Vec<TreeNode> = Vec::new();
+                let mut files: Vec<TreeNode> = Vec::new();
+
+                for (child_name, child_node) in children {
+                    match child_node {
+                        NodeBuilder::Dir(_) => dirs.push(convert(child_name, child_node)),
+                        NodeBuilder::File(_) => files.push(convert(child_name, child_node)),
+                    }
+                }
+
+                TreeNode::Directory {
+                    name,
+                    children: dirs.into_iter().chain(files).collect(),
+                }
+            }
+        }
+    }
+
+    let mut root: BTreeMap<String, NodeBuilder> = BTreeMap::new();
+
+    for (path, size) in flat {
+        let components: Vec<&str> = path.split('/').collect();
+        insert(&mut root, &components, size);
+    }
+
+    let mut dirs: Vec<TreeNode> = Vec::new();
+    let mut files: Vec<TreeNode> = Vec::new();
+
+    for (name, node) in root {
+        match node {
+            NodeBuilder::Dir(_) => dirs.push(convert(name, node)),
+            NodeBuilder::File(_) => files.push(convert(name, node)),
+        }
+    }
+
+    dirs.into_iter().chain(files).collect()
+}
+
+/// Writes a file to disk, stages it, and creates a commit.
+/// Returns the commit SHA and the type of change (created vs updated).
+pub fn write_file(
+    repo_path: &Path,
+    file_path: &str,
+    content: &str,
+    commit_message: Option<&str>,
+    author_name: &str,
+    author_email: &str,
+) -> Result<(String, FileChange), AppError> {
+    tracing::debug!(path = %file_path, author_name = %author_name, author_email = %author_email, "writing file");
+
+    cleanup_stale_index_lock(repo_path)?;
+
+    let repo = open_or_init_repo(repo_path, author_name, author_email)?;
+
+    let absolute_path = repo_path.join(file_path);
+    let is_new_file = !absolute_path.exists();
+
+    tracing::debug!(path = %file_path, is_new_file = is_new_file, "staging file write");
+
+    if let Some(parent_dir) = absolute_path.parent() {
+        std::fs::create_dir_all(parent_dir)?;
+    }
+
+    std::fs::write(&absolute_path, content)?;
+
+    let mut index = repo.index()?;
+
+    tracing::trace!(path = %file_path, "adding path to git index");
+
+    index.add_path(Path::new(file_path))?;
+    index.write()?;
+
+    let tree_id = index.write_tree()?;
+    let tree = repo.find_tree(tree_id)?;
+    let parent_commit = repo.head()?.peel_to_commit()?;
+
+    let signature = git_signature(author_name, author_email)?;
+
+    let auto_message = if is_new_file {
+        format!("create: {}", file_path)
+    } else {
+        format!("update: {}", file_path)
+    };
+
+    let message = commit_message.unwrap_or(&auto_message);
+
+    tracing::trace!(path = %file_path, message = %message, "committing file write");
+
+    let commit_oid = repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        message,
+        &tree,
+        &[&parent_commit],
+    )?;
+
+    tracing::debug!(
+        path = %file_path,
+        sha = %commit_oid,
+        is_new_file = is_new_file,
+        "file write committed"
+    );
+
+    let change = if is_new_file {
+        FileChange::Created {
+            path: file_path.to_string(),
+            content: content.to_string(),
+        }
+    } else {
+        FileChange::Updated {
+            path: file_path.to_string(),
+            content: content.to_string(),
+        }
+    };
+
+    Ok((commit_oid.to_string(), change))
+}
+
+/// Removes a file from disk, stages the deletion, and creates a commit.
+pub fn delete_file(
+    repo_path: &Path,
+    tenant_id: &str,
+    file_path: &str,
+    commit_message: Option<&str>,
+    author_name: &str,
+    author_email: &str,
+) -> Result<(String, FileChange), AppError> {
+    tracing::debug!(tenant_id = %tenant_id, path = %file_path, author_name = %author_name, author_email = %author_email, "deleting file");
+
+    cleanup_stale_index_lock(repo_path)?;
+
+    let repo = open_tenant_repo(repo_path, tenant_id)?;
+
+    let absolute_path = repo_path.join(file_path);
+
+    if !absolute_path.exists() {
+        tracing::debug!(tenant_id = %tenant_id, path = %file_path, "file not found for deletion");
+
+        return Err(AppError::FileNotFound {
+            path: file_path.to_string(),
+        });
+    }
+
+    let mut index = repo.index()?;
+
+    // Remove from the index first; if the path was never tracked, surface that
+    // before we touch the working tree.
+    tracing::trace!(tenant_id = %tenant_id, path = %file_path, "removing path from git index");
+
+    index.remove_path(Path::new(file_path))?;
+
+    std::fs::remove_file(&absolute_path)?;
+
+    index.write()?;
+
+    let tree_id = index.write_tree()?;
+    let tree = repo.find_tree(tree_id)?;
+    let parent_commit = repo.head()?.peel_to_commit()?;
+
+    let signature = git_signature(author_name, author_email)?;
+
+    let auto_message = format!("delete: {}", file_path);
+    let message = commit_message.unwrap_or(&auto_message);
+
+    tracing::trace!(tenant_id = %tenant_id, path = %file_path, message = %message, "committing file deletion");
+
+    let commit_oid = repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        message,
+        &tree,
+        &[&parent_commit],
+    )?;
+
+    tracing::debug!(tenant_id = %tenant_id, path = %file_path, sha = %commit_oid, "file deletion committed");
+
+    Ok((
+        commit_oid.to_string(),
+        FileChange::Deleted {
+            path: file_path.to_string(),
+        },
+    ))
+}
+
+/// Renames a file on disk, stages both sides, and creates a single commit.
+/// This preserves rename semantics so hook receivers know an entity was moved.
+pub fn move_file(
+    repo_path: &Path,
+    tenant_id: &str,
+    from_path: &str,
+    to_path: &str,
+    commit_message: Option<&str>,
+    author_name: &str,
+    author_email: &str,
+) -> Result<(String, FileChange), AppError> {
+    tracing::debug!(
+        tenant_id = %tenant_id,
+        from_path = %from_path,
+        to_path = %to_path,
+        author_email = %author_email,
+        "moving file"
+    );
+
+    cleanup_stale_index_lock(repo_path)?;
+
+    let repo = open_tenant_repo(repo_path, tenant_id)?;
+
+    if from_path == to_path {
+        tracing::debug!(tenant_id = %tenant_id, path = %from_path, "move rejected: source and destination are identical");
+
+        return Err(AppError::InvalidOperation {
+            reason: "destination must differ from source path".to_string(),
+        });
+    }
+
+    let absolute_from = repo_path.join(from_path);
+    let absolute_to = repo_path.join(to_path);
+
+    if !absolute_from.exists() {
+        tracing::debug!(tenant_id = %tenant_id, from_path = %from_path, "source file not found for move");
+
+        return Err(AppError::FileNotFound {
+            path: from_path.to_string(),
+        });
+    }
+
+    // Refuse to clobber an existing destination — the user must delete first.
+    if absolute_to.exists() {
+        tracing::debug!(tenant_id = %tenant_id, to_path = %to_path, "move rejected: destination already exists");
+
+        return Err(AppError::InvalidOperation {
+            reason: format!("destination already exists: {}", to_path),
+        });
+    }
+
+    if let Some(parent_dir) = absolute_to.parent() {
+        std::fs::create_dir_all(parent_dir)?;
+    }
+
+    std::fs::rename(&absolute_from, &absolute_to)?;
+
+    let content = std::fs::read_to_string(&absolute_to)?;
+
+    let mut index = repo.index()?;
+
+    tracing::trace!(
+        tenant_id = %tenant_id,
+        from_path = %from_path,
+        to_path = %to_path,
+        "updating git index for move"
+    );
+
+    index.remove_path(Path::new(from_path))?;
+    index.add_path(Path::new(to_path))?;
+    index.write()?;
+
+    let tree_id = index.write_tree()?;
+    let tree = repo.find_tree(tree_id)?;
+    let parent_commit = repo.head()?.peel_to_commit()?;
+
+    let signature = git_signature(author_name, author_email)?;
+
+    let auto_message = format!("move: {} -> {}", from_path, to_path);
+    let message = commit_message.unwrap_or(&auto_message);
+
+    tracing::trace!(
+        tenant_id = %tenant_id,
+        from_path = %from_path,
+        to_path = %to_path,
+        message = %message,
+        "committing file move"
+    );
+
+    let commit_oid = repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        message,
+        &tree,
+        &[&parent_commit],
+    )?;
+
+    tracing::debug!(
+        tenant_id = %tenant_id,
+        from_path = %from_path,
+        to_path = %to_path,
+        sha = %commit_oid,
+        "file move committed"
+    );
+
+    Ok((
+        commit_oid.to_string(),
+        FileChange::Moved {
+            from_path: from_path.to_string(),
+            to_path: to_path.to_string(),
+            content,
+        },
+    ))
+}
+
+/// Lists commit history.
+pub fn list_commits(
+    repo_path: &Path,
+    tenant_id: &str,
+    page: usize,
+    per_page: usize,
+) -> Result<Vec<CommitSummary>, AppError> {
+    tracing::debug!(tenant_id = %tenant_id, page = page, per_page = per_page, "listing commits");
+
+    let repo = open_tenant_repo(repo_path, tenant_id)?;
+
+    let mut revwalk = repo.revwalk()?;
+
+    revwalk.push_head()?;
+
+    // TIME | TOPOLOGICAL gives stable ordering across commits sharing a timestamp.
+    revwalk.set_sorting(Sort::TIME | Sort::TOPOLOGICAL)?;
+
+    let skip_count = page.saturating_sub(1).saturating_mul(per_page);
+
+    tracing::trace!(tenant_id = %tenant_id, skip_count = skip_count, per_page = per_page, "walking commit graph");
+
+    let commits: Vec<CommitSummary> = revwalk
+        .skip(skip_count)
+        .take(per_page)
+        .filter_map(|oid_result| oid_result.ok())
+        .filter_map(|oid| repo.find_commit(oid).ok())
+        .map(|commit| CommitSummary {
+            sha: commit.id().to_string(),
+            message: commit.message().unwrap_or("").to_string(),
+            author: CommitAuthor {
+                name: commit.author().name().unwrap_or("").to_string(),
+                email: commit.author().email().unwrap_or("").to_string(),
+            },
+            committed_at: timestamp_from_git_time(commit.time()),
+        })
+        .collect();
+
+    tracing::debug!(tenant_id = %tenant_id, page = page, returned = commits.len(), "commit listing complete");
+
+    Ok(commits)
+}
+
+/// Gets a commit.
+pub fn get_commit(repo_path: &Path, tenant_id: &str, sha: &str) -> Result<CommitDetail, AppError> {
+    tracing::debug!(tenant_id = %tenant_id, sha = %sha, "fetching commit detail");
+
+    let repo = open_tenant_repo(repo_path, tenant_id)?;
+
+    let object = repo
+        .revparse_single(sha)
+        .map_err(|_err| AppError::CommitNotFound {
+            sha: sha.to_string(),
+        })?;
+
+    let commit = object
+        .peel_to_commit()
+        .map_err(|_err| AppError::CommitNotFound {
+            sha: sha.to_string(),
+        })?;
+
+    let commit_tree = commit.tree()?;
+
+    let parent_tree = if commit.parent_count() > 0 {
+        Some(commit.parent(0)?.tree()?)
+    } else {
+        None
+    };
+
+    tracing::trace!(
+        tenant_id = %tenant_id,
+        sha = %sha,
+        has_parent = parent_tree.is_some(),
+        "diffing commit against parent"
+    );
+
+    let mut diff_options = DiffOptions::new();
+
+    diff_options.include_untracked(false);
+
+    let mut diff = repo.diff_tree_to_tree(
+        parent_tree.as_ref(),
+        Some(&commit_tree),
+        Some(&mut diff_options),
+    )?;
+
+    // Enable rename detection so moved files are identified correctly.
+    let mut find_options = DiffFindOptions::new();
+
+    find_options.renames(true);
+
+    diff.find_similar(Some(&mut find_options))?;
+
+    let records: Vec<DeltaRecord> = (0..diff.deltas().count())
+        .filter_map(|index| diff.get_delta(index))
+        .map(|delta| {
+            tracing::trace!(
+                tenant_id = %tenant_id,
+                sha = %sha,
+                status = ?delta.status(),
+                old_path = ?delta.old_file().path(),
+                new_path = ?delta.new_file().path(),
+                "processing diff delta"
+            );
+            DeltaRecord {
+                status: delta.status(),
+                old_oid: delta.old_file().id(),
+                new_oid: delta.new_file().id(),
+                old_path: delta.old_file().path().map(PathBuf::from),
+                new_path: delta.new_file().path().map(PathBuf::from),
+            }
+        })
+        .collect();
+
+    tracing::trace!(tenant_id = %tenant_id, sha = %sha, delta_count = records.len(), "building per-file diffs");
+
+    // Walk the entire patch once and route each line to its delta's bucket.
+    // Linear scan via `position` is fine — commits hold a handful of files.
+    let mut per_file_diffs: Vec<String> = vec![String::new(); records.len()];
+
+    diff.print(DiffFormat::Patch, |delta, _hunk, line| {
+        let key = (delta.old_file().id(), delta.new_file().id());
+
+        if let Some(idx) = records
+            .iter()
+            .position(|record| (record.old_oid, record.new_oid) == key)
+        {
+            let bucket = &mut per_file_diffs[idx];
+
+            match line.origin() {
+                '+' | '-' | ' ' | '\\' => bucket.push(line.origin()),
+                _ => {}
+            }
+
+            bucket.push_str(std::str::from_utf8(line.content()).unwrap_or(""));
+        }
+
+        true
+    })?;
+
+    let mut file_details: Vec<CommitFileDetail> = Vec::with_capacity(records.len());
+
+    for (index, record) in records.iter().enumerate() {
+        let (change_label, file_path, from_path) = match record.status {
+            Delta::Added => ("created", path_string(record.new_path.as_deref()), None),
+            Delta::Deleted => ("deleted", path_string(record.old_path.as_deref()), None),
+            Delta::Renamed => (
+                "moved",
+                path_string(record.new_path.as_deref()),
+                record
+                    .old_path
+                    .as_deref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+            ),
+            _ => ("updated", path_string(record.new_path.as_deref()), None),
+        };
+
+        tracing::trace!(
+            tenant_id = %tenant_id,
+            sha = %sha,
+            path = %file_path,
+            change = %change_label,
+            "assembling commit file detail"
+        );
+
+        let content = if record.status == Delta::Deleted {
+            String::new()
+        } else {
+            blob_content_from_tree(&repo, &commit_tree, &file_path)?
+        };
+
+        file_details.push(CommitFileDetail {
+            path: file_path,
+            change: change_label.to_string(),
+            from_path,
+            content,
+            diff: std::mem::take(&mut per_file_diffs[index]),
+        });
+    }
+
+    // Materialise borrowed values before the struct literal so that the
+    // `Signature` temporary returned by `commit.author()` is dropped while
+    // `commit` (and the underlying `repo`) is still alive.
+    let sha = commit.id().to_string();
+    let message = commit.message().unwrap_or("").to_string();
+
+    let author = CommitAuthor {
+        name: commit.author().name().unwrap_or("").to_string(),
+        email: commit.author().email().unwrap_or("").to_string(),
+    };
+
+    let committed_at = timestamp_from_git_time(commit.time());
+
+    tracing::debug!(tenant_id = %tenant_id, sha = %sha, file_count = file_details.len(), "commit detail ready");
+
+    Ok(CommitDetail {
+        sha,
+        message,
+        author,
+        committed_at,
+        files: file_details,
+    })
+}
+
+/// Converts a path to a string.
+fn path_string(path: Option<&Path>) -> String {
+    path.map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Reverts all changes introduced by the given commit by applying their inverse,
+/// then records the result as a new commit. Returns the new commit SHA and
+/// the list of file changes (for hook delivery).
+pub fn revert_commit(
+    repo_path: &Path,
+    tenant_id: &str,
+    sha: &str,
+    commit_message: Option<&str>,
+    author_name: &str,
+    author_email: &str,
+) -> Result<(String, Vec<FileChange>), AppError> {
+    tracing::debug!(tenant_id = %tenant_id, sha = %sha, author_name = %author_name, author_email = %author_email, "reverting commit");
+
+    cleanup_stale_index_lock(repo_path)?;
+
+    let repo = open_tenant_repo(repo_path, tenant_id)?;
+
+    let object = repo
+        .revparse_single(sha)
+        .map_err(|_err| AppError::CommitNotFound {
+            sha: sha.to_string(),
+        })?;
+
+    let target_commit = object
+        .peel_to_commit()
+        .map_err(|_err| AppError::CommitNotFound {
+            sha: sha.to_string(),
+        })?;
+
+    if target_commit.parent_count() == 0 {
+        tracing::warn!(tenant_id = %tenant_id, sha = %sha, "cannot revert root commit");
+        return Err(AppError::InvalidOperation {
+            reason: "cannot revert the initial commit".to_string(),
+        });
+    }
+
+    let parent_commit = target_commit.parent(0)?;
+    let commit_tree = target_commit.tree()?;
+    let parent_tree = parent_commit.tree()?;
+
+    // Diff from parent → commit tells us what the commit introduced.
+    // Reverting means applying each change in reverse.
+    tracing::trace!(tenant_id = %tenant_id, sha = %sha, "computing diff for revert");
+
+    let mut diff = repo.diff_tree_to_tree(Some(&parent_tree), Some(&commit_tree), None)?;
+
+    let mut find_options = DiffFindOptions::new();
+
+    find_options.renames(true);
+
+    diff.find_similar(Some(&mut find_options))?;
+
+    let raw_deltas: Vec<DeltaRecord> = (0..diff.deltas().count())
+        .filter_map(|index| diff.get_delta(index))
+        .map(|delta| DeltaRecord {
+            status: delta.status(),
+            old_oid: delta.old_file().id(),
+            new_oid: delta.new_file().id(),
+            old_path: delta.old_file().path().map(PathBuf::from),
+            new_path: delta.new_file().path().map(PathBuf::from),
+        })
+        .collect();
+
+    tracing::trace!(tenant_id = %tenant_id, sha = %sha, delta_count = raw_deltas.len(), "applying revert deltas");
+
+    let mut index = repo.index()?;
+    let mut file_changes: Vec<FileChange> = Vec::new();
+
+    for raw_delta in &raw_deltas {
+        match raw_delta.status {
+            Delta::Added => {
+                // Commit added this file → revert removes it.
+                if let Some(new_path) = &raw_delta.new_path {
+                    tracing::trace!(
+                        tenant_id = %tenant_id,
+                        sha = %sha,
+                        path = %new_path.display(),
+                        "revert: removing added file"
+                    );
+
+                    let absolute_path = repo_path.join(new_path);
+
+                    if absolute_path.exists() {
+                        std::fs::remove_file(&absolute_path)?;
+                    }
+
+                    index.remove_path(new_path)?;
+
+                    file_changes.push(FileChange::Deleted {
+                        path: new_path.to_string_lossy().into_owned(),
+                    });
+                }
+            }
+            Delta::Deleted => {
+                // Commit deleted this file → revert restores it from the parent tree.
+                if let Some(old_path) = &raw_delta.old_path {
+                    tracing::trace!(
+                        tenant_id = %tenant_id,
+                        sha = %sha,
+                        path = %old_path.display(),
+                        "revert: restoring deleted file"
+                    );
+
+                    let content =
+                        blob_content_from_tree(&repo, &parent_tree, &old_path.to_string_lossy())?;
+
+                    let absolute_path = repo_path.join(old_path);
+
+                    if let Some(parent_dir) = absolute_path.parent() {
+                        std::fs::create_dir_all(parent_dir)?;
+                    }
+
+                    std::fs::write(&absolute_path, &content)?;
+                    index.add_path(old_path)?;
+
+                    file_changes.push(FileChange::Created {
+                        path: old_path.to_string_lossy().into_owned(),
+                        content,
+                    });
+                }
+            }
+            Delta::Modified => {
+                // Commit modified this file → revert restores the old version.
+                if let Some(old_path) = &raw_delta.old_path {
+                    tracing::trace!(
+                        tenant_id = %tenant_id,
+                        sha = %sha,
+                        path = %old_path.display(),
+                        "revert: restoring modified file to previous version"
+                    );
+
+                    let content =
+                        blob_content_from_tree(&repo, &parent_tree, &old_path.to_string_lossy())?;
+
+                    let absolute_path = repo_path.join(old_path);
+
+                    std::fs::write(&absolute_path, &content)?;
+                    index.add_path(old_path)?;
+
+                    file_changes.push(FileChange::Updated {
+                        path: old_path.to_string_lossy().into_owned(),
+                        content,
+                    });
+                }
+            }
+            Delta::Renamed => {
+                // Commit renamed old → new; revert renames new → old.
+                if let (Some(old_path), Some(new_path)) = (&raw_delta.old_path, &raw_delta.new_path)
+                {
+                    tracing::trace!(
+                        tenant_id = %tenant_id,
+                        sha = %sha,
+                        from_path = %new_path.display(),
+                        to_path = %old_path.display(),
+                        "revert: reversing rename"
+                    );
+
+                    let content =
+                        blob_content_from_tree(&repo, &parent_tree, &old_path.to_string_lossy())?;
+
+                    let absolute_old = repo_path.join(old_path);
+                    let absolute_new = repo_path.join(new_path);
+
+                    if absolute_new.exists() {
+                        std::fs::remove_file(&absolute_new)?;
+                    }
+
+                    if let Some(parent_dir) = absolute_old.parent() {
+                        std::fs::create_dir_all(parent_dir)?;
+                    }
+
+                    std::fs::write(&absolute_old, &content)?;
+
+                    index.remove_path(new_path)?;
+                    index.add_path(old_path)?;
+
+                    file_changes.push(FileChange::Moved {
+                        from_path: new_path.to_string_lossy().into_owned(),
+                        to_path: old_path.to_string_lossy().into_owned(),
+                        content,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    tracing::trace!(tenant_id = %tenant_id, sha = %sha, "writing revert index and committing");
+    index.write()?;
+
+    let tree_id = index.write_tree()?;
+    let tree = repo.find_tree(tree_id)?;
+    let head_commit = repo.head()?.peel_to_commit()?;
+
+    let signature = git_signature(author_name, author_email)?;
+
+    let auto_message = format!("revert: {}", target_commit.message().unwrap_or("unknown"));
+    let revert_message = commit_message.unwrap_or(&auto_message);
+
+    let new_commit_oid = repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        revert_message,
+        &tree,
+        &[&head_commit],
+    )?;
+
+    tracing::debug!(
+        tenant_id = %tenant_id,
+        reverted_sha = %sha,
+        new_sha = %new_commit_oid,
+        file_change_count = file_changes.len(),
+        "revert committed"
+    );
+
+    Ok((new_commit_oid.to_string(), file_changes))
+}
+
+/// Deletes a repository (tenant repo deletion).
+pub fn delete_repo(repo_path: &Path, tenant_id: &str) -> Result<(), AppError> {
+    tracing::debug!(tenant_id = %tenant_id, "deleting tenant repository");
+
+    if !repo_path.exists() {
+        tracing::debug!(tenant_id = %tenant_id, "tenant repository not found for deletion");
+
+        return Err(AppError::TenantNotFound {
+            tenant_id: tenant_id.to_string(),
+        });
+    }
+
+    std::fs::remove_dir_all(repo_path).map_err(|err| {
+        tracing::error!(
+            tenant_id = %tenant_id,
+            path = %repo_path.display(),
+            err = %err,
+            "failed to remove tenant repository directory"
+        );
+
+        AppError::Io(err)
+    })?;
+
+    tracing::info!(tenant_id = %tenant_id, "tenant repository deleted");
+
+    Ok(())
+}
