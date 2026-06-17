@@ -136,9 +136,7 @@ impl HookDelivery {
 
                     let exponent = (attempt - 1).min(MAX_BACKOFF_EXPONENT);
 
-                    let backoff_ms = hooks
-                        .retry_backoff_ms
-                        .saturating_mul(1u64 << exponent);
+                    let backoff_ms = hooks.retry_backoff_ms.saturating_mul(1u64 << exponent);
 
                     sleep(Duration::from_millis(backoff_ms)).await;
                 }
