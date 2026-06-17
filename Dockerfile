@@ -1,11 +1,36 @@
-FROM rust:1.87-alpine AS build
+FROM rust:latest AS build
 
-RUN apk add --no-cache musl-dev cmake make perl
+ARG PREBUILT_TAG
+ARG TARGETPLATFORM
 
-WORKDIR /build
-COPY . /build
+ENV PREBUILT_TAG=$PREBUILT_TAG
 
-RUN cargo build --release
+WORKDIR /app
+COPY . /app
+
+RUN case ${TARGETPLATFORM} in \
+    "linux/amd64")  echo "x86_64" > .arch && echo "x86_64-unknown-linux-musl" > .toolchain ;; \
+    "linux/arm64")  echo "aarch64" > .arch && echo "aarch64-unknown-linux-musl" > .toolchain ;; \
+    *)              echo "Unsupported platform: $TARGETPLATFORM" && exit 1 ;; \
+    esac
+
+# Run full build?
+RUN if [ -z "$PREBUILT_TAG" ]; then \
+    apt-get update && \
+        apt-get install -y musl-tools && \
+        rustup target add $(cat .toolchain) \
+    ; fi
+RUN if [ -z "$PREBUILT_TAG" ]; then \
+    cargo build --release --target $(cat .toolchain) && \
+        mkdir -p ./githttp-fs/ && \
+        mv ./target/$(cat .toolchain)/release/githttp-fs ./githttp-fs/ \
+    ; fi
+
+# Pull pre-built binary?
+RUN if [ ! -z "$PREBUILT_TAG" ]; then \
+    wget https://github.com/crisp-oss/githttp-fs/releases/download/$PREBUILT_TAG/$PREBUILT_TAG-$(cat .arch).tar.gz && \
+        tar -xzf $PREBUILT_TAG-$(cat .arch).tar.gz \
+    ; fi
 
 FROM scratch
 
