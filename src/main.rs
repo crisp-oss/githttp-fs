@@ -19,18 +19,28 @@ use axum::{
     routing::{delete, get, post},
     Router,
 };
-use std::{env, net::SocketAddr, path::Path};
+use clap::Parser;
+use std::{net::SocketAddr, path::Path};
 use tokio::net::TcpListener;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use config::Config;
 use state::AppState;
 
+#[derive(Parser)]
+#[command(about = "Git-based Content Management System served over HTTP")]
+struct Cli {
+    #[arg(short = 'c', long = "config", default_value = "config.toml")]
+    config: String,
+}
+
 #[tokio::main]
 async fn main() {
+    let cli = Cli::parse();
+
     // Config must be loaded first so the log level it carries can be passed
     // to init_tracing — the subscriber can only be initialised once.
-    let config = load_config();
+    let config = load_config(&cli.config);
 
     init_tracing(config.server.log_level.as_deref());
 
@@ -42,7 +52,7 @@ async fn main() {
     );
 
     // Before accepting traffic, remove any lock files left by a previous crash.
-    git::cleanup_all_stale_locks(&repos_path);
+    git::GitLocks::cleanup_all_stale_locks(&repos_path);
 
     // Ensure the repos root directory exists.
     if !repos_path.exists() {
@@ -133,11 +143,8 @@ fn build_router(app_state: AppState) -> Router {
     Router::new().nest("/v1", api_routes)
 }
 
-fn load_config() -> Config {
-    // Allow overriding the config file path via an environment variable.
-    let config_path = env::var("CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
-
-    let raw_content = std::fs::read_to_string(Path::new(&config_path)).unwrap_or_else(|read_err| {
+fn load_config(config_path: &str) -> Config {
+    let raw_content = std::fs::read_to_string(Path::new(config_path)).unwrap_or_else(|read_err| {
         eprintln!("Cannot read config file '{}': {}", config_path, read_err);
 
         std::process::exit(1);

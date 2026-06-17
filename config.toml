@@ -1,22 +1,18 @@
 [server]
 host = "0.0.0.0"
 port = 5355
-# Bearer token required in Authorization header for all requests
+
 api_key = "MySecretAPIKey"
-# Directory where per-tenant git repositories are stored
+
 repos_path = "./dev/repositories"
 log_level = "debug"
 
 [hooks]
 url = "https://webhook.site/e9ddfb60-8d40-4d44-90b7-cc7fb01822db"
-# Events to deliver. Comment out any you do not need.
 events = ["file.created", "file.updated", "file.deleted", "file.moved"]
-# Total number of delivery attempts (first attempt + retries)
 retry_attempts = 5
-# Base delay between retries in milliseconds — doubles on each subsequent attempt
 retry_backoff_ms = 2000
 
-# Optional: attach an auth header to every hook request
 [hooks.auth]
 header = "Authorization"
 value = "Bearer your-hook-receiver-secret"

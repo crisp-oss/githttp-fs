@@ -33,7 +33,7 @@ pub async fn delete_tenant(
 
     let tenant_id_for_task = tenant_id.clone();
 
-    run_blocking(move || git::delete_repo(&repo_path, &tenant_id_for_task)).await?;
+    run_blocking(move || git::GitTenant::delete_repo(&repo_path, &tenant_id_for_task)).await?;
 
     state.remove_repo_lock(&tenant_id);
 

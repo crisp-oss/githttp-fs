@@ -1,0 +1,13 @@
+Source: flavio
+Section: net
+Priority: ext
+Maintainer: Valerian Saliou <valerian@valeriansaliou.name>
+Standards-Version: 3.9.4
+Build-Depends: wget
+Homepage: https://github.com/crisp-oss/flavio
+
+Package: flavio
+Architecture: any
+Depends: adduser
+Provides: flavio-server
+Description: A git-backed content management database served over HTTP.

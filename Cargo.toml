@@ -1,13 +1,21 @@
 [package]
 name = "flavio"
-version = "0.1.0"
-edition = "2021"
+version = "1.0.0"
 description = "A git-backed content management database served over HTTP"
-license = "MIT"
+readme = "README.md"
+license = "MPL-2.0"
+edition = "2021"
+homepage = "https://github.com/crisp-oss/flavio"
+repository = "https://github.com/crisp-oss/flavio.git"
+keywords = ["git", "cms"]
+categories = ["database-implementations"]
+authors = ["Valerian Saliou <valerian@valeriansaliou.name>"]
+exclude = ["dev/*"]
 
 [[bin]]
 name = "flavio"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
@@ -23,3 +31,17 @@ chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+
+[profile.dev]
+opt-level = 0
+debug = true
+debug-assertions = true
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+debug-assertions = false
+strip = true

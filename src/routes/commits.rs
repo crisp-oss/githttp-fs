@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
-    error::AppError, git, hooks::spawn_hook_delivery, routes::AuthorRequest, state::AppState,
+    error::AppError, git, hooks::HookDelivery, routes::AuthorRequest, state::AppState,
     util::run_blocking, validate,
 };
 
@@ -54,9 +54,10 @@ pub async fn list_commits(
 
     let tenant_id_for_task = tenant_id.clone();
 
-    let commits =
-        run_blocking(move || git::list_commits(&repo_path, &tenant_id_for_task, page, per_page))
-            .await?;
+    let commits = run_blocking(move || {
+        git::GitCommits::list_commits(&repo_path, &tenant_id_for_task, page, per_page)
+    })
+    .await?;
 
     tracing::debug!(tenant_id = %tenant_id, page = page, returned = commits.len(), "list commits response ready");
 
@@ -83,7 +84,8 @@ pub async fn get_commit(
     let tenant_id_for_task = tenant_id.clone();
 
     let commit_detail =
-        run_blocking(move || git::get_commit(&repo_path, &tenant_id_for_task, &sha)).await?;
+        run_blocking(move || git::GitCommits::get_commit(&repo_path, &tenant_id_for_task, &sha))
+            .await?;
 
     tracing::debug!(
         tenant_id = %tenant_id,
@@ -118,7 +120,7 @@ pub async fn revert_commit(
     let sha_for_task = sha.clone();
 
     let (new_commit_sha, file_changes) = run_blocking(move || {
-        git::revert_commit(
+        git::GitCommits::revert_commit(
             &repo_path,
             &tenant_id_for_task,
             &sha_for_task,
@@ -137,7 +139,7 @@ pub async fn revert_commit(
         "revert complete, spawning hook delivery"
     );
 
-    spawn_hook_delivery(
+    HookDelivery::spawn(
         state.http_client.clone(),
         state.config.clone(),
         tenant_id,

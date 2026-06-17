@@ -11,8 +11,6 @@ RUN cargo build --release
 
 FROM alpine:3.22
 
-RUN apk add --no-cache ca-certificates
-
 WORKDIR /app
 
 COPY --from=build /build/target/release/flavio ./flavio

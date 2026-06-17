@@ -232,9 +232,9 @@ All payloads include `tenant_id`, `commit_sha`, and `committed_at`.
 ## Running
 
 ```sh
-cargo run                              # uses config.toml in cwd
-CONFIG_PATH=/etc/flavio.toml cargo run
-RUST_LOG=debug cargo run              # overrides log_level in config
+cargo run                                    # uses config.toml in cwd
+cargo run -- -c /etc/flavio.toml
+RUST_LOG=debug cargo run                     # overrides log_level in config
 ```
 
 ## Docker

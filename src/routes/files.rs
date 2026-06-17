@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
-    error::AppError, git, hooks::spawn_hook_delivery, routes::AuthorRequest, state::AppState,
+    error::AppError, git, hooks::HookDelivery, routes::AuthorRequest, state::AppState,
     util::run_blocking, validate,
 };
 
@@ -53,7 +53,8 @@ pub async fn list_files(
 
     let tenant_id_for_task = tenant_id.clone();
 
-    let tree = run_blocking(move || git::list_files(&repo_path, &tenant_id_for_task)).await?;
+    let tree =
+        run_blocking(move || git::GitFiles::list_files(&repo_path, &tenant_id_for_task)).await?;
 
     tracing::debug!(tenant_id = %tenant_id, "list files tree response ready");
 
@@ -76,9 +77,10 @@ pub async fn read_file(
     let file_path_for_task = file_path.clone();
     let tenant_id_for_task = tenant_id.clone();
 
-    let content =
-        run_blocking(move || git::read_file(&repo_path, &tenant_id_for_task, &file_path_for_task))
-            .await?;
+    let content = run_blocking(move || {
+        git::GitFiles::read_file(&repo_path, &tenant_id_for_task, &file_path_for_task)
+    })
+    .await?;
 
     Ok(Json(json!({
         "path": file_path,
@@ -110,7 +112,7 @@ pub async fn write_file(
     } = body;
 
     let (commit_sha, file_change) = run_blocking(move || {
-        git::write_file(
+        git::GitFiles::write_file(
             &repo_path,
             &file_path,
             &content,
@@ -123,7 +125,7 @@ pub async fn write_file(
 
     tracing::debug!(tenant_id = %tenant_id, sha = %commit_sha, "file write committed, spawning hook delivery");
 
-    spawn_hook_delivery(
+    HookDelivery::spawn(
         state.http_client.clone(),
         state.config.clone(),
         tenant_id,
@@ -157,7 +159,7 @@ pub async fn delete_file(
     let tenant_id_for_task = tenant_id.clone();
 
     let (commit_sha, file_change) = run_blocking(move || {
-        git::delete_file(
+        git::GitFiles::delete_file(
             &repo_path,
             &tenant_id_for_task,
             &file_path,
@@ -170,7 +172,7 @@ pub async fn delete_file(
 
     tracing::debug!(tenant_id = %tenant_id, sha = %commit_sha, "file deletion committed, spawning hook delivery");
 
-    spawn_hook_delivery(
+    HookDelivery::spawn(
         state.http_client.clone(),
         state.config.clone(),
         tenant_id,
@@ -227,7 +229,7 @@ pub async fn move_file(
     let tenant_id_for_task = tenant_id.clone();
 
     let (commit_sha, file_change) = run_blocking(move || {
-        git::move_file(
+        git::GitFiles::move_file(
             &repo_path,
             &tenant_id_for_task,
             &from_path,
@@ -241,7 +243,7 @@ pub async fn move_file(
 
     tracing::debug!(tenant_id = %tenant_id, sha = %commit_sha, "file move committed, spawning hook delivery");
 
-    spawn_hook_delivery(
+    HookDelivery::spawn(
         state.http_client.clone(),
         state.config.clone(),
         tenant_id,

@@ -1,0 +1,14 @@
+[Unit]
+Description=Flavio Git-backed content management database served over HTTP
+After=network.target
+
+[Service]
+Type=simple
+User=flavio
+Group=flavio
+ExecStart=/usr/bin/flavio -c /etc/flavio.toml
+Restart=on-failure
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
