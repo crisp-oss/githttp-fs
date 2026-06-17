@@ -36,8 +36,8 @@ FROM scratch
 
 WORKDIR /usr/src/githttp-fs
 
-COPY --from=build /build/target/release/githttp-fs /usr/local/bin/githttp-fs
-COPY --from=build /build/config.toml /etc/githttp-fs.toml
+COPY --from=build /app/githttp-fs/githttp-fs /usr/local/bin/githttp-fs
+COPY --from=build /app/config.toml /etc/githttp-fs.toml
 
 CMD [ "githttp-fs", "-c", "/etc/githttp-fs.toml" ]
 

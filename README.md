@@ -17,18 +17,18 @@ _Tested at Rust version: `rustc 1.94.0 (4a4ef493e 2026-03-02)`_
 
 **Install from Docker Hub:**
 
-You might find it convenient to run githttp-fs via Docker. You can find the pre-built githttp-fs image on Docker Hub as [crisp-oss/githttp-fs](https://hub.docker.com/r/crisp-oss/githttp-fs/).
+You might find it convenient to run githttp-fs via Docker. You can find the pre-built githttp-fs image on Docker Hub as [crispim/githttp-fs](https://hub.docker.com/r/crispim/githttp-fs/).
 
-First, pull the `crisp-oss/githttp-fs` image:
+First, pull the `crispim/githttp-fs` image:
 
 ```bash
-docker pull crisp-oss/githttp-fs:v1.0.0
+docker pull crispim/githttp-fs:v1.0.0
 ```
 
 Then, provide a configuration file and run it (replace `/path/to/your/githttp-fs/config.toml` with the path to your configuration file):
 
 ```bash
-docker run -p 5355:5355 -v /path/to/your/githttp-fs/config.toml:/etc/githttp-fs.cfg crisp-oss/githttp-fs:v1.0.0
+docker run -p 5355:5355 -v /path/to/your/githttp-fs/config.toml:/etc/githttp-fs.cfg crispim/githttp-fs:v1.0.0
 ```
 
 In the configuration file, ensure that:
@@ -40,7 +40,7 @@ githttp-fs will be reachable from `http://localhost:5355`.
 
 **Install from binary:**
 
-A pre-built binary of githttp-fs is shared in the releases on GitHub. You can simply download the latest binary version from the [releases page](https://github.com/crisp-oss/githttp-fs/releases), and run it on your server.
+A pre-built binary of githttp-fs is shared in the releases on GitHub. You can simply download the latest binary version from the [releases page](https://github.com/crispim/githttp-fs/releases), and run it on your server.
 
 You will still need to provide the binary with the configuration file, so make sure you have a githttp-fs `config.toml` file ready somewhere.
 
