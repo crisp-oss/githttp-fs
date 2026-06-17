@@ -1,4 +1,5 @@
 [server]
+
 host = "0.0.0.0"
 port = 5355
 
@@ -8,11 +9,20 @@ repos_path = "./dev/repositories"
 log_level = "debug"
 
 [hooks]
+
 url = "https://webhook.site/e9ddfb60-8d40-4d44-90b7-cc7fb01822db"
-events = ["file.created", "file.updated", "file.deleted", "file.moved"]
+
+events = [
+  "file.created",
+  "file.updated",
+  "file.deleted",
+  "file.moved"
+]
+
 retry_attempts = 5
 retry_backoff_ms = 2000
 
 [hooks.auth]
+
 header = "Authorization"
 value = "Bearer your-hook-receiver-secret"

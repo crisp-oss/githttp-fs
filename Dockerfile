@@ -3,19 +3,17 @@ FROM rust:1.87-alpine AS build
 RUN apk add --no-cache musl-dev cmake make perl
 
 WORKDIR /build
-
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+COPY . /build
 
 RUN cargo build --release
 
-FROM alpine:3.22
+FROM scratch
 
-WORKDIR /app
+WORKDIR /usr/src/flavio
 
-COPY --from=build /build/target/release/flavio ./flavio
-COPY config.toml .
+COPY --from=build /build/target/release/flavio /usr/local/bin/flavio
+COPY --from=build /build/config.toml /etc/flavio.toml
+
+CMD [ "flavio", "-c", "/etc/flavio.toml" ]
 
 EXPOSE 5355
-
-ENTRYPOINT ["./flavio"]

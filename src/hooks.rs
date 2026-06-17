@@ -10,7 +10,7 @@ use serde_json::{json, Map, Value};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
-use crate::config::{Config, HookEvent};
+use crate::config::{Config, HookEvent, HooksConfig};
 use crate::git::FileChange;
 
 /// Cap on the exponential backoff exponent to avoid `1 << n` overflow when an
@@ -35,6 +35,10 @@ impl HookDelivery {
         committed_at: DateTime<Utc>,
         file_changes: Vec<FileChange>,
     ) {
+        if config.hooks.is_none() {
+            return;
+        }
+
         tokio::spawn(async move {
             Self::deliver_all(
                 client,
@@ -56,14 +60,19 @@ impl HookDelivery {
         committed_at: DateTime<Utc>,
         file_changes: Vec<FileChange>,
     ) {
+        let hooks = match config.hooks.as_ref() {
+            Some(hooks) => hooks,
+            None => return,
+        };
+
         // A zero/negative configuration is treated as a single attempt so events
         // are never silently dropped because of a misconfiguration.
-        let attempts = config.hooks.retry_attempts.max(1);
+        let attempts = hooks.retry_attempts.max(1);
 
         for file_change in file_changes {
             let required_event = Self::event_for_change(&file_change);
 
-            if !config.hooks.events.contains(&required_event) {
+            if !hooks.events.contains(&required_event) {
                 continue;
             }
 
@@ -72,7 +81,7 @@ impl HookDelivery {
 
             Self::deliver_with_retries(
                 &client,
-                &config,
+                hooks,
                 attempts,
                 payload,
                 &tenant_id,
@@ -85,7 +94,7 @@ impl HookDelivery {
 
     async fn deliver_with_retries(
         client: &Client,
-        config: &Config,
+        hooks: &HooksConfig,
         attempts: u32,
         payload: Value,
         tenant_id: &str,
@@ -93,7 +102,7 @@ impl HookDelivery {
         change_description: &str,
     ) {
         for attempt in 1..=attempts {
-            match Self::send(client, config, &payload).await {
+            match Self::send(client, hooks, &payload).await {
                 Ok(()) => {
                     tracing::debug!(
                         tenant_id,
@@ -127,8 +136,7 @@ impl HookDelivery {
 
                     let exponent = (attempt - 1).min(MAX_BACKOFF_EXPONENT);
 
-                    let backoff_ms = config
-                        .hooks
+                    let backoff_ms = hooks
                         .retry_backoff_ms
                         .saturating_mul(1u64 << exponent);
 
@@ -138,10 +146,10 @@ impl HookDelivery {
         }
     }
 
-    async fn send(client: &Client, config: &Config, payload: &Value) -> Result<(), String> {
-        let mut request_builder = client.post(&config.hooks.url).json(payload);
+    async fn send(client: &Client, hooks: &HooksConfig, payload: &Value) -> Result<(), String> {
+        let mut request_builder = client.post(&hooks.url).json(payload);
 
-        if let Some(hook_auth) = &config.hooks.auth {
+        if let Some(hook_auth) = &hooks.auth {
             request_builder = request_builder.header(&hook_auth.header, &hook_auth.value);
         }
 

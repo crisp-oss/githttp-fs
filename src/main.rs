@@ -54,24 +54,6 @@ async fn main() {
     // Before accepting traffic, remove any lock files left by a previous crash.
     git::GitLocks::cleanup_all_stale_locks(&repos_path);
 
-    // Ensure the repos root directory exists.
-    if !repos_path.exists() {
-        tracing::debug!(
-            repos_path = %repos_path.display(),
-            "repos directory absent, creating"
-        );
-
-        std::fs::create_dir_all(&repos_path).unwrap_or_else(|create_err| {
-            tracing::error!(
-                repos_path = %repos_path.display(),
-                err = %create_err,
-                "failed to create repos directory"
-            );
-
-            std::process::exit(1);
-        });
-    }
-
     let app_state = AppState::new(config.clone());
     let router = build_router(app_state);
 
@@ -150,11 +132,21 @@ fn load_config(config_path: &str) -> Config {
         std::process::exit(1);
     });
 
-    toml::from_str::<Config>(&raw_content).unwrap_or_else(|parse_err| {
+    let config = toml::from_str::<Config>(&raw_content).unwrap_or_else(|parse_err| {
         eprintln!("Invalid config file '{}': {}", config_path, parse_err);
 
         std::process::exit(1);
-    })
+    });
+
+    if let Err(validation_errors) = config.validate() {
+        for error in &validation_errors {
+            eprintln!("Config error: {}", error);
+        }
+
+        std::process::exit(1);
+    }
+
+    config
 }
 
 fn init_tracing(log_level: Option<&str>) {
