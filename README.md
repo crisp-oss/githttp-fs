@@ -22,13 +22,13 @@ You might find it convenient to run githttp-fs via Docker. You can find the pre-
 First, pull the `crispim/githttp-fs` image:
 
 ```bash
-docker pull crispim/githttp-fs:v1.0.0
+docker pull crispim/githttp-fs:v1.0.1
 ```
 
 Then, provide a configuration file and run it (replace `/path/to/your/githttp-fs/config.toml` with the path to your configuration file):
 
 ```bash
-docker run -p 5355:5355 -v /path/to/your/githttp-fs/config.toml:/etc/githttp-fs.cfg crispim/githttp-fs:v1.0.0
+docker run -p 5355:5355 -v /path/to/your/githttp-fs/config.toml:/etc/githttp-fs.cfg crispim/githttp-fs:v1.0.1
 ```
 
 In the configuration file, ensure that:

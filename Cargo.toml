@@ -1,6 +1,6 @@
 [package]
 name = "githttp-fs"
-version = "1.0.0"
+version = "1.0.1"
 description = "A git-backed content management database served over HTTP"
 readme = "README.md"
 license = "MPL-2.0"
