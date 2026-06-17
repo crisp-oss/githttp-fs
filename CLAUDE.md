@@ -1,10 +1,10 @@
-# Flavio
+# githttp-fs
 
 Git-based Content Management System served over HTTP.
 
 ## What it is
 
-Flavio is a single Rust binary that wraps git repositories and exposes them as a file-system-over-HTTP API. Each tenant gets its own git repository on disk. Clients can create, read, update, delete, and move `.md`/`.mdx` files via REST. Every write produces a git commit. A configurable webhook fires after each commit so downstream systems (e.g. a read-only SQL database) can stay in sync.
+githttp-fs is a single Rust binary that wraps git repositories and exposes them as a file-system-over-HTTP API. Each tenant gets its own git repository on disk. Clients can create, read, update, delete, and move `.md`/`.mdx` files via REST. Every write produces a git commit. A configurable webhook fires after each commit so downstream systems (e.g. a read-only SQL database) can stay in sync.
 
 Git is never exposed in the API surface — no git terminology appears in requests or responses.
 
@@ -233,7 +233,7 @@ All payloads include `tenant_id`, `commit_sha`, and `committed_at`.
 
 ```sh
 cargo run                                    # uses config.toml in cwd
-cargo run -- -c /etc/flavio.toml
+cargo run -- -c /etc/githttp-fs.toml
 RUST_LOG=debug cargo run                     # overrides log_level in config
 ```
 
@@ -242,11 +242,11 @@ RUST_LOG=debug cargo run                     # overrides log_level in config
 Two-stage build: compiles in `rust:alpine` (static musl binary), runs in `alpine:3.22`.
 
 ```sh
-docker build -t flavio .
+docker build -t githttp-fs .
 docker run -p 5355:5355 \
   -v ./config.toml:/app/config.toml \
   -v ./data:/app/data \
-  flavio
+  githttp-fs
 ```
 
 ## License

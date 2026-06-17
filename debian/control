@@ -1,13 +1,13 @@
-Source: flavio
+Source: githttp-fs
 Section: net
 Priority: ext
 Maintainer: Valerian Saliou <valerian@valeriansaliou.name>
 Standards-Version: 3.9.4
 Build-Depends: wget
-Homepage: https://github.com/crisp-oss/flavio
+Homepage: https://github.com/crisp-oss/githttp-fs
 
-Package: flavio
+Package: githttp-fs
 Architecture: any
 Depends: adduser
-Provides: flavio-server
+Provides: githttp-fs-server
 Description: A git-backed content management database served over HTTP.

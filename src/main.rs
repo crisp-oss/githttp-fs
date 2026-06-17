@@ -1,4 +1,4 @@
-// Flavio
+// githttp-fs
 //
 // Git-based Content Management System
 // Copyright: 2026, Valerian Saliou <valerian@valeriansaliou.name>
@@ -48,7 +48,7 @@ async fn main() {
 
     tracing::info!(
         repos_path = %repos_path.display(),
-        "starting flavio"
+        "starting githttp-fs"
     );
 
     // Before accepting traffic, remove any lock files left by a previous crash.

@@ -9,11 +9,11 @@ RUN cargo build --release
 
 FROM scratch
 
-WORKDIR /usr/src/flavio
+WORKDIR /usr/src/githttp-fs
 
-COPY --from=build /build/target/release/flavio /usr/local/bin/flavio
-COPY --from=build /build/config.toml /etc/flavio.toml
+COPY --from=build /build/target/release/githttp-fs /usr/local/bin/githttp-fs
+COPY --from=build /build/config.toml /etc/githttp-fs.toml
 
-CMD [ "flavio", "-c", "/etc/flavio.toml" ]
+CMD [ "githttp-fs", "-c", "/etc/githttp-fs.toml" ]
 
 EXPOSE 5355

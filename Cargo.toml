@@ -1,19 +1,19 @@
 [package]
-name = "flavio"
+name = "githttp-fs"
 version = "1.0.0"
 description = "A git-backed content management database served over HTTP"
 readme = "README.md"
 license = "MPL-2.0"
 edition = "2021"
-homepage = "https://github.com/crisp-oss/flavio"
-repository = "https://github.com/crisp-oss/flavio.git"
+homepage = "https://github.com/crisp-oss/githttp-fs"
+repository = "https://github.com/crisp-oss/githttp-fs.git"
 keywords = ["git", "cms"]
 categories = ["database-implementations"]
 authors = ["Valerian Saliou <valerian@valeriansaliou.name>"]
 exclude = ["dev/*"]
 
 [[bin]]
-name = "flavio"
+name = "githttp-fs"
 path = "src/main.rs"
 doc = false
 

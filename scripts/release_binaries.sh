@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ##
-#  Flavio
+#  githttp-fs
 #
 #  Git-based Content Management System
 #  Copyright: 2026, Valerian Saliou <valerian@valeriansaliou.name>
@@ -16,7 +16,7 @@ while [ "$1" != "" ]; do
     case $argument_key in
         -v | --version)
             # Notice: strip any leading 'v' to the version number
-            FLAVIO_VERSION="${argument_value/v}"
+            GITHTTP_FS_VERSION="${argument_value/v}"
             ;;
         *)
             echo "Unknown argument received: '$argument_key'"
@@ -28,23 +28,23 @@ while [ "$1" != "" ]; do
 done
 
 # Ensure release version is provided
-if [ -z "$FLAVIO_VERSION" ]; then
-  echo "No Flavio release version was provided, please provide it using '--version'"
+if [ -z "$GITHTTP_FS_VERSION" ]; then
+  echo "No githttp-fs release version was provided, please provide it using '--version'"
 
   exit 1
 fi
 
 # Define release pipeline
 function release_for_architecture {
-    final_tar="v$FLAVIO_VERSION-$1.tar.gz"
+    final_tar="v$GITHTTP_FS_VERSION-$1.tar.gz"
 
-    rm -rf ./flavio/ ./target/ && \
+    rm -rf ./githttp-fs/ ./target/ && \
         cross build --target "$2" --release && \
-        mkdir ./flavio && \
-        cp -p "target/$2/release/flavio" ./flavio/ && \
-        cp -r ./config.toml flavio/ && \
-        tar --owner=0 --group=0 -czvf "$final_tar" ./flavio && \
-        rm -r ./flavio/
+        mkdir ./githttp-fs && \
+        cp -p "target/$2/release/githttp-fs" ./githttp-fs/ && \
+        cp -r ./config.toml githttp-fs/ && \
+        tar --owner=0 --group=0 -czvf "$final_tar" ./githttp-fs && \
+        rm -r ./githttp-fs/
     release_result=$?
 
     if [ $release_result -eq 0 ]; then
@@ -61,16 +61,16 @@ BASE_DIR="$ABSPATH/../"
 rc=0
 
 pushd "$BASE_DIR" > /dev/null
-    echo "Executing release steps for Flavio v$FLAVIO_VERSION..."
+    echo "Executing release steps for githttp-fs v$GITHTTP_FS_VERSION..."
 
     release_for_architecture "x86_64" "x86_64-unknown-linux-musl" && \
         release_for_architecture "aarch64" "aarch64-unknown-linux-musl"
     rc=$?
 
     if [ $rc -eq 0 ]; then
-        echo "Success: Done executing release steps for Flavio v$FLAVIO_VERSION"
+        echo "Success: Done executing release steps for githttp-fs v$GITHTTP_FS_VERSION"
     else
-        echo "Error: Failed executing release steps for Flavio v$FLAVIO_VERSION"
+        echo "Error: Failed executing release steps for githttp-fs v$GITHTTP_FS_VERSION"
     fi
 popd > /dev/null
 
