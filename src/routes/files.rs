@@ -39,17 +39,18 @@ pub struct MoveFileRequest {
     pub message: Option<String>,
 }
 
-/// GET /:tenant_id/files
+/// GET /:collection_id/:tenant_id/files
 /// Returns the repository contents as a recursive file tree.
 pub async fn list_files(
     State(state): State<AppState>,
-    Path(tenant_id): Path<String>,
+    Path((collection_id, tenant_id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
+    let collection_id = validate::collection_id(&collection_id)?.to_string();
     let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
 
-    tracing::debug!(tenant_id = %tenant_id, "handling list files request");
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, "handling list files request");
 
-    let repo_path = state.config.server.repos_path.join(&tenant_id);
+    let repo_path = state.config.server.repos_path.join(&collection_id).join(&tenant_id);
 
     let tenant_id_for_task = tenant_id.clone();
 
@@ -61,18 +62,19 @@ pub async fn list_files(
     Ok(Json(json!(tree)))
 }
 
-/// GET /:tenant_id/files/*path
+/// GET /:collection_id/:tenant_id/files/*path
 /// Returns the file content and path as JSON.
 pub async fn read_file(
     State(state): State<AppState>,
-    Path((tenant_id, file_path)): Path<(String, String)>,
+    Path((collection_id, tenant_id, file_path)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
+    let collection_id = validate::collection_id(&collection_id)?.to_string();
     let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
     let file_path = validate::file_path(&file_path)?.to_string();
 
-    tracing::debug!(tenant_id = %tenant_id, path = %file_path, "handling read file request");
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %file_path, "handling read file request");
 
-    let repo_path = state.config.server.repos_path.join(&tenant_id);
+    let repo_path = state.config.server.repos_path.join(&collection_id).join(&tenant_id);
 
     let file_path_for_task = file_path.clone();
     let tenant_id_for_task = tenant_id.clone();
@@ -88,21 +90,23 @@ pub async fn read_file(
     })))
 }
 
-/// PUT /:tenant_id/files/*path
+/// PUT /:collection_id/:tenant_id/files/*path
 /// Creates or updates a file, commits the change, and fires a hook.
 pub async fn write_file(
     State(state): State<AppState>,
-    Path((tenant_id, file_path)): Path<(String, String)>,
+    Path((collection_id, tenant_id, file_path)): Path<(String, String, String)>,
     Json(body): Json<WriteFileRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    let collection_id = validate::collection_id(&collection_id)?.to_string();
     let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
     let file_path = validate::file_path(&file_path)?.to_string();
 
-    tracing::debug!(tenant_id = %tenant_id, path = %file_path, "handling write file request");
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %file_path, "handling write file request");
 
-    let repo_path = state.config.server.repos_path.join(&tenant_id);
+    let repo_path = state.config.server.repos_path.join(&collection_id).join(&tenant_id);
 
-    let lock = state.get_repo_lock(&tenant_id);
+    let lock_key = format!("{}/{}", collection_id, tenant_id);
+    let lock = state.get_repo_lock(&lock_key);
     let _lock_guard = lock.lock().await;
 
     let WriteFileRequest {
@@ -137,21 +141,23 @@ pub async fn write_file(
     Ok((StatusCode::OK, Json(json!({ "commit_sha": commit_sha }))))
 }
 
-/// DELETE /:tenant_id/files/*path
+/// DELETE /:collection_id/:tenant_id/files/*path
 /// Deletes a file, commits the removal, and fires a hook.
 pub async fn delete_file(
     State(state): State<AppState>,
-    Path((tenant_id, file_path)): Path<(String, String)>,
+    Path((collection_id, tenant_id, file_path)): Path<(String, String, String)>,
     Json(body): Json<DeleteFileRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    let collection_id = validate::collection_id(&collection_id)?.to_string();
     let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
     let file_path = validate::file_path(&file_path)?.to_string();
 
-    tracing::debug!(tenant_id = %tenant_id, path = %file_path, "handling delete file request");
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %file_path, "handling delete file request");
 
-    let repo_path = state.config.server.repos_path.join(&tenant_id);
+    let repo_path = state.config.server.repos_path.join(&collection_id).join(&tenant_id);
 
-    let lock = state.get_repo_lock(&tenant_id);
+    let lock_key = format!("{}/{}", collection_id, tenant_id);
+    let lock = state.get_repo_lock(&lock_key);
     let _lock_guard = lock.lock().await;
 
     let DeleteFileRequest { author, message } = body;
@@ -184,7 +190,7 @@ pub async fn delete_file(
     Ok((StatusCode::OK, Json(json!({ "commit_sha": commit_sha }))))
 }
 
-/// POST /:tenant_id/files/*path/move
+/// POST /:collection_id/:tenant_id/files/*path/move
 /// Moves/renames a file to a new path in a single atomic commit, fires a
 /// single hook with both the old and new paths so the receiver can
 /// correlate the rename without losing attached metadata.
@@ -193,9 +199,10 @@ pub async fn delete_file(
 /// is registered on POST `/*path` and enforces the `/move` suffix itself.
 pub async fn move_file(
     State(state): State<AppState>,
-    Path((tenant_id, raw_path)): Path<(String, String)>,
+    Path((collection_id, tenant_id, raw_path)): Path<(String, String, String)>,
     Json(body): Json<MoveFileRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    let collection_id = validate::collection_id(&collection_id)?.to_string();
     let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
 
     // Enforce that the URL ends with /move — anything else on POST is not found.
@@ -209,15 +216,17 @@ pub async fn move_file(
     let to_path = validate::file_path(&body.destination)?.to_string();
 
     tracing::debug!(
+        collection_id = %collection_id,
         tenant_id = %tenant_id,
         from_path = %from_path,
         to_path = %to_path,
         "handling move file request"
     );
 
-    let repo_path = state.config.server.repos_path.join(&tenant_id);
+    let repo_path = state.config.server.repos_path.join(&collection_id).join(&tenant_id);
 
-    let lock = state.get_repo_lock(&tenant_id);
+    let lock_key = format!("{}/{}", collection_id, tenant_id);
+    let lock = state.get_repo_lock(&lock_key);
     let _lock_guard = lock.lock().await;
 
     let MoveFileRequest {

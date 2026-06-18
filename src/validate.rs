@@ -9,6 +9,25 @@ use std::path::{Component, Path};
 use crate::error::AppError;
 
 const MAX_TENANT_ID_LEN: usize = 64;
+const MAX_COLLECTION_ID_LEN: usize = 64;
+
+/// Collection identifiers are used as the top-level on-disk directory name.
+/// Same character-set rules as tenant identifiers.
+pub fn collection_id(raw: &str) -> Result<&str, AppError> {
+    let valid_length = !raw.is_empty() && raw.len() <= MAX_COLLECTION_ID_LEN;
+
+    let valid_chars = raw
+        .bytes()
+        .all(|byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_'));
+
+    if valid_length && valid_chars {
+        Ok(raw)
+    } else {
+        Err(AppError::InvalidTenant {
+            tenant_id: raw.to_string(),
+        })
+    }
+}
 
 /// Tenant identifiers are used as on-disk directory names, so they must be
 /// strictly limited to a safe character set. This prevents path traversal

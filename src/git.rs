@@ -337,30 +337,47 @@ impl GitLocks {
     /// Walks `repos_root` once on startup and removes any leftover `.git/index.lock`
     /// regardless of age — no live operation can hold a lock at boot.
     pub fn cleanup_all_stale_locks(repos_root: &Path) {
-        let read_dir = match std::fs::read_dir(repos_root) {
-            Ok(read_dir) => read_dir,
+        let collections_dir = match std::fs::read_dir(repos_root) {
+            Ok(d) => d,
             Err(_) => return,
         };
 
-        for dir_entry_result in read_dir {
-            let Ok(dir_entry) = dir_entry_result else {
+        for collection_entry_result in collections_dir {
+            let Ok(collection_entry) = collection_entry_result else {
                 continue;
             };
 
-            let lock_path = dir_entry.path().join(".git").join("index.lock");
+            let collection_path = collection_entry.path();
 
-            if lock_path.exists() {
-                tracing::warn!(
-                    "Removing stale git lock file found on startup: {:?}",
-                    lock_path
-                );
+            if !collection_path.is_dir() {
+                continue;
+            }
 
-                if let Err(remove_err) = std::fs::remove_file(&lock_path) {
-                    tracing::error!(
-                        "Failed to remove stale lock {:?}: {}",
-                        lock_path,
-                        remove_err
+            let tenants_dir = match std::fs::read_dir(&collection_path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+
+            for tenant_entry_result in tenants_dir {
+                let Ok(tenant_entry) = tenant_entry_result else {
+                    continue;
+                };
+
+                let lock_path = tenant_entry.path().join(".git").join("index.lock");
+
+                if lock_path.exists() {
+                    tracing::warn!(
+                        "Removing stale git lock file found on startup: {:?}",
+                        lock_path
                     );
+
+                    if let Err(remove_err) = std::fs::remove_file(&lock_path) {
+                        tracing::error!(
+                            "Failed to remove stale lock {:?}: {}",
+                            lock_path,
+                            remove_err
+                        );
+                    }
                 }
             }
         }

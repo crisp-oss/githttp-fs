@@ -21,9 +21,9 @@ src/
   middleware.rs    — Bearer API key guard (axum middleware)
   routes/
     mod.rs         — shared request types (AuthorRequest)
-    files.rs       — GET/PUT/DELETE/POST on /:tenant_id/files and /:tenant_id/files/*path
+    files.rs       — GET/PUT/DELETE/POST on /:collection_id/:tenant_id/files and /:collection_id/:tenant_id/files/*path
     commits.rs     — commit list, commit detail, revert
-    tenant.rs      — DELETE /:tenant_id
+    tenant.rs      — DELETE /:collection_id/:tenant_id
 ```
 
 ## HTTP API
@@ -32,15 +32,15 @@ All routes are prefixed `/v1` and require `Authorization: Bearer <api_key>`.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `DELETE` | `/v1/:tenant_id` | Delete entire tenant repository |
-| `GET` | `/v1/:tenant_id/files` | List all tracked files (path + size) |
-| `GET` | `/v1/:tenant_id/files/*path` | Read file content |
-| `PUT` | `/v1/:tenant_id/files/*path` | Create or update a file |
-| `DELETE` | `/v1/:tenant_id/files/*path` | Delete a file |
-| `POST` | `/v1/:tenant_id/files/*path/move` | Move / rename a file |
-| `GET` | `/v1/:tenant_id/commits?page=&per_page=` | List commits, paginated (default 100, max 500) |
-| `GET` | `/v1/:tenant_id/commits/:sha` | Commit detail with per-file diffs and snapshots |
-| `POST` | `/v1/:tenant_id/commits/:sha/revert` | Revert a commit |
+| `DELETE` | `/v1/:collection_id/:tenant_id` | Delete entire tenant repository |
+| `GET` | `/v1/:collection_id/:tenant_id/files` | List all tracked files (path + size) |
+| `GET` | `/v1/:collection_id/:tenant_id/files/*path` | Read file content |
+| `PUT` | `/v1/:collection_id/:tenant_id/files/*path` | Create or update a file |
+| `DELETE` | `/v1/:collection_id/:tenant_id/files/*path` | Delete a file |
+| `POST` | `/v1/:collection_id/:tenant_id/files/*path/move` | Move / rename a file |
+| `GET` | `/v1/:collection_id/:tenant_id/commits?page=&per_page=` | List commits, paginated (default 100, max 500) |
+| `GET` | `/v1/:collection_id/:tenant_id/commits/:sha` | Commit detail with per-file diffs and snapshots |
+| `POST` | `/v1/:collection_id/:tenant_id/commits/:sha/revert` | Revert a commit |
 
 ### Request bodies
 
@@ -177,8 +177,8 @@ Log verbosity priority: `RUST_LOG` env var → `log_level` in config → `"info"
 
 ## Key design decisions
 
-- **One git working tree per tenant** at `repos_path/<tenant_id>/`. Repos are auto-initialised on the first write with a `"chore: initialize"` root commit — no explicit provisioning step needed.
-- **Per-tenant in-memory mutex** (`DashMap<String, Arc<Mutex<()>>>`) serialises all write operations on the same repo. Reads never acquire the lock.
+- **One git working tree per tenant** at `repos_path/<collection_id>/<tenant_id>/`. Repos are auto-initialised on the first write with a `"chore: initialize"` root commit — no explicit provisioning step needed.
+- **Per-tenant in-memory mutex** (`DashMap<String, Arc<Mutex<()>>>`) serialises all write operations on the same repo; keyed as `"collection_id/tenant_id"`. Reads never acquire the lock.
 - **All git operations run in `spawn_blocking`** so they never stall the tokio executor.
 - **Hook delivery is fire-and-forget** — spawned as a background task after the write lock is released, so writes are never delayed by a slow hook receiver.
 - **Hook events are sequential per commit** — files within a single commit are delivered one hook at a time in order, so the receiver can process them synchronously.

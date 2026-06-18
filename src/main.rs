@@ -97,22 +97,22 @@ async fn main() {
 fn build_router(app_state: AppState) -> Router {
     let api_routes = Router::new()
         // Tenant management
-        .route("/:tenant_id", delete(routes::tenant::delete_tenant))
+        .route("/:collection_id/:tenant_id", delete(routes::tenant::delete_tenant))
         // File tree listing
-        .route("/:tenant_id/files", get(routes::files::list_files))
+        .route("/:collection_id/:tenant_id/files", get(routes::files::list_files))
         // Individual file operations
         .route(
-            "/:tenant_id/files/*path",
+            "/:collection_id/:tenant_id/files/*path",
             get(routes::files::read_file)
                 .put(routes::files::write_file)
                 .delete(routes::files::delete_file)
                 .post(routes::files::move_file),
         )
         // Commit history
-        .route("/:tenant_id/commits", get(routes::commits::list_commits))
-        .route("/:tenant_id/commits/:sha", get(routes::commits::get_commit))
+        .route("/:collection_id/:tenant_id/commits", get(routes::commits::list_commits))
+        .route("/:collection_id/:tenant_id/commits/:sha", get(routes::commits::get_commit))
         .route(
-            "/:tenant_id/commits/:sha/revert",
+            "/:collection_id/:tenant_id/commits/:sha/revert",
             post(routes::commits::revert_commit),
         )
         // Require a valid Bearer token on every route.
