@@ -26,7 +26,12 @@ pub async fn delete_tenant(
 
     tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, "handling delete tenant request");
 
-    let repo_path = state.config.server.repos_path.join(&collection_id).join(&tenant_id);
+    let repo_path = state
+        .config
+        .server
+        .repos_path
+        .join(&collection_id)
+        .join(&tenant_id);
 
     let lock_key = format!("{}/{}", collection_id, tenant_id);
 

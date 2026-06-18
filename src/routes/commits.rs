@@ -43,7 +43,12 @@ pub async fn list_commits(
 ) -> Result<impl IntoResponse, AppError> {
     let collection_id = validate::collection_id(&collection_id)?.to_string();
     let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
-    let repo_path = state.config.server.repos_path.join(&collection_id).join(&tenant_id);
+    let repo_path = state
+        .config
+        .server
+        .repos_path
+        .join(&collection_id)
+        .join(&tenant_id);
 
     let page = query_params.page.unwrap_or(1).max(1);
     let per_page = query_params
@@ -82,7 +87,12 @@ pub async fn get_commit(
 
     tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, sha = %sha, "handling get commit request");
 
-    let repo_path = state.config.server.repos_path.join(&collection_id).join(&tenant_id);
+    let repo_path = state
+        .config
+        .server
+        .repos_path
+        .join(&collection_id)
+        .join(&tenant_id);
 
     let tenant_id_for_task = tenant_id.clone();
 
@@ -113,7 +123,12 @@ pub async fn revert_commit(
 
     tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, sha = %sha, "handling revert commit request");
 
-    let repo_path = state.config.server.repos_path.join(&collection_id).join(&tenant_id);
+    let repo_path = state
+        .config
+        .server
+        .repos_path
+        .join(&collection_id)
+        .join(&tenant_id);
 
     let lock_key = format!("{}/{}", collection_id, tenant_id);
     let lock = state.get_repo_lock(&lock_key);

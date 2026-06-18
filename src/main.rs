@@ -97,9 +97,15 @@ async fn main() {
 fn build_router(app_state: AppState) -> Router {
     let api_routes = Router::new()
         // Tenant management
-        .route("/:collection_id/:tenant_id", delete(routes::tenant::delete_tenant))
+        .route(
+            "/:collection_id/:tenant_id",
+            delete(routes::tenant::delete_tenant),
+        )
         // File tree listing
-        .route("/:collection_id/:tenant_id/files", get(routes::files::list_files))
+        .route(
+            "/:collection_id/:tenant_id/files",
+            get(routes::files::list_files),
+        )
         // Individual file operations
         .route(
             "/:collection_id/:tenant_id/files/*path",
@@ -109,8 +115,14 @@ fn build_router(app_state: AppState) -> Router {
                 .post(routes::files::move_file),
         )
         // Commit history
-        .route("/:collection_id/:tenant_id/commits", get(routes::commits::list_commits))
-        .route("/:collection_id/:tenant_id/commits/:sha", get(routes::commits::get_commit))
+        .route(
+            "/:collection_id/:tenant_id/commits",
+            get(routes::commits::list_commits),
+        )
+        .route(
+            "/:collection_id/:tenant_id/commits/:sha",
+            get(routes::commits::get_commit),
+        )
         .route(
             "/:collection_id/:tenant_id/commits/:sha/revert",
             post(routes::commits::revert_commit),

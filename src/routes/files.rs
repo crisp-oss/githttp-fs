@@ -50,7 +50,12 @@ pub async fn list_files(
 
     tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, "handling list files request");
 
-    let repo_path = state.config.server.repos_path.join(&collection_id).join(&tenant_id);
+    let repo_path = state
+        .config
+        .server
+        .repos_path
+        .join(&collection_id)
+        .join(&tenant_id);
 
     let tenant_id_for_task = tenant_id.clone();
 
@@ -74,7 +79,12 @@ pub async fn read_file(
 
     tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %file_path, "handling read file request");
 
-    let repo_path = state.config.server.repos_path.join(&collection_id).join(&tenant_id);
+    let repo_path = state
+        .config
+        .server
+        .repos_path
+        .join(&collection_id)
+        .join(&tenant_id);
 
     let file_path_for_task = file_path.clone();
     let tenant_id_for_task = tenant_id.clone();
@@ -103,7 +113,12 @@ pub async fn write_file(
 
     tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %file_path, "handling write file request");
 
-    let repo_path = state.config.server.repos_path.join(&collection_id).join(&tenant_id);
+    let repo_path = state
+        .config
+        .server
+        .repos_path
+        .join(&collection_id)
+        .join(&tenant_id);
 
     let lock_key = format!("{}/{}", collection_id, tenant_id);
     let lock = state.get_repo_lock(&lock_key);
@@ -154,7 +169,12 @@ pub async fn delete_file(
 
     tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %file_path, "handling delete file request");
 
-    let repo_path = state.config.server.repos_path.join(&collection_id).join(&tenant_id);
+    let repo_path = state
+        .config
+        .server
+        .repos_path
+        .join(&collection_id)
+        .join(&tenant_id);
 
     let lock_key = format!("{}/{}", collection_id, tenant_id);
     let lock = state.get_repo_lock(&lock_key);
@@ -223,7 +243,12 @@ pub async fn move_file(
         "handling move file request"
     );
 
-    let repo_path = state.config.server.repos_path.join(&collection_id).join(&tenant_id);
+    let repo_path = state
+        .config
+        .server
+        .repos_path
+        .join(&collection_id)
+        .join(&tenant_id);
 
     let lock_key = format!("{}/{}", collection_id, tenant_id);
     let lock = state.get_repo_lock(&lock_key);
