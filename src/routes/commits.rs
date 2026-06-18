@@ -55,16 +55,17 @@ pub async fn list_commits(
 
     let tenant_id_for_task = tenant_id.clone();
 
-    let commits = run_blocking(move || {
+    let (commits, has_more) = run_blocking(move || {
         git::GitCommits::list_commits(&repo_path, &tenant_id_for_task, page, per_page)
     })
     .await?;
 
-    tracing::debug!(tenant_id = %tenant_id, page = page, returned = commits.len(), "list commits response ready");
+    tracing::debug!(tenant_id = %tenant_id, page = page, returned = commits.len(), has_more = has_more, "list commits response ready");
 
     Ok(Json(json!({
         "page": page,
         "per_page": per_page,
+        "has_more": has_more,
         "commits": commits,
     })))
 }

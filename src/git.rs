@@ -716,7 +716,7 @@ impl GitCommits {
         tenant_id: &str,
         page: usize,
         per_page: usize,
-    ) -> Result<Vec<CommitSummary>, AppError> {
+    ) -> Result<(Vec<CommitSummary>, bool), AppError> {
         tracing::debug!(tenant_id = %tenant_id, page = page, per_page = per_page, "listing commits");
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
@@ -732,9 +732,10 @@ impl GitCommits {
 
         tracing::trace!(tenant_id = %tenant_id, skip_count = skip_count, per_page = per_page, "walking commit graph");
 
-        let commits: Vec<CommitSummary> = revwalk
+        // Fetch one extra to detect whether a next page exists without a full count.
+        let mut commits: Vec<CommitSummary> = revwalk
             .skip(skip_count)
-            .take(per_page)
+            .take(per_page + 1)
             .filter_map(|oid_result| oid_result.ok())
             .filter_map(|oid| repo.find_commit(oid).ok())
             .map(|commit| CommitSummary {
@@ -748,9 +749,13 @@ impl GitCommits {
             })
             .collect();
 
-        tracing::debug!(tenant_id = %tenant_id, page = page, returned = commits.len(), "commit listing complete");
+        let has_more = commits.len() > per_page;
 
-        Ok(commits)
+        commits.truncate(per_page);
+
+        tracing::debug!(tenant_id = %tenant_id, page = page, returned = commits.len(), has_more = has_more, "commit listing complete");
+
+        Ok((commits, has_more))
     }
 
     pub fn get_commit(

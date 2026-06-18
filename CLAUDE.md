@@ -109,6 +109,7 @@ All write requests share a required `author` object. `message` is optional every
 {
   "page": 1,
   "per_page": 100,
+  "has_more": false,
   "commits": [
     {
       "sha": "a3f9c1d",
