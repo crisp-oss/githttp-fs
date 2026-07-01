@@ -33,12 +33,12 @@ All routes are prefixed `/v1` and require `Authorization: Bearer <api_key>`.
 | Method | Path | Description |
 |--------|------|-------------|
 | `DELETE` | `/v1/:collection_id/:tenant_id` | Delete entire tenant repository |
-| `GET` | `/v1/:collection_id/:tenant_id/files` | List all tracked files (path + size) |
+| `GET` | `/v1/:collection_id/:tenant_id/files?prefix_path=` | List tracked files as a tree; optional `prefix_path` scopes the listing to a sub-directory (e.g. `?prefix_path=/docs`) |
 | `GET` | `/v1/:collection_id/:tenant_id/files/*path` | Read file content |
 | `PUT` | `/v1/:collection_id/:tenant_id/files/*path` | Create or update a file |
 | `DELETE` | `/v1/:collection_id/:tenant_id/files/*path` | Delete a file |
 | `POST` | `/v1/:collection_id/:tenant_id/files/*path/move` | Move / rename a file |
-| `GET` | `/v1/:collection_id/:tenant_id/commits?page=&per_page=` | List commits, paginated (default 100, max 500) |
+| `GET` | `/v1/:collection_id/:tenant_id/commits?page=&per_page=&file_path=` | List commits, paginated (default 100, max 500); optional `file_path` filters to commits touching that file, following renames backward |
 | `GET` | `/v1/:collection_id/:tenant_id/commits/:sha` | Commit detail with per-file diffs and snapshots |
 | `POST` | `/v1/:collection_id/:tenant_id/commits/:sha/revert` | Revert a commit |
 
@@ -82,7 +82,7 @@ All write requests share a required `author` object. `message` is optional every
 
 ### Response shapes
 
-**GET** `/files` — file listing
+**GET** `/files` — file listing (tree rooted at the optional `?prefix_path=` folder, or the repo root if omitted)
 ```json
 {
   "files": [
@@ -90,6 +90,8 @@ All write requests share a required `author` object. `message` is optional every
   ]
 }
 ```
+
+The `prefix_path` query parameter must be a folder path (e.g. `/docs` or `docs/sub`). Leading and trailing slashes are stripped. `..`, `.`, and `.git` components are rejected with `400`. Passing `/` or omitting the parameter lists the full repository. When `prefix_path` points to a non-existent folder the response is an empty tree.
 
 **GET** `/files/*path` — read file
 ```json
@@ -120,6 +122,8 @@ All write requests share a required `author` object. `message` is optional every
   ]
 }
 ```
+
+The optional `file_path` query parameter (e.g. `?file_path=docs/intro.md`) filters the list to commits that touched that exact file. Rename history is followed: if the file was previously known under a different name, commits that touched it under the old name are included. Always pass the current (latest) path; the server resolves prior names automatically. The same `..`, `.`, and `.git` rejection rules as other path parameters apply.
 
 **GET** `/commits/:sha` — commit detail
 ```json

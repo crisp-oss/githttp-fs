@@ -48,6 +48,45 @@ pub fn tenant_id(raw: &str) -> Result<&str, AppError> {
     }
 }
 
+/// Strips leading/trailing slashes and rejects folder paths that try to escape
+/// the repo root or access git internals. Returns the sanitised relative path,
+/// or an empty string if the caller passed `/` or an empty string (= repo root).
+pub fn folder_path(raw: &str) -> Result<&str, AppError> {
+    let path = raw.trim_matches('/');
+
+    if path.is_empty() {
+        return Ok(path);
+    }
+
+    for component in Path::new(path).components() {
+        match component {
+            Component::ParentDir => {
+                return Err(AppError::InvalidPath {
+                    reason: "path must not contain '..' components".to_string(),
+                });
+            }
+            Component::CurDir => {
+                return Err(AppError::InvalidPath {
+                    reason: "path must not contain '.' components".to_string(),
+                });
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(AppError::InvalidPath {
+                    reason: "path must be relative".to_string(),
+                });
+            }
+            Component::Normal(name) if name == ".git" => {
+                return Err(AppError::InvalidPath {
+                    reason: "path must not reference .git".to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    Ok(path)
+}
+
 /// Strips a leading slash and rejects paths that try to escape the repo root
 /// or access git internals. Returns the sanitised relative path.
 pub fn file_path(raw: &str) -> Result<&str, AppError> {

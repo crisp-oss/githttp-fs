@@ -391,8 +391,12 @@ impl GitLocks {
 pub struct GitFiles;
 
 impl GitFiles {
-    pub fn list_files(repo_path: &Path, tenant_id: &str) -> Result<Vec<TreeNode>, AppError> {
-        tracing::debug!(tenant_id = %tenant_id, "listing files");
+    pub fn list_files(
+        repo_path: &Path,
+        tenant_id: &str,
+        path_prefix: Option<&str>,
+    ) -> Result<Vec<TreeNode>, AppError> {
+        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, "listing files");
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
         let head_commit = repo.head()?.peel_to_commit()?;
@@ -401,7 +405,13 @@ impl GitFiles {
 
         let head_tree = head_commit.tree()?;
 
-        // Collect flat (path, size) pairs first, then build the tree in one pass.
+        // When a prefix is given, only entries whose path starts with `prefix/`
+        // are kept, and the prefix is stripped before the tree is built so the
+        // result is rooted at the requested folder.
+        let prefix_filter: Option<String> = path_prefix
+            .filter(|p| !p.is_empty())
+            .map(|p| format!("{}/", p));
+
         let mut flat: Vec<(String, usize)> = Vec::new();
 
         head_tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
@@ -411,6 +421,12 @@ impl GitFiles {
 
             let name = entry.name().unwrap_or("");
             let path = format!("{}{}", root, name);
+
+            if let Some(ref prefix) = prefix_filter {
+                if !path.starts_with(prefix.as_str()) {
+                    return git2::TreeWalkResult::Ok;
+                }
+            }
 
             let size = repo
                 .find_blob(entry.id())
@@ -425,6 +441,14 @@ impl GitFiles {
         })?;
 
         tracing::debug!(tenant_id = %tenant_id, count = flat.len(), "file listing complete, building tree");
+
+        let flat = match prefix_filter {
+            Some(ref prefix) => flat
+                .into_iter()
+                .map(|(path, size)| (path[prefix.len()..].to_string(), size))
+                .collect(),
+            None => flat,
+        };
 
         Ok(GitUtils::build_tree(flat))
     }
@@ -716,7 +740,12 @@ impl GitCommits {
         tenant_id: &str,
         page: usize,
         per_page: usize,
+        file_path: Option<&str>,
     ) -> Result<(Vec<CommitSummary>, bool), AppError> {
+        if let Some(path) = file_path {
+            return Self::list_commits_by_file(repo_path, tenant_id, page, per_page, path);
+        }
+
         tracing::debug!(tenant_id = %tenant_id, page = page, per_page = per_page, "listing commits");
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
@@ -754,6 +783,198 @@ impl GitCommits {
         commits.truncate(per_page);
 
         tracing::debug!(tenant_id = %tenant_id, page = page, returned = commits.len(), has_more = has_more, "commit listing complete");
+
+        Ok((commits, has_more))
+    }
+
+    /// Walks the commit graph from HEAD, diffing each commit against its parent
+    /// with rename detection enabled, and collects only commits that touched
+    /// `file_path` (following the file backward through any renames).
+    ///
+    /// Pagination is applied after matching: we collect up to
+    /// `(page-1)*per_page + per_page + 1` matching commits, then slice.
+    fn list_commits_by_file(
+        repo_path: &Path,
+        tenant_id: &str,
+        page: usize,
+        per_page: usize,
+        file_path: &str,
+    ) -> Result<(Vec<CommitSummary>, bool), AppError> {
+        tracing::debug!(
+            tenant_id = %tenant_id,
+            page = page,
+            per_page = per_page,
+            file_path = %file_path,
+            "listing commits by file path"
+        );
+
+        let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
+
+        let mut revwalk = repo.revwalk()?;
+
+        revwalk.push_head()?;
+        revwalk.set_sorting(Sort::TIME | Sort::TOPOLOGICAL)?;
+
+        let skip_count = page.saturating_sub(1).saturating_mul(per_page);
+        // Collect one extra beyond what we need so we can detect has_more.
+        let need = skip_count + per_page + 1;
+
+        // The name of the file we are tracking. Updated when we cross a rename.
+        let mut current_path = file_path.to_string();
+        let mut matching: Vec<CommitSummary> = Vec::new();
+
+        for oid_result in revwalk {
+            if matching.len() >= need {
+                break;
+            }
+
+            let oid = match oid_result {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+
+            let commit = match repo.find_commit(oid) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let commit_tree = match commit.tree() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+
+            // For the root commit there is no parent tree to diff against — the
+            // file is "created" here if it exists in the tree under the current name.
+            let (is_match, rename_from) = if commit.parent_count() == 0 {
+                let exists = commit_tree.get_path(Path::new(&current_path)).is_ok();
+
+                tracing::trace!(
+                    tenant_id = %tenant_id,
+                    sha = %commit.id(),
+                    path = %current_path,
+                    exists = exists,
+                    "checking root commit for file"
+                );
+
+                (exists, None)
+            } else {
+                let parent_tree = match commit.parent(0).and_then(|p| p.tree()) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+
+                let mut diff_opts = DiffOptions::new();
+
+                diff_opts.include_untracked(false);
+
+                let mut diff = match repo.diff_tree_to_tree(
+                    Some(&parent_tree),
+                    Some(&commit_tree),
+                    Some(&mut diff_opts),
+                ) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+
+                let mut find_opts = DiffFindOptions::new();
+
+                find_opts.renames(true);
+
+                let _ = diff.find_similar(Some(&mut find_opts));
+
+                let mut matched = false;
+                let mut rename_from: Option<String> = None;
+
+                for i in 0..diff.deltas().count() {
+                    let delta = match diff.get_delta(i) {
+                        Some(d) => d,
+                        None => continue,
+                    };
+
+                    let old = delta
+                        .old_file()
+                        .path()
+                        .map(|p| p.to_string_lossy().into_owned());
+
+                    let new = delta
+                        .new_file()
+                        .path()
+                        .map(|p| p.to_string_lossy().into_owned());
+
+                    match delta.status() {
+                        Delta::Renamed => {
+                            if new.as_deref() == Some(current_path.as_str()) {
+                                tracing::trace!(
+                                    tenant_id = %tenant_id,
+                                    sha = %commit.id(),
+                                    from = ?old,
+                                    to = %current_path,
+                                    "rename detected, following path backward"
+                                );
+
+                                matched = true;
+                                rename_from = old;
+                                break;
+                            }
+                        }
+                        Delta::Added | Delta::Modified => {
+                            if new.as_deref() == Some(current_path.as_str()) {
+                                matched = true;
+                                break;
+                            }
+                        }
+                        Delta::Deleted => {
+                            if old.as_deref() == Some(current_path.as_str()) {
+                                matched = true;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                (matched, rename_from)
+            };
+
+            if is_match {
+                tracing::trace!(
+                    tenant_id = %tenant_id,
+                    sha = %commit.id(),
+                    path = %current_path,
+                    "commit matched file path filter"
+                );
+
+                matching.push(CommitSummary {
+                    sha: commit.id().to_string(),
+                    message: commit.message().unwrap_or("").to_string(),
+                    author: CommitAuthor {
+                        name: commit.author().name().unwrap_or("").to_string(),
+                        email: commit.author().email().unwrap_or("").to_string(),
+                    },
+                    committed_at: GitUtils::timestamp_from_git_time(commit.time()),
+                });
+
+                if let Some(old_name) = rename_from {
+                    current_path = old_name;
+                }
+            }
+        }
+
+        let has_more = matching.len() > skip_count + per_page;
+
+        let commits = matching
+            .into_iter()
+            .skip(skip_count)
+            .take(per_page)
+            .collect();
+
+        tracing::debug!(
+            tenant_id = %tenant_id,
+            page = page,
+            returned = per_page,
+            has_more = has_more,
+            "commit listing by file complete"
+        );
 
         Ok((commits, has_more))
     }

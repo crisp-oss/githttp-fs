@@ -23,6 +23,7 @@ use crate::{
 pub struct ListCommitsQuery {
     pub page: Option<usize>,
     pub per_page: Option<usize>,
+    pub file_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -55,13 +56,25 @@ pub async fn list_commits(
         .per_page
         .unwrap_or(DEFAULT_PER_PAGE)
         .clamp(1, MAX_PER_PAGE);
+    let file_path: Option<String> = query_params
+        .file_path
+        .as_deref()
+        .map(validate::file_path)
+        .transpose()?
+        .map(|p| p.to_string());
 
-    tracing::debug!(tenant_id = %tenant_id, page = page, per_page = per_page, "handling list commits request");
+    tracing::debug!(tenant_id = %tenant_id, page = page, per_page = per_page, file_path = ?file_path, "handling list commits request");
 
     let tenant_id_for_task = tenant_id.clone();
 
     let (commits, has_more) = run_blocking(move || {
-        git::GitCommits::list_commits(&repo_path, &tenant_id_for_task, page, per_page)
+        git::GitCommits::list_commits(
+            &repo_path,
+            &tenant_id_for_task,
+            page,
+            per_page,
+            file_path.as_deref(),
+        )
     })
     .await?;
 

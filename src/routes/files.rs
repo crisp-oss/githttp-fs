@@ -5,7 +5,7 @@
 // License: Mozilla Public License v2.0 (MPL v2.0)
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -18,6 +18,11 @@ use crate::{
     error::AppError, git, hooks::HookDelivery, routes::AuthorRequest, state::AppState,
     util::run_blocking, validate,
 };
+
+#[derive(Deserialize)]
+pub struct ListFilesQuery {
+    pub prefix_path: Option<String>,
+}
 
 #[derive(Deserialize)]
 pub struct WriteFileRequest {
@@ -41,14 +46,26 @@ pub struct MoveFileRequest {
 
 /// GET /:collection_id/:tenant_id/files
 /// Returns the repository contents as a recursive file tree.
+/// Accepts an optional `prefix_path` query parameter (e.g. `?prefix_path=/docs`) to scope
+/// the listing to a specific sub-directory. The path must be a folder and must
+/// not escape the repository root (`..' components are rejected).
 pub async fn list_files(
     State(state): State<AppState>,
     Path((collection_id, tenant_id)): Path<(String, String)>,
+    Query(query): Query<ListFilesQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let collection_id = validate::collection_id(&collection_id)?.to_string();
     let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
 
-    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, "handling list files request");
+    let path_prefix: Option<String> = query
+        .prefix_path
+        .as_deref()
+        .map(validate::folder_path)
+        .transpose()?
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_string());
+
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path_prefix = ?path_prefix, "handling list files request");
 
     let repo_path = state
         .config
@@ -59,8 +76,10 @@ pub async fn list_files(
 
     let tenant_id_for_task = tenant_id.clone();
 
-    let tree =
-        run_blocking(move || git::GitFiles::list_files(&repo_path, &tenant_id_for_task)).await?;
+    let tree = run_blocking(move || {
+        git::GitFiles::list_files(&repo_path, &tenant_id_for_task, path_prefix.as_deref())
+    })
+    .await?;
 
     tracing::debug!(tenant_id = %tenant_id, "list files tree response ready");
 
