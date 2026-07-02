@@ -245,6 +245,10 @@ cargo run -- -c /etc/githttp-fs.toml
 RUST_LOG=debug cargo run                     # overrides log_level in config
 ```
 
+## Development workflow
+
+After applying code changes, always run `cargo fmt` before `cargo build`.
+
 ## Docker
 
 Two-stage build: compiles in `rust:alpine` (static musl binary), runs in `alpine:3.22`.
