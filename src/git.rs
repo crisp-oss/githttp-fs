@@ -472,6 +472,38 @@ impl GitFiles {
         GitUtils::blob_content_from_tree(&repo, &head_tree, file_path)
     }
 
+    /// Checks that a file exists in HEAD's tree without reading its content.
+    /// Returns `FileNotFound` when the path is absent or resolves to a folder.
+    pub fn file_exists(
+        repo_path: &Path,
+        tenant_id: &str,
+        file_path: &str,
+    ) -> Result<(), AppError> {
+        tracing::debug!(tenant_id = %tenant_id, path = %file_path, "checking file existence");
+
+        let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
+        let head_commit = repo.head()?.peel_to_commit()?;
+
+        tracing::trace!(tenant_id = %tenant_id, path = %file_path, head_sha = %head_commit.id(), "resolved HEAD for existence check");
+
+        let head_tree = head_commit.tree()?;
+
+        let tree_entry =
+            head_tree
+                .get_path(Path::new(file_path))
+                .map_err(|_err| AppError::FileNotFound {
+                    path: file_path.to_string(),
+                })?;
+
+        if tree_entry.kind() != Some(git2::ObjectType::Blob) {
+            return Err(AppError::FileNotFound {
+                path: file_path.to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
     /// Writes a file to disk, stages it, and creates a commit.
     /// Returns the commit SHA and the type of change (created vs updated).
     pub fn write_file(

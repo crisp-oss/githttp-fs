@@ -110,6 +110,7 @@ fn build_router(app_state: AppState) -> Router {
         .route(
             "/{collection_id}/{tenant_id}/files/{*path}",
             get(routes::files::read_file)
+                .head(routes::files::file_exists)
                 .put(routes::files::write_file)
                 .delete(routes::files::delete_file)
                 .post(routes::files::move_file),

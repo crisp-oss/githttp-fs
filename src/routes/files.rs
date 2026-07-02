@@ -119,6 +119,31 @@ pub async fn read_file(
     })))
 }
 
+/// HEAD /:collection_id/:tenant_id/files/*path
+/// Returns 200 with no body when the file exists in HEAD, 404 otherwise.
+/// Cheaper than GET as the blob content is never loaded.
+pub async fn file_exists(
+    State(state): State<AppState>,
+    Path((collection_id, tenant_id, file_path)): Path<(String, String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    let collection_id = validate::collection_id(&collection_id)?.to_string();
+    let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
+    let file_path = validate::file_path(&file_path)?.to_string();
+
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %file_path, "handling file existence request");
+
+    let repo_path = state
+        .config
+        .server
+        .repos_path
+        .join(&collection_id)
+        .join(&tenant_id);
+
+    run_blocking(move || git::GitFiles::file_exists(&repo_path, &tenant_id, &file_path)).await?;
+
+    Ok(StatusCode::OK)
+}
+
 /// PUT /:collection_id/:tenant_id/files/*path
 /// Creates or updates a file, commits the change, and fires a hook.
 pub async fn write_file(
