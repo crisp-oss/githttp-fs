@@ -474,11 +474,7 @@ impl GitFiles {
 
     /// Checks that a file exists in HEAD's tree without reading its content.
     /// Returns `FileNotFound` when the path is absent or resolves to a folder.
-    pub fn file_exists(
-        repo_path: &Path,
-        tenant_id: &str,
-        file_path: &str,
-    ) -> Result<(), AppError> {
+    pub fn file_exists(repo_path: &Path, tenant_id: &str, file_path: &str) -> Result<(), AppError> {
         tracing::debug!(tenant_id = %tenant_id, path = %file_path, "checking file existence");
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
