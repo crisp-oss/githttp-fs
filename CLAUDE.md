@@ -102,6 +102,8 @@ The `prefix_path` query parameter must be a folder path (e.g. `/docs` or `docs/s
 }
 ```
 
+**HEAD** `/files/*path` — check file existence. Responds `200` with an empty body when the file exists in the last committed state, `404` when it doesn't (including when the path points to a folder or the tenant doesn't exist). Blob content is never loaded, so this is cheaper than a GET.
+
 **PUT / DELETE / POST move** — write result
 ```json
 { "commit_sha": "a3f9c1d" }
