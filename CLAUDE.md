@@ -35,6 +35,7 @@ All routes are prefixed `/v1` and require `Authorization: Bearer <api_key>`.
 | `DELETE` | `/v1/:collection_id/:tenant_id` | Delete entire tenant repository |
 | `GET` | `/v1/:collection_id/:tenant_id/files?prefix_path=` | List tracked files as a tree; optional `prefix_path` scopes the listing to a sub-directory (e.g. `?prefix_path=/docs`) |
 | `GET` | `/v1/:collection_id/:tenant_id/files/*path` | Read file content |
+| `HEAD` | `/v1/:collection_id/:tenant_id/files/*path` | Check that a file exists (`200` or `404`, no body) |
 | `PUT` | `/v1/:collection_id/:tenant_id/files/*path` | Create or update a file |
 | `DELETE` | `/v1/:collection_id/:tenant_id/files/*path` | Delete a file |
 | `POST` | `/v1/:collection_id/:tenant_id/files/*path/move` | Move / rename a file |
