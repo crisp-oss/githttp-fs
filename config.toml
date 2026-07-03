@@ -8,7 +8,7 @@ api_key = "MySecretAPIKey"
 repos_path = "./dev/repositories"
 log_level = "debug"
 
-allowed_extensions = ["md", "mdx"]
+allowed_extensions = ["html", "txt", "toml", "json", "md", "mdx"]
 
 [hooks]
 
