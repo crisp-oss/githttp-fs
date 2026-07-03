@@ -12,10 +12,11 @@
 //! failed writes can orphan unreachable blobs. A busy tenant accumulates
 //! thousands of tiny files, which slows down object lookups and wastes
 //! disk. Git normally solves this with `git gc`; githttp-fs does the
-//! equivalent in-process (see `GitMaintenance` in `git.rs`) — repacking all
-//! reachable objects into a single consolidated packfile, pruning
-//! unreachable ones, and expiring reflogs — with no dependency on a `git`
-//! binary.
+//! equivalent in-process (see `GitMaintenance` in `git.rs`) — repacking
+//! everything into a single consolidated packfile and expiring reflogs,
+//! plus pruning unreachable objects when `destructive_prune` is enabled
+//! (off by default: with it off, maintenance can never destroy data) —
+//! with no dependency on a `git` binary.
 //!
 //! Why the scheduler works the way it does:
 //!
@@ -81,6 +82,7 @@ impl MaintenanceScheduler {
         }
 
         let delay_secs = self.config.maintenance.delay_secs;
+        let destructive_prune = self.config.maintenance.destructive_prune;
         let pending = self.pending.clone();
         let task_tenant_key = tenant_key.to_string();
 
@@ -95,7 +97,9 @@ impl MaintenanceScheduler {
 
             let repo_path_for_task = repo_path.clone();
 
-            match run_blocking(move || GitMaintenance::run(&repo_path_for_task)).await {
+            match run_blocking(move || GitMaintenance::run(&repo_path_for_task, destructive_prune))
+                .await
+            {
                 Ok(report) => {
                     tracing::info!(
                         tenant = %task_tenant_key,

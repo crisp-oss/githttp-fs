@@ -64,7 +64,8 @@ impl Config {
 }
 
 /// Background repository maintenance (repack into a single consolidated
-/// packfile, prune unreachable objects, expire reflogs, refresh the index).
+/// packfile, expire reflogs, refresh the index — and optionally prune
+/// unreachable objects).
 /// The section is optional; omitting it enables maintenance with a 24h delay.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
@@ -72,6 +73,13 @@ pub struct MaintenanceConfig {
     pub enabled: bool,
     /// Delay between the first write to a repository and its maintenance pass.
     pub delay_secs: u64,
+    /// When true, the maintenance repack keeps only objects reachable from a
+    /// ref, permanently dropping unreachable ones (e.g. blobs orphaned by
+    /// writes that failed mid-operation). When false (the default), every
+    /// object in the store is carried over into the consolidated pack, so
+    /// maintenance can never destroy data under any circumstance — at the
+    /// cost of orphaned garbage being retained forever.
+    pub destructive_prune: bool,
 }
 
 impl Default for MaintenanceConfig {
@@ -80,6 +88,7 @@ impl Default for MaintenanceConfig {
             enabled: true,
             // 24 hours
             delay_secs: 86_400,
+            destructive_prune: false,
         }
     }
 }

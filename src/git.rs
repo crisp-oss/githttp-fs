@@ -16,7 +16,8 @@
 //! - `GitUtils` — private low-level helpers (signatures, repo open/init,
 //!   blob reads, tree building)
 //! - `GitLocks` — stale `.git/index.lock` cleanup
-//! - `GitMaintenance` — loose-object packing + index refresh
+//! - `GitMaintenance` — consolidating repack, optional prune, reflog
+//!   expiry, index refresh
 //! - `GitFiles` — file CRUD (list / read / exists / write / delete / move)
 //! - `GitCommits` — history listing, commit detail, revert
 //! - `GitTenant` — tenant repository deletion
@@ -517,7 +518,7 @@ impl GitLocks {
 }
 
 // ---------------------------------------------------------------------------
-// GitMaintenance — background repack, prune, reflog expiry, index refresh
+// GitMaintenance — background repack, optional prune, reflog expiry, index refresh
 // ---------------------------------------------------------------------------
 
 /// Summary of what one maintenance pass did, consumed by the scheduler's log
@@ -527,17 +528,19 @@ pub struct MaintenanceReport {
     /// Reachable objects written into the consolidated packfile
     /// (0 when the repack was skipped because nothing had changed).
     pub packed_objects: usize,
-    /// Loose object files deleted. Reachable ones now live in the new pack;
-    /// the remainder were unreachable and are thereby pruned.
+    /// Loose object files deleted. All of them live on in the new pack —
+    /// except, when `destructive_prune` is enabled, unreachable ones, which
+    /// are thereby pruned.
     pub loose_objects_removed: usize,
     /// Superseded packfiles deleted after consolidation.
     pub old_packs_removed: usize,
 }
 
 /// The maintenance pass itself (the *when* lives in `maintenance.rs`; this
-/// is the *what*). Equivalent in spirit to `git repack -a -d` + `git prune`
-/// + `git reflog expire --all` + `git read-tree HEAD`, implemented directly
-/// against libgit2 so the binary stays self-contained.
+/// is the *what*). Equivalent in spirit to `git repack -a -d` + `git reflog
+/// expire --all` + `git read-tree HEAD` — plus `git prune` when
+/// `destructive_prune` is enabled — implemented directly against libgit2 so
+/// the binary stays self-contained.
 pub struct GitMaintenance;
 
 impl GitMaintenance {
@@ -547,12 +550,18 @@ impl GitMaintenance {
     ///    rewritten and the API never exposes them, yet every commit appends
     ///    an entry, so they grow without bound. They are simply deleted (and
     ///    start accumulating again until the next pass).
-    /// 2. **Reachability repack** — every object reachable from any ref is
-    ///    written into one new packfile, then *all* loose objects and *all*
-    ///    superseded packfiles are deleted. Consolidation and pruning fall
-    ///    out of the same step: reachable objects survive in the new pack,
-    ///    unreachable ones (e.g. blobs orphaned by a write that failed
-    ///    between blob creation and commit) simply aren't carried over.
+    /// 2. **Consolidating repack** — one new packfile is written, then *all*
+    ///    loose objects and *all* superseded packfiles are deleted. What
+    ///    goes into that pack depends on `destructive_prune`:
+    ///    - `false` (default): every object in the store, reachable or not.
+    ///      Maintenance can then never destroy data under any circumstance;
+    ///      orphaned garbage (e.g. blobs from writes that failed between
+    ///      blob creation and commit) is retained forever.
+    ///    - `true`: only objects reachable from a ref. Orphaned garbage is
+    ///      permanently pruned. Note this never touches *history*: commits
+    ///      are append-only in this system, so every past file version —
+    ///      including versions of since-deleted files — stays reachable
+    ///      through its commit and is always carried over.
     ///    Skipped entirely when the repository is already consolidated (no
     ///    loose objects, at most one pack).
     /// 3. **Index refresh** — the on-disk index is reset to HEAD so
@@ -571,7 +580,7 @@ impl GitMaintenance {
     /// does not invalidate the mapping (POSIX unlink semantics), and on a
     /// missed lookup libgit2 rescans the pack directory and finds the new
     /// consolidated pack.
-    pub fn run(repo_path: &Path) -> Result<MaintenanceReport, AppError> {
+    pub fn run(repo_path: &Path, destructive_prune: bool) -> Result<MaintenanceReport, AppError> {
         // The tenant may have been deleted while the timer was armed.
         if !repo_path.join(".git").exists() {
             tracing::debug!(path = %repo_path.display(), "repository gone, skipping maintenance");
@@ -590,6 +599,7 @@ impl GitMaintenance {
             path = %repo_path.display(),
             loose_objects = loose_objects.len(),
             packs = packs_before.len(),
+            destructive_prune = destructive_prune,
             "running repository maintenance"
         );
 
@@ -599,7 +609,13 @@ impl GitMaintenance {
         let report = if loose_objects.is_empty() && packs_before.len() <= 1 {
             MaintenanceReport::default()
         } else {
-            Self::repack_reachable(&repo, repo_path, &loose_objects, &packs_before)?
+            Self::repack(
+                &repo,
+                repo_path,
+                destructive_prune,
+                &loose_objects,
+                &packs_before,
+            )?
         };
 
         // Refresh the on-disk index to HEAD. Clean a stale index.lock first —
@@ -615,52 +631,35 @@ impl GitMaintenance {
         Ok(report)
     }
 
-    /// Writes one packfile holding every reachable object, then deletes the
+    /// Writes one consolidated packfile — holding either every object or
+    /// only the reachable ones, per `destructive_prune` — then deletes the
     /// now-redundant loose objects and superseded packs.
     ///
     /// Crash safety: the new pack is fully written and committed to the ODB
     /// *before* anything is deleted, so a failure at any point never loses
     /// objects — at worst it leaves redundant copies that the next pass
     /// cleans up.
-    fn repack_reachable(
+    fn repack(
         repo: &Repository,
         repo_path: &Path,
+        destructive_prune: bool,
         loose_objects: &[(Oid, PathBuf)],
         packs_before: &HashSet<PathBuf>,
     ) -> Result<MaintenanceReport, AppError> {
+        let odb = repo.odb()?;
         let mut pack_builder = repo.packbuilder()?;
-        let mut revwalk = repo.revwalk()?;
 
-        // Reachability roots: HEAD plus every ref. The service itself only
-        // ever creates HEAD/master, but a human may have added branches or
-        // tags while inspecting a repo — a destructive prune must honour
-        // those, not silently corrupt them.
-        revwalk.push_head()?;
-
-        for reference in repo.references()?.flatten() {
-            if let Ok(name) = reference.name() {
-                let _ = revwalk.push_ref(name);
-            }
-
-            // `push_ref` peels an annotated tag down to its commit for the
-            // walk; the tag *object* itself must be packed separately or the
-            // ref would dangle after the prune.
-            if let Some(oid) = reference.target() {
-                if let Ok(object) = repo.find_object(oid, None) {
-                    if object.kind() == Some(git2::ObjectType::Tag) {
-                        let _ = pack_builder.insert_object(oid, None);
-                    }
-                }
-            }
+        if destructive_prune {
+            Self::insert_reachable_objects(repo, &mut pack_builder)?;
+        } else {
+            // Non-destructive mode: carry over every object in the store —
+            // loose and packed, reachable or not. The ODB iterator visits
+            // all backends; duplicates are deduplicated by the packbuilder.
+            odb.foreach(|oid| pack_builder.insert_object(*oid, None).is_ok())?;
         }
-
-        // Inserts every commit in the walk plus all trees and blobs they
-        // reference, deduplicated — the complete reachable object set.
-        pack_builder.insert_walk(&mut revwalk)?;
 
         // Stream the pack straight into the ODB — this writes both the
         // .pack and its .idx under .git/objects/pack.
-        let odb = repo.odb()?;
         let mut pack_writer = odb.packwriter()?;
 
         pack_builder.foreach(|chunk| {
@@ -721,6 +720,46 @@ impl GitMaintenance {
         }
 
         Ok(report)
+    }
+
+    /// Feeds the packbuilder with the complete reachable object set: every
+    /// commit reachable from any ref, plus all trees and blobs those commits
+    /// reference. Objects *not* collected here are the ones a destructive
+    /// prune drops, so this must err on the side of keeping things.
+    fn insert_reachable_objects(
+        repo: &Repository,
+        pack_builder: &mut git2::PackBuilder<'_>,
+    ) -> Result<(), AppError> {
+        let mut revwalk = repo.revwalk()?;
+
+        // Reachability roots: HEAD plus every ref. The service itself only
+        // ever creates HEAD/master, but a human may have added branches or
+        // tags while inspecting a repo — a destructive prune must honour
+        // those, not silently corrupt them.
+        revwalk.push_head()?;
+
+        for reference in repo.references()?.flatten() {
+            if let Ok(name) = reference.name() {
+                let _ = revwalk.push_ref(name);
+            }
+
+            // `push_ref` peels an annotated tag down to its commit for the
+            // walk; the tag *object* itself must be packed separately or the
+            // ref would dangle after the prune.
+            if let Some(oid) = reference.target() {
+                if let Ok(object) = repo.find_object(oid, None) {
+                    if object.kind() == Some(git2::ObjectType::Tag) {
+                        let _ = pack_builder.insert_object(oid, None);
+                    }
+                }
+            }
+        }
+
+        // Inserts every commit in the walk plus all trees and blobs they
+        // reference, deduplicated — the complete reachable object set.
+        pack_builder.insert_walk(&mut revwalk)?;
+
+        Ok(())
     }
 
     /// Deletes the reflogs for HEAD and the branch it points at. Best-effort:
