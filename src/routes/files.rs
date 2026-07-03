@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
-    error::AppError, git, hooks::HookDelivery, routes::AuthorRequest, state::AppState,
+    error::AppError, git, hooks::HookJob, routes::AuthorRequest, state::AppState,
     util::run_blocking, validate,
 };
 
@@ -189,6 +189,11 @@ pub async fn write_file(
     let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
     let file_path = validate::file_path(&file_path)?.to_string();
 
+    validate::file_extension(
+        &file_path,
+        state.config.server.allowed_extensions.as_deref(),
+    )?;
+
     tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %file_path, "handling write file request");
 
     let repo_path = state
@@ -220,15 +225,18 @@ pub async fn write_file(
     })
     .await?;
 
-    tracing::debug!(tenant_id = %tenant_id, sha = %commit_sha, "file write committed, spawning hook delivery");
+    tracing::debug!(tenant_id = %tenant_id, sha = %commit_sha, "file write committed, enqueuing hook delivery");
 
-    HookDelivery::spawn(
-        state.http_client.clone(),
-        state.config.clone(),
-        tenant_id,
-        commit_sha.clone(),
-        Utc::now(),
-        vec![file_change],
+    // Enqueued while the tenant write lock is still held, so per-tenant hook
+    // order always matches commit order.
+    state.hook_queue.enqueue(
+        &lock_key,
+        HookJob {
+            tenant_id,
+            commit_sha: commit_sha.clone(),
+            committed_at: Utc::now(),
+            file_changes: vec![file_change],
+        },
     );
 
     Ok((StatusCode::OK, Json(json!({ "commit_sha": commit_sha }))))
@@ -274,15 +282,18 @@ pub async fn delete_file(
     })
     .await?;
 
-    tracing::debug!(tenant_id = %tenant_id, sha = %commit_sha, "file deletion committed, spawning hook delivery");
+    tracing::debug!(tenant_id = %tenant_id, sha = %commit_sha, "file deletion committed, enqueuing hook delivery");
 
-    HookDelivery::spawn(
-        state.http_client.clone(),
-        state.config.clone(),
-        tenant_id,
-        commit_sha.clone(),
-        Utc::now(),
-        vec![file_change],
+    // Enqueued while the tenant write lock is still held, so per-tenant hook
+    // order always matches commit order.
+    state.hook_queue.enqueue(
+        &lock_key,
+        HookJob {
+            tenant_id,
+            commit_sha: commit_sha.clone(),
+            committed_at: Utc::now(),
+            file_changes: vec![file_change],
+        },
     );
 
     Ok((StatusCode::OK, Json(json!({ "commit_sha": commit_sha }))))
@@ -312,6 +323,10 @@ pub async fn move_file(
 
     let from_path = validate::file_path(from_path_raw)?.to_string();
     let to_path = validate::file_path(&body.destination)?.to_string();
+
+    // Only the destination is checked against the whitelist: files written
+    // before the whitelist was configured must remain movable.
+    validate::file_extension(&to_path, state.config.server.allowed_extensions.as_deref())?;
 
     tracing::debug!(
         collection_id = %collection_id,
@@ -353,15 +368,18 @@ pub async fn move_file(
     })
     .await?;
 
-    tracing::debug!(tenant_id = %tenant_id, sha = %commit_sha, "file move committed, spawning hook delivery");
+    tracing::debug!(tenant_id = %tenant_id, sha = %commit_sha, "file move committed, enqueuing hook delivery");
 
-    HookDelivery::spawn(
-        state.http_client.clone(),
-        state.config.clone(),
-        tenant_id,
-        commit_sha.clone(),
-        Utc::now(),
-        vec![file_change],
+    // Enqueued while the tenant write lock is still held, so per-tenant hook
+    // order always matches commit order.
+    state.hook_queue.enqueue(
+        &lock_key,
+        HookJob {
+            tenant_id,
+            commit_sha: commit_sha.clone(),
+            committed_at: Utc::now(),
+            file_changes: vec![file_change],
+        },
     );
 
     Ok((StatusCode::OK, Json(json!({ "commit_sha": commit_sha }))))

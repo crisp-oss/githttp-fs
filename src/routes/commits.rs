@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
-    error::AppError, git, hooks::HookDelivery, routes::AuthorRequest, state::AppState,
+    error::AppError, git, hooks::HookJob, routes::AuthorRequest, state::AppState,
     util::run_blocking, validate,
 };
 
@@ -97,6 +97,7 @@ pub async fn get_commit(
 ) -> Result<impl IntoResponse, AppError> {
     let collection_id = validate::collection_id(&collection_id)?.to_string();
     let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
+    let sha = validate::commit_sha(&sha)?.to_string();
 
     tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, sha = %sha, "handling get commit request");
 
@@ -133,6 +134,7 @@ pub async fn revert_commit(
 ) -> Result<impl IntoResponse, AppError> {
     let collection_id = validate::collection_id(&collection_id)?.to_string();
     let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
+    let sha = validate::commit_sha(&sha)?.to_string();
 
     tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, sha = %sha, "handling revert commit request");
 
@@ -169,16 +171,19 @@ pub async fn revert_commit(
         reverted_sha = %sha,
         new_sha = %new_commit_sha,
         file_change_count = file_changes.len(),
-        "revert complete, spawning hook delivery"
+        "revert complete, enqueuing hook delivery"
     );
 
-    HookDelivery::spawn(
-        state.http_client.clone(),
-        state.config.clone(),
-        tenant_id,
-        new_commit_sha.clone(),
-        Utc::now(),
-        file_changes,
+    // Enqueued while the tenant write lock is still held, so per-tenant hook
+    // order always matches commit order.
+    state.hook_queue.enqueue(
+        &lock_key,
+        HookJob {
+            tenant_id,
+            commit_sha: new_commit_sha.clone(),
+            committed_at: Utc::now(),
+            file_changes,
+        },
     );
 
     Ok((

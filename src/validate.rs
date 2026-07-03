@@ -11,6 +11,10 @@ use crate::error::AppError;
 const MAX_TENANT_ID_LEN: usize = 64;
 const MAX_COLLECTION_ID_LEN: usize = 64;
 
+// Shortest unambiguous git SHA prefix, and enough room for a full SHA-256.
+const MIN_COMMIT_SHA_LEN: usize = 4;
+const MAX_COMMIT_SHA_LEN: usize = 64;
+
 /// Collection identifiers are used as the top-level on-disk directory name.
 /// Same character-set rules as tenant identifiers.
 pub fn collection_id(raw: &str) -> Result<&str, AppError> {
@@ -44,6 +48,52 @@ pub fn tenant_id(raw: &str) -> Result<&str, AppError> {
     } else {
         Err(AppError::InvalidTenant {
             tenant_id: raw.to_string(),
+        })
+    }
+}
+
+/// Commit identifiers must be plain hexadecimal (a full or abbreviated SHA).
+/// This guarantees the value can never be interpreted as a git revspec
+/// (`HEAD~3`, `master@{1}`, `:/message-pattern`, ...), which would leak git
+/// semantics through the API and allow expensive full-history searches.
+pub fn commit_sha(raw: &str) -> Result<&str, AppError> {
+    let valid_length = raw.len() >= MIN_COMMIT_SHA_LEN && raw.len() <= MAX_COMMIT_SHA_LEN;
+    let valid_chars = raw.bytes().all(|byte| byte.is_ascii_hexdigit());
+
+    if valid_length && valid_chars {
+        Ok(raw)
+    } else {
+        Err(AppError::InvalidOperation {
+            reason: format!("commit sha must be hexadecimal: {}", raw),
+        })
+    }
+}
+
+/// When an extension whitelist is configured, the final path component must
+/// carry one of the allowed extensions (compared case-insensitively).
+/// No whitelist configured means every extension is accepted.
+pub fn file_extension(path: &str, allowed_extensions: Option<&[String]>) -> Result<(), AppError> {
+    let Some(allowed) = allowed_extensions else {
+        return Ok(());
+    };
+
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("");
+
+    let permitted = !extension.is_empty()
+        && allowed.iter().any(|entry| {
+            entry
+                .trim_start_matches('.')
+                .eq_ignore_ascii_case(extension)
+        });
+
+    if permitted {
+        Ok(())
+    } else {
+        Err(AppError::InvalidPath {
+            reason: format!("file extension is not allowed: {}", path),
         })
     }
 }
@@ -103,6 +153,14 @@ pub fn file_path(raw: &str) -> Result<&str, AppError> {
             Component::ParentDir => {
                 return Err(AppError::InvalidPath {
                     reason: "path must not contain '..' components".to_string(),
+                });
+            }
+            // Only a leading `./` survives `components()` normalization, but it
+            // must still be rejected: `./foo.md` and `foo.md` are the same file
+            // on disk yet different identities in commits and hook payloads.
+            Component::CurDir => {
+                return Err(AppError::InvalidPath {
+                    reason: "path must not contain '.' components".to_string(),
                 });
             }
             Component::RootDir | Component::Prefix(_) => {

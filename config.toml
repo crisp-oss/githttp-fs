@@ -8,9 +8,11 @@ api_key = "MySecretAPIKey"
 repos_path = "./dev/repositories"
 log_level = "debug"
 
+allowed_extensions = ["md", "mdx"]
+
 [hooks]
 
-url = "https://webhook.site/e9ddfb60-8d40-4d44-90b7-cc7fb01822db"
+url = "https://webhook.site/c086f90d-e2d6-40dc-a925-38179cc33e8d"
 
 events = [
   "file.created",

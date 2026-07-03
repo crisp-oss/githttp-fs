@@ -43,7 +43,8 @@ pub async fn delete_tenant(
 
     run_blocking(move || git::GitTenant::delete_repo(&repo_path, &tenant_id_for_task)).await?;
 
-    state.remove_repo_lock(&lock_key);
+    // The lock entry is intentionally retained (see AppState::get_repo_lock):
+    // removing it would allow two aliased mutexes for the same repository.
 
     tracing::info!(tenant_id = %tenant_id, "tenant deleted");
 

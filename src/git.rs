@@ -573,10 +573,25 @@ impl GitFiles {
 
         let repo = GitUtils::open_or_init_repo(repo_path, author_name, author_email)?;
 
-        let absolute_path = repo_path.join(file_path);
-        let is_new_file = !absolute_path.exists();
+        let parent_commit = repo.head()?.peel_to_commit()?;
+        let head_tree = parent_commit.tree()?;
+
+        // Existence is decided from HEAD's tree, never from the working tree,
+        // so leftovers from a previously failed operation cannot change the
+        // outcome (created vs updated) or the hook event that is emitted.
+        let is_new_file = match head_tree.get_path(Path::new(file_path)) {
+            Ok(entry) if entry.kind() == Some(git2::ObjectType::Blob) => false,
+            Ok(_) => {
+                return Err(AppError::InvalidOperation {
+                    reason: format!("path is a folder: {}", file_path),
+                })
+            }
+            Err(_) => true,
+        };
 
         tracing::debug!(path = %file_path, is_new_file = is_new_file, "staging file write");
+
+        let absolute_path = repo_path.join(file_path);
 
         if let Some(parent_dir) = absolute_path.parent() {
             std::fs::create_dir_all(parent_dir)?;
@@ -588,12 +603,14 @@ impl GitFiles {
 
         tracing::trace!(path = %file_path, "adding path to git index");
 
+        // Rebase the index onto HEAD before staging so stray entries left by a
+        // failed past operation can never be swept into this commit.
+        index.read_tree(&head_tree)?;
         index.add_path(Path::new(file_path))?;
         index.write()?;
 
         let tree_id = index.write_tree()?;
         let tree = repo.find_tree(tree_id)?;
-        let parent_commit = repo.head()?.peel_to_commit()?;
         let signature = GitUtils::git_signature(author_name, author_email)?;
 
         let auto_message = if is_new_file {
@@ -646,31 +663,44 @@ impl GitFiles {
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
 
-        let absolute_path = repo_path.join(file_path);
+        let parent_commit = repo.head()?.peel_to_commit()?;
+        let head_tree = parent_commit.tree()?;
 
-        if !absolute_path.exists() {
-            tracing::debug!(tenant_id = %tenant_id, path = %file_path, "file not found for deletion");
+        // Existence is decided from HEAD's tree, never from the working tree.
+        match head_tree.get_path(Path::new(file_path)) {
+            Ok(entry) if entry.kind() == Some(git2::ObjectType::Blob) => {}
+            _ => {
+                tracing::debug!(tenant_id = %tenant_id, path = %file_path, "file not found for deletion");
 
-            return Err(AppError::FileNotFound {
-                path: file_path.to_string(),
-            });
+                return Err(AppError::FileNotFound {
+                    path: file_path.to_string(),
+                });
+            }
         }
 
         let mut index = repo.index()?;
 
-        // Remove from the index first; if the path was never tracked, surface that
-        // before we touch the working tree.
         tracing::trace!(tenant_id = %tenant_id, path = %file_path, "removing path from git index");
 
+        // Rebase the index onto HEAD before staging so stray entries left by a
+        // failed past operation can never be swept into this commit.
+        index.read_tree(&head_tree)?;
         index.remove_path(Path::new(file_path))?;
 
-        std::fs::remove_file(&absolute_path)?;
+        // A file already missing from the working tree just means the working
+        // tree had diverged from HEAD; there is nothing left to clean up.
+        let absolute_path = repo_path.join(file_path);
+
+        match std::fs::remove_file(&absolute_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(AppError::Io(err)),
+        }
 
         index.write()?;
 
         let tree_id = index.write_tree()?;
         let tree = repo.find_tree(tree_id)?;
-        let parent_commit = repo.head()?.peel_to_commit()?;
         let signature = GitUtils::git_signature(author_name, author_email)?;
 
         let auto_message = format!("delete: {}", file_path);
@@ -728,19 +758,23 @@ impl GitFiles {
             });
         }
 
-        let absolute_from = repo_path.join(from_path);
-        let absolute_to = repo_path.join(to_path);
+        let parent_commit = repo.head()?.peel_to_commit()?;
+        let head_tree = parent_commit.tree()?;
 
-        if !absolute_from.exists() {
-            tracing::debug!(tenant_id = %tenant_id, from_path = %from_path, "source file not found for move");
+        // Existence is decided from HEAD's tree, never from the working tree.
+        match head_tree.get_path(Path::new(from_path)) {
+            Ok(entry) if entry.kind() == Some(git2::ObjectType::Blob) => {}
+            _ => {
+                tracing::debug!(tenant_id = %tenant_id, from_path = %from_path, "source file not found for move");
 
-            return Err(AppError::FileNotFound {
-                path: from_path.to_string(),
-            });
+                return Err(AppError::FileNotFound {
+                    path: from_path.to_string(),
+                });
+            }
         }
 
         // Refuse to clobber an existing destination — the user must delete first.
-        if absolute_to.exists() {
+        if head_tree.get_path(Path::new(to_path)).is_ok() {
             tracing::debug!(tenant_id = %tenant_id, to_path = %to_path, "move rejected: destination already exists");
 
             return Err(AppError::InvalidOperation {
@@ -748,13 +782,24 @@ impl GitFiles {
             });
         }
 
+        // The moved content comes from HEAD's blob — the authoritative state —
+        // rather than whatever the working tree currently holds.
+        let content = GitUtils::blob_content_from_tree(&repo, &head_tree, from_path)?;
+
+        let absolute_from = repo_path.join(from_path);
+        let absolute_to = repo_path.join(to_path);
+
+        match std::fs::remove_file(&absolute_from) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(AppError::Io(err)),
+        }
+
         if let Some(parent_dir) = absolute_to.parent() {
             std::fs::create_dir_all(parent_dir)?;
         }
 
-        std::fs::rename(&absolute_from, &absolute_to)?;
-
-        let content = std::fs::read_to_string(&absolute_to)?;
+        std::fs::write(&absolute_to, &content)?;
 
         let mut index = repo.index()?;
 
@@ -765,13 +810,15 @@ impl GitFiles {
             "updating git index for move"
         );
 
+        // Rebase the index onto HEAD before staging so stray entries left by a
+        // failed past operation can never be swept into this commit.
+        index.read_tree(&head_tree)?;
         index.remove_path(Path::new(from_path))?;
         index.add_path(Path::new(to_path))?;
         index.write()?;
 
         let tree_id = index.write_tree()?;
         let tree = repo.find_tree(tree_id)?;
-        let parent_commit = repo.head()?.peel_to_commit()?;
         let signature = GitUtils::git_signature(author_name, author_email)?;
 
         let auto_message = format!("move: {} -> {}", from_path, to_path);
@@ -1306,7 +1353,15 @@ impl GitCommits {
 
         tracing::trace!(tenant_id = %tenant_id, sha = %sha, delta_count = raw_deltas.len(), "applying revert deltas");
 
+        let head_commit = repo.head()?.peel_to_commit()?;
+        let head_tree = head_commit.tree()?;
+
         let mut index = repo.index()?;
+
+        // Rebase the index onto HEAD before staging so stray entries left by a
+        // failed past operation can never be swept into this commit.
+        index.read_tree(&head_tree)?;
+
         let mut file_changes: Vec<FileChange> = Vec::new();
 
         for raw_delta in &raw_deltas {
@@ -1444,7 +1499,6 @@ impl GitCommits {
 
         let tree_id = index.write_tree()?;
         let tree = repo.find_tree(tree_id)?;
-        let head_commit = repo.head()?.peel_to_commit()?;
         let signature = GitUtils::git_signature(author_name, author_email)?;
 
         let auto_message = format!("revert: {}", target_commit.message().unwrap_or("unknown"));

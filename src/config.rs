@@ -44,6 +44,9 @@ pub struct ServerConfig {
     pub api_key: String,
     pub repos_path: PathBuf,
     pub log_level: Option<LogLevel>,
+    /// Optional whitelist of file extensions accepted on writes and move
+    /// destinations (e.g. `["md", "mdx"]`). Unset means all extensions.
+    pub allowed_extensions: Option<Vec<String>>,
 }
 
 impl ServerConfig {
@@ -63,6 +66,27 @@ impl ServerConfig {
                     level,
                     VALID_LOG_LEVELS.join(", ")
                 ));
+            }
+        }
+
+        if let Some(extensions) = &self.allowed_extensions {
+            if extensions.is_empty() {
+                errors.push(
+                    "server.allowed_extensions must contain at least one extension".to_string(),
+                );
+            }
+
+            for extension in extensions {
+                let normalized = extension.trim_start_matches('.');
+
+                if normalized.is_empty()
+                    || !normalized.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                {
+                    errors.push(format!(
+                        "server.allowed_extensions entry '{}' is invalid; must be alphanumeric like \"md\"",
+                        extension
+                    ));
+                }
             }
         }
 

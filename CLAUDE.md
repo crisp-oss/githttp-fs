@@ -169,6 +169,11 @@ repos_path = "./dev/repositories"
 # Tracing log level: "trace" | "debug" | "info" | "warn" | "error"
 # Defaults to "info" if unset. Overridden by the RUST_LOG env var.
 log_level = "debug"
+# Optional whitelist of file extensions (compared case-insensitively) accepted
+# on PUT paths and move destinations; other extensions are rejected with 400.
+# Unset means all extensions are accepted. Move sources are not checked, so
+# files written before the whitelist was configured remain movable.
+allowed_extensions = ["md", "mdx"]
 
 [hooks]
 url = "https://your-receiver.example.com/hook"
@@ -190,12 +195,15 @@ Log verbosity priority: `RUST_LOG` env var → `log_level` in config → `"info"
 - **One git working tree per tenant** at `repos_path/<collection_id>/<tenant_id>/`. Repos are auto-initialised on the first write with a `"chore: initialize"` root commit — no explicit provisioning step needed.
 - **Per-tenant in-memory mutex** (`DashMap<String, Arc<Mutex<()>>>`) serialises all write operations on the same repo; keyed as `"collection_id/tenant_id"`. Reads never acquire the lock.
 - **All git operations run in `spawn_blocking`** so they never stall the tokio executor.
-- **Hook delivery is fire-and-forget** — spawned as a background task after the write lock is released, so writes are never delayed by a slow hook receiver.
-- **Hook events are sequential per commit** — files within a single commit are delivered one hook at a time in order, so the receiver can process them synchronously.
+- **Hook delivery is asynchronous** — writes enqueue their hook job and return immediately, so they are never delayed by a slow hook receiver.
+- **Hook events are ordered per tenant** — each tenant has a dedicated in-memory queue with a single consumer task. Jobs are enqueued while the tenant write lock is still held, so hooks are delivered in exactly the order commits were accepted by this server; a later commit can never overtake an earlier one at the receiver (even one stuck in retries). Files within a single commit are delivered one hook at a time in order.
 - **Rename = single hook** — a `POST .../move` produces one `file.moved` event with both `from` and `to` paths, preserving entity identity in downstream systems.
 - **Revert = new commit** — reverts never rewrite history; they produce a new inverse commit and fire the appropriate hooks for each changed file.
 - **Author identity is caller-supplied** — every write request requires an `author` object with `name` and `email`. Both are stored in the git commit and validated as non-empty.
 - **Commit identifier is named `sha`** (not `sha1`) — future-proof against git's SHA-256 migration; matches the convention used by GitHub, GitLab, and Gitea.
+- **`:sha` parameters accept hexadecimal only** — a full or abbreviated commit SHA (4–64 hex chars). Revspecs (`HEAD~1`, `master@{1}`, `:/pattern`) are rejected with `400` so git semantics never leak through the API and history-search DoS is impossible.
+- **HEAD is authoritative, not the working tree** — existence checks for writes, deletes, and moves are answered from HEAD's tree, and every write rebases the index onto HEAD (`index.read_tree`) before staging. Leftover working-tree or index state from a previously failed operation can never change an operation's outcome or be silently swept into a later commit. Moved content is read from HEAD's blob, not from disk.
+- **Per-tenant lock entries are never removed** — not even on tenant deletion. Removing an entry would let a writer holding the old mutex run concurrently with a writer holding a freshly-created one for the same repository.
 - **Timestamps are named `committed_at`** — follows the `*_at` suffix convention (Stripe, GitHub API, Rails); unambiguous about what the value represents.
 - **`/move` URL suffix on POST** — axum's wildcard router cannot match a fixed suffix after `*path`, so the handler is registered on `POST /*path` and enforces the `/move` suffix internally, returning 400 otherwise.
 - **Stale `.git/index.lock` cleanup** — removed at startup across all repos, and checked before each write (removed if older than 30 s), to recover from crashed processes.

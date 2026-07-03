@@ -6,6 +6,7 @@
 - [x] Update commit history to support per-file path history only, using an optional query parameter
 - [x] Add paging in file list route + maximum depth
 - [ ] Review whole code for security issues & performance issues on large/deep repositories w/ Fable
+- [ ] Ask Fable to improve Rust code quality, following Rust coding best practices and add a lot of comments for humans to understand the code better and justify design decisions
 
 ## Later
 
