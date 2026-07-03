@@ -151,6 +151,7 @@ pub async fn revert_commit(
 
     let RevertCommitRequest { author, message } = body;
 
+    let repo_path_for_maintenance = repo_path.clone();
     let tenant_id_for_task = tenant_id.clone();
     let sha_for_task = sha.clone();
 
@@ -185,6 +186,10 @@ pub async fn revert_commit(
             file_changes,
         },
     );
+
+    state
+        .maintenance
+        .schedule(&lock_key, repo_path_for_maintenance, lock.clone());
 
     Ok((
         StatusCode::OK,

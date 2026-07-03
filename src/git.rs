@@ -5,7 +5,10 @@
 // License: Mozilla Public License v2.0 (MPL v2.0)
 
 use chrono::{DateTime, Utc};
-use git2::{Delta, DiffFindOptions, DiffFormat, DiffOptions, Oid, Repository, Signature, Sort};
+use git2::build::TreeUpdateBuilder;
+use git2::{
+    Delta, DiffFindOptions, DiffFormat, DiffOptions, FileMode, Oid, Repository, Signature, Sort,
+};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -20,7 +23,6 @@ use crate::error::AppError;
 pub enum TreeNode {
     File {
         name: String,
-        size: usize,
     },
     Directory {
         name: String,
@@ -166,10 +168,7 @@ impl GitUtils {
         // An empty tree is required for the root commit so that HEAD is valid.
         tracing::trace!(path = %repo_path.display(), "writing empty tree for root commit");
 
-        let empty_tree_id = {
-            let mut index = repo.index()?;
-            index.write_tree()?
-        };
+        let empty_tree_id = repo.treebuilder(None)?.write()?;
         let empty_tree = repo.find_tree(empty_tree_id)?;
 
         let root_oid = repo.commit(
@@ -218,31 +217,30 @@ impl GitUtils {
             .unwrap_or_default()
     }
 
-    /// Builds a recursive `TreeNode` tree from a flat list of (path, size) pairs
-    /// plus an explicit list of directory stub paths (directories whose contents
+    /// Builds a recursive `TreeNode` tree from a flat list of file paths plus
+    /// an explicit list of directory stub paths (directories whose contents
     /// were not walked due to a depth limit). Directories are sorted before files
     /// at each level; entries within each group are sorted alphabetically.
     fn build_tree(
-        flat: Vec<(String, usize)>,
+        flat: Vec<String>,
         stubs: Vec<String>,
         max_depth: Option<usize>,
     ) -> Vec<TreeNode> {
         enum NodeBuilder {
-            File(usize),
+            File,
             Dir(BTreeMap<String, NodeBuilder>),
         }
 
         fn insert(
             dir: &mut BTreeMap<String, NodeBuilder>,
             components: &[&str],
-            size: usize,
             max_depth: Option<usize>,
             current_depth: usize,
         ) {
             match components {
                 [] => {}
                 [name] => {
-                    dir.insert(name.to_string(), NodeBuilder::File(size));
+                    dir.insert(name.to_string(), NodeBuilder::File);
                 }
                 [name, rest @ ..] => {
                     if let Some(max) = max_depth {
@@ -257,7 +255,7 @@ impl GitUtils {
                         .or_insert_with(|| NodeBuilder::Dir(BTreeMap::new()));
 
                     if let NodeBuilder::Dir(children) = child {
-                        insert(children, rest, size, max_depth, current_depth + 1);
+                        insert(children, rest, max_depth, current_depth + 1);
                     }
                 }
             }
@@ -283,7 +281,7 @@ impl GitUtils {
 
         fn convert(name: String, node: NodeBuilder) -> TreeNode {
             match node {
-                NodeBuilder::File(size) => TreeNode::File { name, size },
+                NodeBuilder::File => TreeNode::File { name },
                 NodeBuilder::Dir(children) => {
                     let mut dirs: Vec<TreeNode> = Vec::new();
                     let mut files: Vec<TreeNode> = Vec::new();
@@ -291,7 +289,7 @@ impl GitUtils {
                     for (child_name, child_node) in children {
                         match child_node {
                             NodeBuilder::Dir(_) => dirs.push(convert(child_name, child_node)),
-                            NodeBuilder::File(_) => files.push(convert(child_name, child_node)),
+                            NodeBuilder::File => files.push(convert(child_name, child_node)),
                         }
                     }
 
@@ -305,9 +303,9 @@ impl GitUtils {
 
         let mut root: BTreeMap<String, NodeBuilder> = BTreeMap::new();
 
-        for (path, size) in flat {
+        for path in flat {
             let components: Vec<&str> = path.split('/').collect();
-            insert(&mut root, &components, size, max_depth, 1);
+            insert(&mut root, &components, max_depth, 1);
         }
 
         for stub_path in stubs {
@@ -321,7 +319,7 @@ impl GitUtils {
         for (name, node) in root {
             match node {
                 NodeBuilder::Dir(_) => dirs.push(convert(name, node)),
-                NodeBuilder::File(_) => files.push(convert(name, node)),
+                NodeBuilder::File => files.push(convert(name, node)),
             }
         }
 
@@ -424,6 +422,137 @@ impl GitLocks {
 }
 
 // ---------------------------------------------------------------------------
+// GitMaintenance — background loose-object packing and index refresh
+// ---------------------------------------------------------------------------
+
+pub struct GitMaintenance;
+
+impl GitMaintenance {
+    /// Packs every loose object into a single new packfile (via libgit2 — no
+    /// dependency on a `git` binary) and deletes the packed loose files, then
+    /// refreshes the on-disk index to match HEAD so `git status` stays
+    /// meaningful for humans (the write path never touches the index).
+    ///
+    /// Must be called while holding the tenant write lock: object writes only
+    /// happen under that lock, so the loose object set is frozen. Concurrent
+    /// reads are safe — libgit2 refreshes its pack backends on a missed
+    /// lookup, so a reader that raced the loose-file deletion finds the
+    /// object in the new pack.
+    ///
+    /// Returns the number of loose objects that were packed.
+    pub fn run(repo_path: &Path) -> Result<usize, AppError> {
+        // The tenant may have been deleted while the timer was armed.
+        if !repo_path.join(".git").exists() {
+            tracing::debug!(path = %repo_path.display(), "repository gone, skipping maintenance");
+
+            return Ok(0);
+        }
+
+        let repo = Repository::open(repo_path)?;
+
+        let loose_objects = Self::enumerate_loose_objects(repo_path)?;
+
+        tracing::debug!(
+            path = %repo_path.display(),
+            loose_objects = loose_objects.len(),
+            "running repository maintenance"
+        );
+
+        if !loose_objects.is_empty() {
+            let mut pack_builder = repo.packbuilder()?;
+
+            for (oid, _) in &loose_objects {
+                pack_builder.insert_object(*oid, None)?;
+            }
+
+            // Stream the pack straight into the ODB — this writes both the
+            // .pack and its .idx under .git/objects/pack.
+            let odb = repo.odb()?;
+            let mut pack_writer = odb.packwriter()?;
+
+            pack_builder.foreach(|chunk| {
+                use std::io::Write;
+
+                pack_writer.write_all(chunk).is_ok()
+            })?;
+
+            pack_writer.commit()?;
+
+            // Only files that made it into the pack are deleted, so a failure
+            // above never loses objects. Empty fan-out directories are pruned
+            // best-effort (`remove_dir` refuses non-empty directories).
+            for (_, loose_path) in &loose_objects {
+                let _ = std::fs::remove_file(loose_path);
+            }
+
+            let fanout_dirs: std::collections::HashSet<PathBuf> = loose_objects
+                .iter()
+                .filter_map(|(_, loose_path)| loose_path.parent().map(PathBuf::from))
+                .collect();
+
+            for fanout_dir in fanout_dirs {
+                let _ = std::fs::remove_dir(fanout_dir);
+            }
+        }
+
+        // Refresh the on-disk index to HEAD. Clean a stale index.lock first —
+        // this is the only code path left that writes the index.
+        GitLocks::cleanup_stale_index_lock(repo_path)?;
+
+        let head_tree = repo.head()?.peel_to_commit()?.tree()?;
+        let mut index = repo.index()?;
+
+        index.read_tree(&head_tree)?;
+        index.write()?;
+
+        Ok(loose_objects.len())
+    }
+
+    /// Walks `.git/objects/` and returns every loose object with its file
+    /// path. Non-object entries (`pack/`, `info/`, temporary files) are
+    /// skipped by the hex-name filters.
+    fn enumerate_loose_objects(repo_path: &Path) -> Result<Vec<(Oid, PathBuf)>, AppError> {
+        let objects_dir = repo_path.join(".git").join("objects");
+        let mut loose_objects: Vec<(Oid, PathBuf)> = Vec::new();
+
+        let fanout_entries = match std::fs::read_dir(&objects_dir) {
+            Ok(entries) => entries,
+            Err(_) => return Ok(loose_objects),
+        };
+
+        for fanout_entry in fanout_entries.flatten() {
+            let fanout_name = fanout_entry.file_name();
+
+            let Some(prefix) = fanout_name.to_str() else {
+                continue;
+            };
+
+            if prefix.len() != 2 || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                continue;
+            }
+
+            let Ok(object_entries) = std::fs::read_dir(fanout_entry.path()) else {
+                continue;
+            };
+
+            for object_entry in object_entries.flatten() {
+                let object_name = object_entry.file_name();
+
+                let Some(suffix) = object_name.to_str() else {
+                    continue;
+                };
+
+                if let Ok(oid) = Oid::from_str(&format!("{}{}", prefix, suffix)) {
+                    loose_objects.push((oid, object_entry.path()));
+                }
+            }
+        }
+
+        Ok(loose_objects)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GitFiles — file CRUD operations
 // ---------------------------------------------------------------------------
 
@@ -460,17 +589,101 @@ impl GitFiles {
             None => head_tree,
         };
 
-        let mut flat: Vec<(String, usize)> = Vec::new();
+        // The listing root's immediate entries are already in memory as part
+        // of the tree object — no further object reads are needed to
+        // enumerate them. Sorting mirrors the response order (directories
+        // first, then files, both alphabetical), so the page window is
+        // decided before a single subtree is opened: off-page directories
+        // are never visited at all.
+        let mut root_dirs: Vec<(String, Oid)> = Vec::new();
+        let mut root_files: Vec<String> = Vec::new();
+
+        for entry in walk_tree.iter() {
+            let Ok(name) = entry.name() else {
+                continue;
+            };
+
+            match entry.kind() {
+                Some(git2::ObjectType::Tree) => root_dirs.push((name.to_string(), entry.id())),
+                Some(git2::ObjectType::Blob) => root_files.push(name.to_string()),
+                _ => {}
+            }
+        }
+
+        root_dirs.sort_by(|left, right| left.0.cmp(&right.0));
+        root_files.sort();
+
+        let total = root_dirs.len() + root_files.len();
+        let offset = ((page - 1) * per_page).min(total);
+        let has_more = total > offset + per_page;
+
+        enum RootEntry {
+            Directory(String, Oid),
+            File(String),
+        }
+
+        let page_entries: Vec<RootEntry> = root_dirs
+            .into_iter()
+            .map(|(name, oid)| RootEntry::Directory(name, oid))
+            .chain(root_files.into_iter().map(RootEntry::File))
+            .skip(offset)
+            .take(per_page)
+            .collect();
+
+        let mut nodes: Vec<TreeNode> = Vec::with_capacity(page_entries.len());
+
+        for root_entry in page_entries {
+            match root_entry {
+                RootEntry::File(name) => nodes.push(TreeNode::File { name }),
+                RootEntry::Directory(name, oid) => {
+                    // maximum_depth counts levels from the listing root, so a
+                    // depth-1 listing renders every directory as a childless
+                    // stub without opening its subtree.
+                    if maximum_depth == Some(1) {
+                        nodes.push(TreeNode::Directory {
+                            name,
+                            children: Vec::new(),
+                        });
+
+                        continue;
+                    }
+
+                    let subtree = repo.find_tree(oid)?;
+
+                    // Depth limits below are relative to this subtree, which
+                    // sits one level down from the listing root.
+                    let subtree_max_depth = maximum_depth.map(|max| max - 1);
+                    let children = Self::collect_subtree(&subtree, subtree_max_depth)?;
+
+                    nodes.push(TreeNode::Directory { name, children });
+                }
+            }
+        }
+
+        tracing::debug!(tenant_id = %tenant_id, page = page, returned = nodes.len(), has_more = has_more, "file listing complete");
+
+        Ok((nodes, has_more))
+    }
+
+    /// Recursively walks one paged root directory and builds its child nodes.
+    /// Only directories inside the requested page window ever reach this
+    /// point. Blob objects are never opened — names and kinds come from the
+    /// tree objects alone.
+    fn collect_subtree(
+        subtree: &git2::Tree<'_>,
+        max_depth: Option<usize>,
+    ) -> Result<Vec<TreeNode>, AppError> {
+        let mut flat: Vec<String> = Vec::new();
         let mut dir_stubs: Vec<String> = Vec::new();
 
-        walk_tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
-            // Depth of this entry relative to the walk root: "" = depth 1, "a/" = depth 2, …
+        subtree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            // Depth of this entry relative to the subtree: "" = depth 1, "a/" = depth 2, …
             let entry_depth = root.chars().filter(|c| *c == '/').count() + 1;
 
             if entry.kind() == Some(git2::ObjectType::Tree) {
-                if let Some(max) = maximum_depth {
+                if let Some(max) = max_depth {
                     if entry_depth >= max {
-                        // Record as a stub and skip descending — no blob lookups below.
+                        // Record as a stub and skip descending.
                         let name = entry.name().unwrap_or("");
                         dir_stubs.push(format!("{}{}", root, name));
                         return git2::TreeWalkResult::Skip;
@@ -484,30 +697,12 @@ impl GitFiles {
             }
 
             let name = entry.name().unwrap_or("");
-            let path = format!("{}{}", root, name);
-
-            let size = repo
-                .find_blob(entry.id())
-                .map(|blob| blob.size())
-                .unwrap_or(0);
-
-            tracing::trace!(tenant_id = %tenant_id, path = %path, size = size, "indexed file entry");
-
-            flat.push((path, size));
+            flat.push(format!("{}{}", root, name));
 
             git2::TreeWalkResult::Ok
         })?;
 
-        tracing::debug!(tenant_id = %tenant_id, files = flat.len(), stubs = dir_stubs.len(), "file listing complete, building tree");
-
-        let mut tree = GitUtils::build_tree(flat, dir_stubs, maximum_depth);
-
-        let total = tree.len();
-        let offset = ((page - 1) * per_page).min(total);
-        let has_more = total > offset + per_page;
-        let page_tree: Vec<TreeNode> = tree.drain(offset..).take(per_page).collect();
-
-        Ok((page_tree, has_more))
+        Ok(GitUtils::build_tree(flat, dir_stubs, max_depth))
     }
 
     /// Returns the file content as recorded in HEAD's tree (not from the working
@@ -569,8 +764,6 @@ impl GitFiles {
     ) -> Result<(String, FileChange), AppError> {
         tracing::debug!(path = %file_path, author_name = %author_name, author_email = %author_email, "writing file");
 
-        GitLocks::cleanup_stale_index_lock(repo_path)?;
-
         let repo = GitUtils::open_or_init_repo(repo_path, author_name, author_email)?;
 
         let parent_commit = repo.head()?.peel_to_commit()?;
@@ -599,17 +792,17 @@ impl GitFiles {
 
         std::fs::write(&absolute_path, content)?;
 
-        let mut index = repo.index()?;
+        tracing::trace!(path = %file_path, "building updated tree");
 
-        tracing::trace!(path = %file_path, "adding path to git index");
+        // The commit tree is HEAD's tree plus this single change — O(path
+        // depth) instead of the O(repository size) an index round-trip costs,
+        // and stray state from a failed past operation can never leak in.
+        let blob_oid = repo.blob(content.as_bytes())?;
 
-        // Rebase the index onto HEAD before staging so stray entries left by a
-        // failed past operation can never be swept into this commit.
-        index.read_tree(&head_tree)?;
-        index.add_path(Path::new(file_path))?;
-        index.write()?;
+        let tree_id = TreeUpdateBuilder::new()
+            .upsert(file_path, blob_oid, FileMode::Blob)
+            .create_updated(&repo, &head_tree)?;
 
-        let tree_id = index.write_tree()?;
         let tree = repo.find_tree(tree_id)?;
         let signature = GitUtils::git_signature(author_name, author_email)?;
 
@@ -659,8 +852,6 @@ impl GitFiles {
     ) -> Result<(String, FileChange), AppError> {
         tracing::debug!(tenant_id = %tenant_id, path = %file_path, author_name = %author_name, author_email = %author_email, "deleting file");
 
-        GitLocks::cleanup_stale_index_lock(repo_path)?;
-
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
 
         let parent_commit = repo.head()?.peel_to_commit()?;
@@ -678,14 +869,7 @@ impl GitFiles {
             }
         }
 
-        let mut index = repo.index()?;
-
-        tracing::trace!(tenant_id = %tenant_id, path = %file_path, "removing path from git index");
-
-        // Rebase the index onto HEAD before staging so stray entries left by a
-        // failed past operation can never be swept into this commit.
-        index.read_tree(&head_tree)?;
-        index.remove_path(Path::new(file_path))?;
+        tracing::trace!(tenant_id = %tenant_id, path = %file_path, "building updated tree without path");
 
         // A file already missing from the working tree just means the working
         // tree had diverged from HEAD; there is nothing left to clean up.
@@ -697,9 +881,12 @@ impl GitFiles {
             Err(err) => return Err(AppError::Io(err)),
         }
 
-        index.write()?;
+        // The commit tree is HEAD's tree minus this single entry — O(path
+        // depth) instead of the O(repository size) an index round-trip costs.
+        let tree_id = TreeUpdateBuilder::new()
+            .remove(file_path)
+            .create_updated(&repo, &head_tree)?;
 
-        let tree_id = index.write_tree()?;
         let tree = repo.find_tree(tree_id)?;
         let signature = GitUtils::git_signature(author_name, author_email)?;
 
@@ -746,8 +933,6 @@ impl GitFiles {
             "moving file"
         );
 
-        GitLocks::cleanup_stale_index_lock(repo_path)?;
-
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
 
         if from_path == to_path {
@@ -762,8 +947,9 @@ impl GitFiles {
         let head_tree = parent_commit.tree()?;
 
         // Existence is decided from HEAD's tree, never from the working tree.
-        match head_tree.get_path(Path::new(from_path)) {
-            Ok(entry) if entry.kind() == Some(git2::ObjectType::Blob) => {}
+        // The blob oid is kept so the destination entry reuses it verbatim.
+        let source_blob_oid = match head_tree.get_path(Path::new(from_path)) {
+            Ok(entry) if entry.kind() == Some(git2::ObjectType::Blob) => entry.id(),
             _ => {
                 tracing::debug!(tenant_id = %tenant_id, from_path = %from_path, "source file not found for move");
 
@@ -771,7 +957,7 @@ impl GitFiles {
                     path: from_path.to_string(),
                 });
             }
-        }
+        };
 
         // Refuse to clobber an existing destination — the user must delete first.
         if head_tree.get_path(Path::new(to_path)).is_ok() {
@@ -801,23 +987,20 @@ impl GitFiles {
 
         std::fs::write(&absolute_to, &content)?;
 
-        let mut index = repo.index()?;
-
         tracing::trace!(
             tenant_id = %tenant_id,
             from_path = %from_path,
             to_path = %to_path,
-            "updating git index for move"
+            "building updated tree for move"
         );
 
-        // Rebase the index onto HEAD before staging so stray entries left by a
-        // failed past operation can never be swept into this commit.
-        index.read_tree(&head_tree)?;
-        index.remove_path(Path::new(from_path))?;
-        index.add_path(Path::new(to_path))?;
-        index.write()?;
+        // The commit tree is HEAD's tree with the entry relocated, reusing the
+        // existing blob — no content rehash, no index round-trip.
+        let tree_id = TreeUpdateBuilder::new()
+            .remove(from_path)
+            .upsert(to_path, source_blob_oid, FileMode::Blob)
+            .create_updated(&repo, &head_tree)?;
 
-        let tree_id = index.write_tree()?;
         let tree = repo.find_tree(tree_id)?;
         let signature = GitUtils::git_signature(author_name, author_email)?;
 
@@ -995,77 +1178,34 @@ impl GitCommits {
                     Err(_) => continue,
                 };
 
-                let mut diff_opts = DiffOptions::new();
+                // Two O(path depth) tree lookups decide whether this commit
+                // touched the file at all. A rename-detecting diff (which loads
+                // blob contents to score similarity) is only computed for the
+                // rare commit that introduced the file under its current name.
+                let commit_entry = commit_tree.get_path(Path::new(&current_path)).ok();
+                let parent_entry = parent_tree.get_path(Path::new(&current_path)).ok();
 
-                diff_opts.include_untracked(false);
-
-                let mut diff = match repo.diff_tree_to_tree(
-                    Some(&parent_tree),
-                    Some(&commit_tree),
-                    Some(&mut diff_opts),
-                ) {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                };
-
-                let mut find_opts = DiffFindOptions::new();
-
-                find_opts.renames(true);
-
-                let _ = diff.find_similar(Some(&mut find_opts));
-
-                let mut matched = false;
-                let mut rename_from: Option<String> = None;
-
-                for i in 0..diff.deltas().count() {
-                    let delta = match diff.get_delta(i) {
-                        Some(d) => d,
-                        None => continue,
-                    };
-
-                    let old = delta
-                        .old_file()
-                        .path()
-                        .map(|p| p.to_string_lossy().into_owned());
-
-                    let new = delta
-                        .new_file()
-                        .path()
-                        .map(|p| p.to_string_lossy().into_owned());
-
-                    match delta.status() {
-                        Delta::Renamed => {
-                            if new.as_deref() == Some(current_path.as_str()) {
-                                tracing::trace!(
-                                    tenant_id = %tenant_id,
-                                    sha = %commit.id(),
-                                    from = ?old,
-                                    to = %current_path,
-                                    "rename detected, following path backward"
-                                );
-
-                                matched = true;
-                                rename_from = old;
-                                break;
-                            }
-                        }
-                        Delta::Added | Delta::Modified => {
-                            if new.as_deref() == Some(current_path.as_str()) {
-                                matched = true;
-                                break;
-                            }
-                        }
-                        Delta::Deleted => {
-                            if old.as_deref() == Some(current_path.as_str()) {
-                                matched = true;
-                                break;
-                            }
-                        }
-                        _ => {}
+                match (commit_entry, parent_entry) {
+                    // Untouched by this commit — the overwhelmingly common case.
+                    (Some(in_commit), Some(in_parent))
+                        if in_commit.id() == in_parent.id()
+                            && in_commit.filemode() == in_parent.filemode() =>
+                    {
+                        (false, None)
                     }
+                    // Modified in this commit.
+                    (Some(_), Some(_)) => (true, None),
+                    // Deleted by this commit (the file was re-created later).
+                    (None, Some(_)) => (true, None),
+                    // Not present under this name on either side.
+                    (None, None) => (false, None),
+                    // Introduced by this commit — either created, or renamed
+                    // from an older path that must be followed backward.
+                    (Some(_), None) => (
+                        true,
+                        Self::rename_source(&repo, &parent_tree, &commit_tree, &current_path),
+                    ),
                 }
-
-                (matched, rename_from)
             };
 
             if is_match {
@@ -1109,6 +1249,63 @@ impl GitCommits {
         );
 
         Ok((commits, has_more))
+    }
+
+    /// Runs a rename-detecting diff of a single commit and returns the prior
+    /// path when `current_path` was renamed (rather than freshly created) by
+    /// it. Only invoked for commits that introduced the file under its
+    /// current name, so the similarity scan stays off the hot path.
+    fn rename_source(
+        repo: &Repository,
+        parent_tree: &git2::Tree<'_>,
+        commit_tree: &git2::Tree<'_>,
+        current_path: &str,
+    ) -> Option<String> {
+        let mut diff_opts = DiffOptions::new();
+
+        diff_opts.include_untracked(false);
+
+        let mut diff = repo
+            .diff_tree_to_tree(Some(parent_tree), Some(commit_tree), Some(&mut diff_opts))
+            .ok()?;
+
+        let mut find_opts = DiffFindOptions::new();
+
+        find_opts.renames(true);
+
+        diff.find_similar(Some(&mut find_opts)).ok()?;
+
+        for index in 0..diff.deltas().count() {
+            let Some(delta) = diff.get_delta(index) else {
+                continue;
+            };
+
+            if delta.status() != Delta::Renamed {
+                continue;
+            }
+
+            let new = delta
+                .new_file()
+                .path()
+                .map(|path| path.to_string_lossy().into_owned());
+
+            if new.as_deref() == Some(current_path) {
+                let old = delta
+                    .old_file()
+                    .path()
+                    .map(|path| path.to_string_lossy().into_owned());
+
+                tracing::trace!(
+                    from = ?old,
+                    to = %current_path,
+                    "rename detected, following path backward"
+                );
+
+                return old;
+            }
+        }
+
+        None
     }
 
     pub fn get_commit(
@@ -1300,8 +1497,6 @@ impl GitCommits {
     ) -> Result<(String, Vec<FileChange>), AppError> {
         tracing::debug!(tenant_id = %tenant_id, sha = %sha, author_name = %author_name, author_email = %author_email, "reverting commit");
 
-        GitLocks::cleanup_stale_index_lock(repo_path)?;
-
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
 
         let object = repo
@@ -1356,11 +1551,9 @@ impl GitCommits {
         let head_commit = repo.head()?.peel_to_commit()?;
         let head_tree = head_commit.tree()?;
 
-        let mut index = repo.index()?;
-
-        // Rebase the index onto HEAD before staging so stray entries left by a
-        // failed past operation can never be swept into this commit.
-        index.read_tree(&head_tree)?;
+        // The revert tree is HEAD's tree plus the inverse of each delta,
+        // reusing parent-tree blob oids — no index round-trip, no rehashing.
+        let mut tree_update = TreeUpdateBuilder::new();
 
         let mut file_changes: Vec<FileChange> = Vec::new();
 
@@ -1382,7 +1575,7 @@ impl GitCommits {
                             std::fs::remove_file(&absolute_path)?;
                         }
 
-                        index.remove_path(new_path)?;
+                        tree_update.remove(new_path);
 
                         file_changes.push(FileChange::Deleted {
                             path: new_path.to_string_lossy().into_owned(),
@@ -1412,7 +1605,8 @@ impl GitCommits {
                         }
 
                         std::fs::write(&absolute_path, &content)?;
-                        index.add_path(old_path)?;
+
+                        tree_update.upsert(old_path, raw_delta.old_oid, FileMode::Blob);
 
                         file_changes.push(FileChange::Created {
                             path: old_path.to_string_lossy().into_owned(),
@@ -1439,7 +1633,8 @@ impl GitCommits {
                         let absolute_path = repo_path.join(old_path);
 
                         std::fs::write(&absolute_path, &content)?;
-                        index.add_path(old_path)?;
+
+                        tree_update.upsert(old_path, raw_delta.old_oid, FileMode::Blob);
 
                         file_changes.push(FileChange::Updated {
                             path: old_path.to_string_lossy().into_owned(),
@@ -1479,8 +1674,8 @@ impl GitCommits {
 
                         std::fs::write(&absolute_old, &content)?;
 
-                        index.remove_path(new_path)?;
-                        index.add_path(old_path)?;
+                        tree_update.remove(new_path);
+                        tree_update.upsert(old_path, raw_delta.old_oid, FileMode::Blob);
 
                         file_changes.push(FileChange::Moved {
                             from_path: new_path.to_string_lossy().into_owned(),
@@ -1493,11 +1688,9 @@ impl GitCommits {
             }
         }
 
-        tracing::trace!(tenant_id = %tenant_id, sha = %sha, "writing revert index and committing");
+        tracing::trace!(tenant_id = %tenant_id, sha = %sha, "building revert tree and committing");
 
-        index.write()?;
-
-        let tree_id = index.write_tree()?;
+        let tree_id = tree_update.create_updated(&repo, &head_tree)?;
         let tree = repo.find_tree(tree_id)?;
         let signature = GitUtils::git_signature(author_name, author_email)?;
 

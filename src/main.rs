@@ -8,6 +8,7 @@ mod config;
 mod error;
 mod git;
 mod hooks;
+mod maintenance;
 mod middleware;
 mod routes;
 mod state;

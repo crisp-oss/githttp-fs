@@ -43,6 +43,11 @@ pub async fn delete_tenant(
 
     run_blocking(move || git::GitTenant::delete_repo(&repo_path, &tenant_id_for_task)).await?;
 
+    // Disarm any pending maintenance timer while the write lock is still
+    // held — a pass mid-run would have been holding the lock, so at this
+    // point the task can only be sleeping or waiting, and aborts cleanly.
+    state.maintenance.cancel(&lock_key);
+
     // The lock entry is intentionally retained (see AppState::get_repo_lock):
     // removing it would allow two aliased mutexes for the same repository.
 

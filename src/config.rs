@@ -17,6 +17,8 @@ const VALID_LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
 pub struct Config {
     pub server: ServerConfig,
     pub hooks: Option<HooksConfig>,
+    #[serde(default)]
+    pub maintenance: MaintenanceConfig,
 }
 
 impl Config {
@@ -29,10 +31,40 @@ impl Config {
             hooks.collect_errors(&mut errors);
         }
 
+        self.maintenance.collect_errors(&mut errors);
+
         if errors.is_empty() {
             Ok(())
         } else {
             Err(errors)
+        }
+    }
+}
+
+/// Background repository maintenance (loose object packing + index refresh).
+/// The section is optional; omitting it enables maintenance with a 24h delay.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct MaintenanceConfig {
+    pub enabled: bool,
+    /// Delay between the first write to a repository and its maintenance pass.
+    pub delay_secs: u64,
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // 24 hours
+            delay_secs: 86_400,
+        }
+    }
+}
+
+impl MaintenanceConfig {
+    fn collect_errors(&self, errors: &mut Vec<String>) {
+        if self.enabled && self.delay_secs < 1 {
+            errors.push("maintenance.delay_secs must be at least 1".to_string());
         }
     }
 }

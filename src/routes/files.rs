@@ -213,6 +213,8 @@ pub async fn write_file(
         message,
     } = body;
 
+    let repo_path_for_maintenance = repo_path.clone();
+
     let (commit_sha, file_change) = run_blocking(move || {
         git::GitFiles::write_file(
             &repo_path,
@@ -238,6 +240,10 @@ pub async fn write_file(
             file_changes: vec![file_change],
         },
     );
+
+    state
+        .maintenance
+        .schedule(&lock_key, repo_path_for_maintenance, lock.clone());
 
     Ok((StatusCode::OK, Json(json!({ "commit_sha": commit_sha }))))
 }
@@ -268,6 +274,7 @@ pub async fn delete_file(
 
     let DeleteFileRequest { author, message } = body;
 
+    let repo_path_for_maintenance = repo_path.clone();
     let tenant_id_for_task = tenant_id.clone();
 
     let (commit_sha, file_change) = run_blocking(move || {
@@ -295,6 +302,10 @@ pub async fn delete_file(
             file_changes: vec![file_change],
         },
     );
+
+    state
+        .maintenance
+        .schedule(&lock_key, repo_path_for_maintenance, lock.clone());
 
     Ok((StatusCode::OK, Json(json!({ "commit_sha": commit_sha }))))
 }
@@ -353,6 +364,7 @@ pub async fn move_file(
         message,
     } = body;
 
+    let repo_path_for_maintenance = repo_path.clone();
     let tenant_id_for_task = tenant_id.clone();
 
     let (commit_sha, file_change) = run_blocking(move || {
@@ -381,6 +393,10 @@ pub async fn move_file(
             file_changes: vec![file_change],
         },
     );
+
+    state
+        .maintenance
+        .schedule(&lock_key, repo_path_for_maintenance, lock.clone());
 
     Ok((StatusCode::OK, Json(json!({ "commit_sha": commit_sha }))))
 }

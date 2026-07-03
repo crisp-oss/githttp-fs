@@ -93,6 +93,11 @@ Use the sample [config.toml](https://github.com/crisp-oss/githttp-fs/blob/master
 * `header` (type: _string_, allowed: any HTTP header name, default: no default) — Authorization header name, as sent to the hook receiver (if any)
 * `value` (type: _string_, allowed: any HTTP header value, default: no default) — Authorization header value, as sent to the hook receiver (if any)
 
+**[maintenance]**
+
+* `enabled` (type: _boolean_, allowed: `true`, `false`, default: `true`) — Whether to run background repository maintenance (packs loose Git objects so long-lived repositories stay fast)
+* `delay_secs` (type: _number_, allowed: seconds, default: `86400`) — How long after the first write to a repository its maintenance pass should run; the timer re-arms on the next write after each pass, and repositories that receive no writes are never maintained
+
 ## :fire: Report A Vulnerability
 
 If you find a vulnerability in githttp-fs, you are more than welcome to report it directly to [@crisp-oss](https://github.com/crisp-oss) by sending an encrypted email to [security@crisp.chat](mailto:security@crisp.chat). Do not report vulnerabilities in public GitHub issues, as they may be exploited by malicious people to target production servers running an unpatched githttp-fs server.

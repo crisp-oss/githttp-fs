@@ -33,7 +33,7 @@ All routes are prefixed `/v1` and require `Authorization: Bearer <api_key>`.
 | Method | Path | Description |
 |--------|------|-------------|
 | `DELETE` | `/v1/:collection_id/:tenant_id` | Delete entire tenant repository |
-| `GET` | `/v1/:collection_id/:tenant_id/files?prefix_path=&maximum_depth=` | List tracked files as a tree; optional `prefix_path` scopes the listing to a sub-directory (e.g. `?prefix_path=/docs`); optional `maximum_depth` limits how many directory levels deep the listing goes |
+| `GET` | `/v1/:collection_id/:tenant_id/files?prefix_path=&maximum_depth=&page=&per_page=` | List tracked files as a tree; optional `prefix_path` scopes the listing to a sub-directory (e.g. `?prefix_path=/docs`); optional `maximum_depth` limits how many directory levels deep the listing goes; `page`/`per_page` paginate over the root-level entries of the listing (default 100, max 500) |
 | `GET` | `/v1/:collection_id/:tenant_id/files/*path` | Read file content |
 | `HEAD` | `/v1/:collection_id/:tenant_id/files/*path` | Check that a file exists (`200` or `404`, no body) |
 | `PUT` | `/v1/:collection_id/:tenant_id/files/*path` | Create or update a file |
@@ -86,11 +86,23 @@ All write requests share a required `author` object. `message` is optional every
 **GET** `/files` — file listing (tree rooted at the optional `?prefix_path=` folder, or the repo root if omitted)
 ```json
 {
+  "page": 1,
+  "per_page": 100,
+  "has_more": false,
   "files": [
-    { "path": "docs/intro.md", "size": 1234 }
+    {
+      "type": "directory",
+      "name": "docs",
+      "children": [
+        { "type": "file", "name": "intro.md" }
+      ]
+    },
+    { "type": "file", "name": "README.md" }
   ]
 }
 ```
+
+Directories sort before files at every level; entries within each group sort alphabetically. File sizes are intentionally not reported — the listing is served from tree objects alone and never opens a single blob. Pagination applies to the *root-level* entries of the listing (parent-based paging): each page contains up to `per_page` root nodes with their full subtrees, and directories outside the page window are never even walked. Combine with `maximum_depth` (and `prefix_path`) to bound subtree size on huge repositories.
 
 The `prefix_path` query parameter must be a folder path (e.g. `/docs` or `docs/sub`). Leading and trailing slashes are stripped. `..`, `.`, and `.git` components are rejected with `400`. Passing `/` or omitting the parameter lists the full repository. When `prefix_path` points to a non-existent folder the response is an empty tree.
 
@@ -184,6 +196,12 @@ retry_backoff_ms = 2000
 [hooks.auth]          # optional
 header = "Authorization"
 value = "Bearer hook-secret"
+
+[maintenance]         # optional; these are the defaults
+enabled = true
+# Delay between the first write to a repository and its background
+# maintenance pass (loose-object packing + index refresh).
+delay_secs = 86400
 ```
 
 Config file path defaults to `config.toml` in the working directory. Override with `CONFIG_PATH=/path/to/config.toml`.
@@ -202,11 +220,14 @@ Log verbosity priority: `RUST_LOG` env var → `log_level` in config → `"info"
 - **Author identity is caller-supplied** — every write request requires an `author` object with `name` and `email`. Both are stored in the git commit and validated as non-empty.
 - **Commit identifier is named `sha`** (not `sha1`) — future-proof against git's SHA-256 migration; matches the convention used by GitHub, GitLab, and Gitea.
 - **`:sha` parameters accept hexadecimal only** — a full or abbreviated commit SHA (4–64 hex chars). Revspecs (`HEAD~1`, `master@{1}`, `:/pattern`) are rejected with `400` so git semantics never leak through the API and history-search DoS is impossible.
-- **HEAD is authoritative, not the working tree** — existence checks for writes, deletes, and moves are answered from HEAD's tree, and every write rebases the index onto HEAD (`index.read_tree`) before staging. Leftover working-tree or index state from a previously failed operation can never change an operation's outcome or be silently swept into a later commit. Moved content is read from HEAD's blob, not from disk.
+- **HEAD is authoritative, not the working tree** — existence checks for writes, deletes, and moves are answered from HEAD's tree, and every commit tree is derived from HEAD's tree plus the intended change. Leftover working-tree state from a previously failed operation can never change an operation's outcome or be silently swept into a later commit. Moved content is read from HEAD's blob, not from disk.
+- **Commits are built with `TreeUpdateBuilder`, not the git index** — cost per write is proportional to the touched path depth, not the repository size, so large repos write as fast as small ones. Moves and reverts reuse existing blob oids (no content rehash). The working tree is still kept in sync with single-file fs operations so humans can inspect repos, and the on-disk index is refreshed to HEAD during maintenance so `git status` stays meaningful.
+- **Background maintenance packs loose objects** — the first write to a repository arms a one-shot timer (`[maintenance] delay_secs`, default 24 h; `enabled = false` turns it off). When it fires, the pass takes the tenant write lock, packs all loose objects into a new packfile via libgit2 (no `git` binary needed), deletes the packed loose files, refreshes the index, and clears the slot so the next write re-arms it. Repos receiving no writes are never touched; the schedule is in-memory only and does not survive restarts. Deleting a tenant disarms its pending timer.
+- **File listing never opens blobs** — the tree endpoint is served from git tree objects alone (no sizes are reported), and pagination over root-level entries is decided before any subtree is opened, so off-page directories are never walked.
 - **Per-tenant lock entries are never removed** — not even on tenant deletion. Removing an entry would let a writer holding the old mutex run concurrently with a writer holding a freshly-created one for the same repository.
 - **Timestamps are named `committed_at`** — follows the `*_at` suffix convention (Stripe, GitHub API, Rails); unambiguous about what the value represents.
 - **`/move` URL suffix on POST** — axum's wildcard router cannot match a fixed suffix after `*path`, so the handler is registered on `POST /*path` and enforces the `/move` suffix internally, returning 400 otherwise.
-- **Stale `.git/index.lock` cleanup** — removed at startup across all repos, and checked before each write (removed if older than 30 s), to recover from crashed processes.
+- **Stale `.git/index.lock` cleanup** — removed at startup across all repos, and before each maintenance index refresh (removed if older than 30 s). The write path itself no longer touches the index, so a stale lock can never block writes.
 - **`git2` compiled with `vendored-libgit2`** — libgit2 is bundled in the binary; no system dependency needed.
 
 ## Webhook payloads

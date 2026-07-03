@@ -28,3 +28,8 @@ retry_backoff_ms = 2000
 
 header = "Authorization"
 value = "Bearer your-hook-receiver-secret"
+
+[maintenance]
+
+enabled = true
+delay_secs = 86400

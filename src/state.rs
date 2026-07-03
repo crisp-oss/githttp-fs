@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::hooks::HookQueue;
+use crate::maintenance::MaintenanceScheduler;
 
 /// A cloneable handle to the per-tenant write lock.
 /// Read operations do not acquire this lock.
@@ -20,6 +21,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// Per-tenant ordered hook delivery queues.
     pub hook_queue: Arc<HookQueue>,
+    /// Per-tenant background maintenance timers.
+    pub maintenance: Arc<MaintenanceScheduler>,
     /// Lazily-created mutex per tenant to serialize git write operations.
     repo_locks: Arc<DashMap<String, RepoLock>>,
 }
@@ -30,6 +33,7 @@ impl AppState {
 
         Self {
             hook_queue: Arc::new(HookQueue::new(config.clone())),
+            maintenance: Arc::new(MaintenanceScheduler::new(config.clone())),
             config,
             repo_locks: Arc::new(DashMap::new()),
         }
