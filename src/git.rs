@@ -415,8 +415,10 @@ impl GitFiles {
         tenant_id: &str,
         path_prefix: Option<&str>,
         maximum_depth: Option<usize>,
-    ) -> Result<Vec<TreeNode>, AppError> {
-        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, "listing files");
+        page: usize,
+        per_page: usize,
+    ) -> Result<(Vec<TreeNode>, bool), AppError> {
+        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, page = page, per_page = per_page, "listing files");
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
         let head_commit = repo.head()?.peel_to_commit()?;
@@ -462,7 +464,7 @@ impl GitFiles {
 
         tracing::debug!(tenant_id = %tenant_id, count = flat.len(), "file listing complete, building tree");
 
-        let flat = match prefix_filter {
+        let flat: Vec<(String, usize)> = match prefix_filter {
             Some(ref prefix) => flat
                 .into_iter()
                 .map(|(path, size)| (path[prefix.len()..].to_string(), size))
@@ -470,7 +472,14 @@ impl GitFiles {
             None => flat,
         };
 
-        Ok(GitUtils::build_tree(flat, maximum_depth))
+        let mut tree = GitUtils::build_tree(flat, maximum_depth);
+
+        let total = tree.len();
+        let offset = ((page - 1) * per_page).min(total);
+        let has_more = total > offset + per_page;
+        let page_tree: Vec<TreeNode> = tree.drain(offset..).take(per_page).collect();
+
+        Ok((page_tree, has_more))
     }
 
     /// Returns the file content as recorded in HEAD's tree (not from the working

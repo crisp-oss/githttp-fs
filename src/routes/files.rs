@@ -23,7 +23,12 @@ use crate::{
 pub struct ListFilesQuery {
     pub prefix_path: Option<String>,
     pub maximum_depth: Option<u32>,
+    pub page: Option<usize>,
+    pub per_page: Option<usize>,
 }
+
+const DEFAULT_PER_PAGE: usize = 100;
+const MAX_PER_PAGE: usize = 500;
 
 #[derive(Deserialize)]
 pub struct WriteFileRequest {
@@ -76,7 +81,13 @@ pub async fn list_files(
         None => None,
     };
 
-    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, "handling list files request");
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = query
+        .per_page
+        .unwrap_or(DEFAULT_PER_PAGE)
+        .clamp(1, MAX_PER_PAGE);
+
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, page = page, per_page = per_page, "handling list files request");
 
     let repo_path = state
         .config
@@ -87,19 +98,26 @@ pub async fn list_files(
 
     let tenant_id_for_task = tenant_id.clone();
 
-    let tree = run_blocking(move || {
+    let (tree, has_more) = run_blocking(move || {
         git::GitFiles::list_files(
             &repo_path,
             &tenant_id_for_task,
             path_prefix.as_deref(),
             maximum_depth,
+            page,
+            per_page,
         )
     })
     .await?;
 
-    tracing::debug!(tenant_id = %tenant_id, "list files tree response ready");
+    tracing::debug!(tenant_id = %tenant_id, page = page, returned = tree.len(), has_more = has_more, "list files tree response ready");
 
-    Ok(Json(json!(tree)))
+    Ok(Json(json!({
+        "page": page,
+        "per_page": per_page,
+        "has_more": has_more,
+        "files": tree,
+    })))
 }
 
 /// GET /:collection_id/:tenant_id/files/*path
