@@ -251,6 +251,17 @@ RUST_LOG=debug cargo run                     # overrides log_level in config
 
 After applying code changes, always run `cargo fmt` before `cargo build`.
 
+## Release procedure
+
+To bump the version to `vX.Y.Z`:
+
+1. Update `version` in `Cargo.toml`
+2. Update the version in `README.md`
+3. Update the version in `debian/rules`
+4. Run `cargo build` to regenerate `Cargo.lock`
+5. Commit all changes with message `vX.Y.Z`
+6. Tag the commit with `vX.Y.Z`
+
 ## Docker
 
 Two-stage build: compiles in `rust:alpine` (static musl binary), runs in `alpine:3.22`.
