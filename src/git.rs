@@ -1070,6 +1070,13 @@ impl GitFiles {
     /// Writes a file to disk, stages it, and creates a commit.
     /// Returns the commit SHA and the type of change (created vs updated).
     ///
+    /// Writing content identical to what HEAD already holds is a no-op:
+    /// no commit is created, nothing touches disk, and the change slot is
+    /// `None` so the caller knows not to fire hooks. Clients that blindly
+    /// re-PUT unchanged files thus cannot pollute history with empty
+    /// commits. The comparison hashes the incoming content and compares
+    /// blob oids, so the existing blob is never even read.
+    ///
     /// Order of operations matters: the working-tree write happens *before*
     /// the commit, so if the process dies in between, HEAD still points at
     /// the last good commit and the stray on-disk file is harmless (it will
@@ -1082,7 +1089,7 @@ impl GitFiles {
         commit_message: Option<&str>,
         author_name: &str,
         author_email: &str,
-    ) -> Result<(String, FileChange), AppError> {
+    ) -> Result<(String, Option<FileChange>), AppError> {
         tracing::debug!(path = %file_path, author_name = %author_name, author_email = %author_email, "writing file");
 
         let repo = GitUtils::open_or_init_repo(repo_path, author_name, author_email)?;
@@ -1098,7 +1105,22 @@ impl GitFiles {
         // is almost certainly a caller mistake that would delete a whole
         // folder of content in one PUT.
         let is_new_file = match head_tree.get_path(Path::new(file_path)) {
-            Ok(entry) if entry.kind() == Some(git2::ObjectType::Blob) => false,
+            Ok(entry) if entry.kind() == Some(git2::ObjectType::Blob) => {
+                // Hashing the incoming content yields the oid the new blob
+                // *would* get; if it matches the entry already in HEAD, the
+                // write changes nothing and short-circuits before any disk
+                // or object-database activity.
+                let incoming_oid =
+                    git2::Oid::hash_object(git2::ObjectType::Blob, content.as_bytes())?;
+
+                if entry.id() == incoming_oid {
+                    tracing::debug!(path = %file_path, "content unchanged, skipping commit");
+
+                    return Ok((parent_commit.id().to_string(), None));
+                }
+
+                false
+            }
             Ok(_) => {
                 return Err(AppError::InvalidOperation {
                     reason: format!("path is a folder: {}", file_path),
@@ -1163,7 +1185,7 @@ impl GitFiles {
             }
         };
 
-        Ok((commit_oid.to_string(), change))
+        Ok((commit_oid.to_string(), Some(change)))
     }
 
     /// Removes a file from disk, stages the deletion, and creates a commit.

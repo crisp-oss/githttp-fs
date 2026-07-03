@@ -207,8 +207,11 @@ pub async fn file_exists(
 /// PUT is idempotent by design: the caller does not need to know whether the
 /// file exists. The server decides created-vs-updated from HEAD's tree and
 /// reflects that in both the auto-generated commit message and the hook
-/// event kind. This is also the endpoint that lazily initialises a tenant
-/// repository on first use — there is no explicit "create tenant" call.
+/// event kind. Idempotency extends to content: re-PUTting a file with the
+/// exact content HEAD already holds creates no commit and fires no hook —
+/// the response carries HEAD's sha instead. This is also the endpoint that
+/// lazily initialises a tenant repository on first use — there is no
+/// explicit "create tenant" call.
 pub async fn write_file(
     State(state): State<AppState>,
     Path((collection_id, tenant_id, file_path)): Path<(String, String, String)>,
@@ -255,6 +258,16 @@ pub async fn write_file(
         )
     })
     .await?;
+
+    // A `None` change means the content already matched HEAD: no commit was
+    // created, so there is nothing for downstream systems to sync and no new
+    // objects for maintenance to consolidate. The returned sha is HEAD's —
+    // the commit whose tree already contains exactly this content.
+    let Some(file_change) = file_change else {
+        tracing::debug!(tenant_id = %tenant_id, sha = %commit_sha, "content unchanged, no commit created");
+
+        return Ok((StatusCode::OK, Json(json!({ "commit_sha": commit_sha }))));
+    };
 
     tracing::debug!(tenant_id = %tenant_id, sha = %commit_sha, "file write committed, enqueuing hook delivery");
 

@@ -4,7 +4,7 @@ Git-based Content Management System served over HTTP.
 
 ## What it is
 
-githttp-fs is a single Rust binary that wraps git repositories and exposes them as a file-system-over-HTTP API. Each tenant gets its own git repository on disk. Clients can create, read, update, delete, and move `.md`/`.mdx` files via REST. Every write produces a git commit. A configurable webhook fires after each commit so downstream systems (e.g. a read-only SQL database) can stay in sync.
+githttp-fs is a single Rust binary that wraps git repositories and exposes them as a file-system-over-HTTP API. Each tenant gets its own git repository on disk. Clients can create, read, update, delete, and move `.md`/`.mdx` files via REST. Every effective write produces a git commit (re-writing a file with unchanged content is a no-op). A configurable webhook fires after each commit so downstream systems (e.g. a read-only SQL database) can stay in sync.
 
 Git is never exposed in the API surface — no git terminology appears in requests or responses.
 
@@ -123,6 +123,8 @@ The optional `maximum_depth` query parameter (positive integer, minimum 1) restr
 { "commit_sha": "a3f9c1d" }
 ```
 
+A PUT whose `content` is byte-for-byte identical to what the file already holds is a no-op: no commit is created, no hook fires, and the response carries the current HEAD sha (the commit whose tree already contains that exact content).
+
 **GET** `/commits` — commit list
 ```json
 {
@@ -221,6 +223,7 @@ Log verbosity priority: `RUST_LOG` env var → `log_level` in config → `"info"
 - **All git operations run in `spawn_blocking`** so they never stall the tokio executor.
 - **Hook delivery is asynchronous** — writes enqueue their hook job and return immediately, so they are never delayed by a slow hook receiver.
 - **Hook events are ordered per tenant** — each tenant has a dedicated in-memory queue with a single consumer task. Jobs are enqueued while the tenant write lock is still held, so hooks are delivered in exactly the order commits were accepted by this server; a later commit can never overtake an earlier one at the receiver (even one stuck in retries). Files within a single commit are delivered one hook at a time in order.
+- **Unchanged writes are no-ops** — a PUT with content identical to HEAD's blob creates no commit and fires no hook; the response returns HEAD's sha. Detection hashes the incoming content and compares blob oids, so nothing is read from or written to the object database or disk. Clients that blindly re-write unchanged files cannot pollute history with empty commits.
 - **Rename = single hook** — a `POST .../move` produces one `file.moved` event with both `from` and `to` paths, preserving entity identity in downstream systems.
 - **Revert = new commit** — reverts never rewrite history; they produce a new inverse commit and fire the appropriate hooks for each changed file.
 - **Author identity is caller-supplied** — every write request requires an `author` object with `name` and `email`. Both are stored in the git commit and validated as non-empty.
