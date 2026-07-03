@@ -25,6 +25,7 @@
 
 pub mod commits;
 pub mod files;
+pub mod root;
 pub mod tenant;
 
 use serde::Deserialize;

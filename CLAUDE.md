@@ -32,6 +32,7 @@ All routes are prefixed `/v1` and require `Authorization: Bearer <api_key>`.
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `GET` | `/v1` | Check that the API key is valid (`200` with body `{ "pong": true }`, or `401`) |
 | `DELETE` | `/v1/:collection_id/:tenant_id` | Delete entire tenant repository |
 | `GET` | `/v1/:collection_id/:tenant_id/files?prefix_path=&maximum_depth=&page=&per_page=` | List tracked files as a tree; optional `prefix_path` scopes the listing to a sub-directory (e.g. `?prefix_path=/docs`); optional `maximum_depth` limits how many directory levels deep the listing goes; `page`/`per_page` paginate over the root-level entries of the listing (default 100, max 500) |
 | `GET` | `/v1/:collection_id/:tenant_id/files/*path` | Read file content |
@@ -82,6 +83,14 @@ All write requests share a required `author` object. `message` is optional every
 ```
 
 ### Response shapes
+
+**GET** `/v1` — authentication check. An authenticated no-op: responds `200` when the Bearer API key is valid, `401` otherwise (via the same middleware as every other route). GET-only (no implicit HEAD).
+```json
+{ "pong": true }
+```
+Touches no tenant or repository state — safe as a credential probe or liveness check for monitors that hold the key.
+
+Any request to the bare server root `/` (any method, no auth required) is answered with a `308 Permanent Redirect` to `/v1`.
 
 **GET** `/files` — file listing (tree rooted at the optional `?prefix_path=` folder, or the repo root if omitted)
 ```json

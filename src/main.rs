@@ -50,7 +50,7 @@ mod validate;
 
 use axum::{
     middleware as axum_middleware,
-    routing::{delete, get, post},
+    routing::{any, delete, get, on, post, MethodFilter},
     Router,
 };
 use clap::Parser;
@@ -136,11 +136,21 @@ async fn main() {
 
 /// Assembles the full `/v1` route table.
 ///
-/// Every route goes through the same API-key middleware — there are no
-/// unauthenticated endpoints (not even a health check), which keeps the
+/// Every API route goes through the same API-key middleware — there are no
+/// unauthenticated API endpoints (not even a health check), which keeps the
 /// public surface of a multi-tenant content store as small as possible.
+/// The closest thing to a health check is `GET /v1`, an authenticated
+/// no-op that lets a client verify its API key works. The only route
+/// outside the middleware is the bare server root `/`, which does nothing
+/// but redirect to `/v1`.
 fn build_router(app_state: AppState) -> Router {
     let api_routes = Router::new()
+        // API root: authenticated no-op for API-key verification. Nesting
+        // strips the `/v1` prefix, so this `/` route answers `GET /v1`
+        // (body `{ "pong": true }`). Registered with a bare GET filter
+        // rather than `get()`, which would implicitly answer HEAD as well —
+        // this endpoint is deliberately GET-only.
+        .route("/", on(MethodFilter::GET, routes::root::ping))
         // Tenant management
         .route(
             "/{collection_id}/{tenant_id}",
@@ -184,7 +194,11 @@ fn build_router(app_state: AppState) -> Router {
         ))
         .with_state(app_state);
 
-    Router::new().nest("/v1", api_routes)
+    Router::new()
+        // Bare server root: any method, no auth — just point the caller at
+        // the versioned API prefix with a 308 (method-preserving) redirect.
+        .route("/", any(routes::root::redirect_to_api_root))
+        .nest("/v1", api_routes)
 }
 
 /// Reads, parses, and validates the TOML config, exiting the process on any
