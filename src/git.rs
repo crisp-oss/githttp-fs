@@ -218,15 +218,15 @@ impl GitUtils {
             .unwrap_or_default()
     }
 
-    /// Builds a recursive `TreeNode` tree from a flat list of (path, size) pairs.
-    /// Directories are sorted before files at each level; entries within each
-    /// group are sorted alphabetically. Uses `BTreeMap` to keep insertion order
-    /// deterministic regardless of the order git walks the tree.
-    ///
-    /// `max_depth` limits how many directory levels are expanded. Directories
-    /// whose contents would appear beyond `max_depth` are emitted as stubs
-    /// (`Directory` nodes with an empty `children` vec). `None` = no limit.
-    fn build_tree(flat: Vec<(String, usize)>, max_depth: Option<usize>) -> Vec<TreeNode> {
+    /// Builds a recursive `TreeNode` tree from a flat list of (path, size) pairs
+    /// plus an explicit list of directory stub paths (directories whose contents
+    /// were not walked due to a depth limit). Directories are sorted before files
+    /// at each level; entries within each group are sorted alphabetically.
+    fn build_tree(
+        flat: Vec<(String, usize)>,
+        stubs: Vec<String>,
+        max_depth: Option<usize>,
+    ) -> Vec<TreeNode> {
         enum NodeBuilder {
             File(usize),
             Dir(BTreeMap<String, NodeBuilder>),
@@ -247,8 +247,6 @@ impl GitUtils {
                 [name, rest @ ..] => {
                     if let Some(max) = max_depth {
                         if current_depth >= max {
-                            // Directory at current_depth; its contents would exceed the
-                            // limit. Emit it as a stub (empty children).
                             dir.entry(name.to_string())
                                 .or_insert_with(|| NodeBuilder::Dir(BTreeMap::new()));
                             return;
@@ -265,11 +263,28 @@ impl GitUtils {
             }
         }
 
+        fn insert_stub(dir: &mut BTreeMap<String, NodeBuilder>, components: &[&str]) {
+            match components {
+                [] => {}
+                [name] => {
+                    dir.entry(name.to_string())
+                        .or_insert_with(|| NodeBuilder::Dir(BTreeMap::new()));
+                }
+                [name, rest @ ..] => {
+                    let child = dir
+                        .entry(name.to_string())
+                        .or_insert_with(|| NodeBuilder::Dir(BTreeMap::new()));
+                    if let NodeBuilder::Dir(children) = child {
+                        insert_stub(children, rest);
+                    }
+                }
+            }
+        }
+
         fn convert(name: String, node: NodeBuilder) -> TreeNode {
             match node {
                 NodeBuilder::File(size) => TreeNode::File { name, size },
                 NodeBuilder::Dir(children) => {
-                    // Directories first, then files; each group sorted by name.
                     let mut dirs: Vec<TreeNode> = Vec::new();
                     let mut files: Vec<TreeNode> = Vec::new();
 
@@ -293,6 +308,11 @@ impl GitUtils {
         for (path, size) in flat {
             let components: Vec<&str> = path.split('/').collect();
             insert(&mut root, &components, size, max_depth, 1);
+        }
+
+        for stub_path in stubs {
+            let components: Vec<&str> = stub_path.split('/').collect();
+            insert_stub(&mut root, &components);
         }
 
         let mut dirs: Vec<TreeNode> = Vec::new();
@@ -427,28 +447,44 @@ impl GitFiles {
 
         let head_tree = head_commit.tree()?;
 
-        // When a prefix is given, only entries whose path starts with `prefix/`
-        // are kept, and the prefix is stripped before the tree is built so the
-        // result is rooted at the requested folder.
-        let prefix_filter: Option<String> = path_prefix
-            .filter(|p| !p.is_empty())
-            .map(|p| format!("{}/", p));
+        // Resolve the prefix subtree directly so the walk never visits unrelated
+        // directories. An absent or non-directory prefix yields an empty result.
+        let walk_tree: git2::Tree<'_> = match path_prefix.filter(|p| !p.is_empty()) {
+            Some(prefix) => match head_tree.get_path(Path::new(prefix)) {
+                Ok(entry) => match repo.find_tree(entry.id()) {
+                    Ok(tree) => tree,
+                    Err(_) => return Ok((vec![], false)),
+                },
+                Err(_) => return Ok((vec![], false)),
+            },
+            None => head_tree,
+        };
 
         let mut flat: Vec<(String, usize)> = Vec::new();
+        let mut dir_stubs: Vec<String> = Vec::new();
 
-        head_tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+        walk_tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            // Depth of this entry relative to the walk root: "" = depth 1, "a/" = depth 2, …
+            let entry_depth = root.chars().filter(|c| *c == '/').count() + 1;
+
+            if entry.kind() == Some(git2::ObjectType::Tree) {
+                if let Some(max) = maximum_depth {
+                    if entry_depth >= max {
+                        // Record as a stub and skip descending — no blob lookups below.
+                        let name = entry.name().unwrap_or("");
+                        dir_stubs.push(format!("{}{}", root, name));
+                        return git2::TreeWalkResult::Skip;
+                    }
+                }
+                return git2::TreeWalkResult::Ok;
+            }
+
             if entry.kind() != Some(git2::ObjectType::Blob) {
                 return git2::TreeWalkResult::Ok;
             }
 
             let name = entry.name().unwrap_or("");
             let path = format!("{}{}", root, name);
-
-            if let Some(ref prefix) = prefix_filter {
-                if !path.starts_with(prefix.as_str()) {
-                    return git2::TreeWalkResult::Ok;
-                }
-            }
 
             let size = repo
                 .find_blob(entry.id())
@@ -462,17 +498,9 @@ impl GitFiles {
             git2::TreeWalkResult::Ok
         })?;
 
-        tracing::debug!(tenant_id = %tenant_id, count = flat.len(), "file listing complete, building tree");
+        tracing::debug!(tenant_id = %tenant_id, files = flat.len(), stubs = dir_stubs.len(), "file listing complete, building tree");
 
-        let flat: Vec<(String, usize)> = match prefix_filter {
-            Some(ref prefix) => flat
-                .into_iter()
-                .map(|(path, size)| (path[prefix.len()..].to_string(), size))
-                .collect(),
-            None => flat,
-        };
-
-        let mut tree = GitUtils::build_tree(flat, maximum_depth);
+        let mut tree = GitUtils::build_tree(flat, dir_stubs, maximum_depth);
 
         let total = tree.len();
         let offset = ((page - 1) * per_page).min(total);
