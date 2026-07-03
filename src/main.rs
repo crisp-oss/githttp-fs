@@ -4,6 +4,39 @@
 // Copyright: 2026, Valerian Saliou <valerian@valeriansaliou.name>
 // License: Mozilla Public License v2.0 (MPL v2.0)
 
+//! Binary entry point: wires every subsystem together and runs the server.
+//!
+//! The startup sequence is strictly ordered, and the order matters:
+//!
+//! 1. **Parse CLI flags** — only `-c/--config` exists; everything else lives
+//!    in the config file so deployments are described by one artifact.
+//! 2. **Load + validate config** — before tracing is initialised, because the
+//!    config carries the log level and a tracing subscriber can only be
+//!    installed once per process. Config errors go to stderr via `eprintln!`.
+//! 3. **Initialise tracing** — from here on, all diagnostics use `tracing`.
+//! 4. **Clean stale git locks** — a previous process killed mid-operation may
+//!    have left `.git/index.lock` files behind; at boot no operation can be
+//!    live, so they are all removed unconditionally before traffic arrives.
+//! 5. **Build `AppState`** — the shared state (config, hook queues,
+//!    maintenance scheduler, per-tenant write locks) cloned into every
+//!    request handler.
+//! 6. **Build the router, bind, serve** — any failure here is fatal: the
+//!    process logs and exits non-zero so a supervisor (systemd, Docker)
+//!    restarts it rather than leaving a half-alive server.
+//!
+//! Module map (see each module's own doc for details):
+//!
+//! - [`config`] — TOML config types and startup validation
+//! - [`state`] — shared application state and per-tenant write locks
+//! - [`error`] — the single `AppError` type and its HTTP mapping
+//! - [`git`] — every libgit2 operation (the heart of the system)
+//! - [`hooks`] — ordered, retried webhook delivery
+//! - [`maintenance`] — background loose-object packing
+//! - [`middleware`] — Bearer API-key guard
+//! - [`routes`] — axum HTTP handlers (thin orchestration over `git`)
+//! - [`util`] — `spawn_blocking` wrapper and constant-time comparison
+//! - [`validate`] — sanitisation of all user-supplied identifiers and paths
+
 mod config;
 mod error;
 mod git;
@@ -28,6 +61,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use config::Config;
 use state::AppState;
 
+/// Command-line interface. Deliberately minimal: the only flag is the config
+/// file path, defaulting to `config.toml` in the working directory, so that
+/// all deployment knobs live in one declarative file rather than being
+/// scattered across CLI flags and environment variables.
 #[derive(Parser)]
 #[command(about = "Git-based Content Management System served over HTTP")]
 struct Cli {
@@ -53,6 +90,8 @@ async fn main() {
     );
 
     // Before accepting traffic, remove any lock files left by a previous crash.
+    // At this point no request can be in flight, so every lock found on disk
+    // is by definition stale and safe to delete regardless of its age.
     git::GitLocks::cleanup_all_stale_locks(&repos_path);
 
     let app_state = AppState::new(config.clone());
@@ -95,6 +134,11 @@ async fn main() {
         });
 }
 
+/// Assembles the full `/v1` route table.
+///
+/// Every route goes through the same API-key middleware — there are no
+/// unauthenticated endpoints (not even a health check), which keeps the
+/// public surface of a multi-tenant content store as small as possible.
 fn build_router(app_state: AppState) -> Router {
     let api_routes = Router::new()
         // Tenant management
@@ -102,12 +146,16 @@ fn build_router(app_state: AppState) -> Router {
             "/{collection_id}/{tenant_id}",
             delete(routes::tenant::delete_tenant),
         )
-        // File tree listing
+        // File tree listing (no trailing path segment — the whole repo,
+        // optionally scoped/paged via query parameters).
         .route(
             "/{collection_id}/{tenant_id}/files",
             get(routes::files::list_files),
         )
-        // Individual file operations
+        // Individual file operations. Note that POST here is the *move*
+        // operation: axum's `{*path}` wildcard cannot match a fixed `/move`
+        // suffix after the wildcard, so the handler receives the full path
+        // (including `/move`) and strips/enforces the suffix itself.
         .route(
             "/{collection_id}/{tenant_id}/files/{*path}",
             get(routes::files::read_file)
@@ -139,6 +187,11 @@ fn build_router(app_state: AppState) -> Router {
     Router::new().nest("/v1", api_routes)
 }
 
+/// Reads, parses, and validates the TOML config, exiting the process on any
+/// failure. Uses `eprintln!` rather than `tracing` because this runs before
+/// the tracing subscriber exists (the config itself carries the log level).
+/// Validation errors are all collected and printed together so an operator
+/// can fix every mistake in one edit instead of playing whack-a-mole.
 fn load_config(config_path: &str) -> Config {
     let raw_content = std::fs::read_to_string(Path::new(config_path)).unwrap_or_else(|read_err| {
         eprintln!("Cannot read config file '{}': {}", config_path, read_err);
@@ -163,8 +216,12 @@ fn load_config(config_path: &str) -> Config {
     config
 }
 
+/// Installs the global tracing subscriber. Can only ever be called once per
+/// process — which is why config loading must happen first.
 fn init_tracing(log_level: Option<&str>) {
-    // RUST_LOG takes priority; config value is the fallback; "info" is the default.
+    // Verbosity priority: RUST_LOG env var → config `log_level` → "info".
+    // The env var wins so an operator can crank up logging on a running
+    // deployment without editing the config file.
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(log_level.unwrap_or("info")));
 

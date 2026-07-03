@@ -4,6 +4,12 @@
 // Copyright: 2026, Valerian Saliou <valerian@valeriansaliou.name>
 // License: Mozilla Public License v2.0 (MPL v2.0)
 
+//! File CRUD routes: listing, read, existence check, write, delete, move.
+//!
+//! See `routes/mod.rs` for the shared handler shape (validate → lock →
+//! blocking git op → hook enqueue → maintenance arm) that every write
+//! handler here follows.
+
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -19,14 +25,21 @@ use crate::{
     util::run_blocking, validate,
 };
 
+/// Query parameters for the listing endpoint. All optional: the bare
+/// endpoint returns page 1 of the full recursive tree.
 #[derive(Deserialize)]
 pub struct ListFilesQuery {
+    /// Folder to root the listing at (e.g. `/docs`); repo root if omitted.
     pub prefix_path: Option<String>,
+    /// How many directory levels to descend from the listing root; full
+    /// recursion if omitted.
     pub maximum_depth: Option<u32>,
     pub page: Option<usize>,
     pub per_page: Option<usize>,
 }
 
+// Pagination bounds shared with the commits endpoint: a generous default,
+// and a hard cap so a caller cannot request unbounded response sizes.
 const DEFAULT_PER_PAGE: usize = 100;
 const MAX_PER_PAGE: usize = 500;
 
@@ -55,6 +68,11 @@ pub struct MoveFileRequest {
 /// Accepts an optional `prefix_path` query parameter (e.g. `?prefix_path=/docs`) to scope
 /// the listing to a specific sub-directory. The path must be a folder and must
 /// not escape the repository root (`..' components are rejected).
+///
+/// Pagination is *parent-based*: `page`/`per_page` window over the
+/// root-level entries of the listing, each carrying its full subtree.
+/// Combined with `maximum_depth` this lets clients bound response size on
+/// arbitrarily large repositories.
 pub async fn list_files(
     State(state): State<AppState>,
     Path((collection_id, tenant_id)): Path<(String, String)>,
@@ -63,6 +81,9 @@ pub async fn list_files(
     let collection_id = validate::collection_id(&collection_id)?.to_string();
     let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
 
+    // An empty sanitised prefix ("/" or "") means "repo root", which is the
+    // same as no prefix at all — normalise it to None here so the git layer
+    // only ever sees a meaningful prefix.
     let path_prefix: Option<String> = query
         .prefix_path
         .as_deref()
@@ -71,6 +92,8 @@ pub async fn list_files(
         .filter(|p| !p.is_empty())
         .map(|p| p.to_string());
 
+    // maximum_depth=0 would mean "list nothing", which is more likely a
+    // caller bug than an intent — reject it explicitly.
     let maximum_depth: Option<usize> = match query.maximum_depth {
         Some(0) => {
             return Err(AppError::InvalidOperation {
@@ -180,6 +203,12 @@ pub async fn file_exists(
 
 /// PUT /:collection_id/:tenant_id/files/*path
 /// Creates or updates a file, commits the change, and fires a hook.
+///
+/// PUT is idempotent by design: the caller does not need to know whether the
+/// file exists. The server decides created-vs-updated from HEAD's tree and
+/// reflects that in both the auto-generated commit message and the hook
+/// event kind. This is also the endpoint that lazily initialises a tenant
+/// repository on first use — there is no explicit "create tenant" call.
 pub async fn write_file(
     State(state): State<AppState>,
     Path((collection_id, tenant_id, file_path)): Path<(String, String, String)>,

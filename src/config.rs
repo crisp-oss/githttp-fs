@@ -4,6 +4,22 @@
 // Copyright: 2026, Valerian Saliou <valerian@valeriansaliou.name>
 // License: Mozilla Public License v2.0 (MPL v2.0)
 
+//! TOML configuration types and startup validation.
+//!
+//! The structs here mirror the sections of `config.toml` one-to-one
+//! (`[server]`, `[hooks]`, `[hooks.auth]`, `[maintenance]`) and are
+//! deserialised by serde. Two conventions run through the whole module:
+//!
+//! - **Fail at startup, not at request time.** Every section implements a
+//!   `collect_errors` method that appends human-readable problems to a
+//!   shared `Vec` instead of returning on the first failure. `main` prints
+//!   the whole list and exits, so an operator fixes every config mistake in
+//!   a single edit-and-restart cycle. Nothing downstream ever needs to
+//!   re-validate config values.
+//! - **Optional sections have safe defaults.** `[hooks]` omitted means "no
+//!   webhooks" (writes still work, nothing is delivered). `[maintenance]`
+//!   omitted means "enabled, 24 h delay" via the `Default` impl.
+
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -13,6 +29,9 @@ type LogLevel = String;
 
 const VALID_LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
 
+/// Root of the parsed config file. `hooks` stays `Option` (its absence is
+/// checked at every enqueue), while `maintenance` collapses to defaults so
+/// the rest of the code never handles a missing section.
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub server: ServerConfig,
@@ -22,6 +41,9 @@ pub struct Config {
 }
 
 impl Config {
+    /// Validates the whole config, returning *all* problems at once rather
+    /// than stopping at the first one. Called exactly once, from `main`,
+    /// before the server starts.
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
@@ -122,6 +144,10 @@ impl ServerConfig {
             }
         }
 
+        // Validating repos_path doubles as provisioning: if the directory
+        // does not exist yet it is created here, so a fresh deployment works
+        // without a manual `mkdir` step. Failure to create it (permissions,
+        // read-only filesystem, ...) is a config error like any other.
         if self.repos_path.as_os_str().is_empty() {
             errors.push("server.repos_path must not be empty".to_string());
         } else if self.repos_path.exists() {
@@ -141,12 +167,22 @@ impl ServerConfig {
     }
 }
 
+/// Webhook receiver configuration. When present, every commit produces one
+/// HTTP POST per changed file (see `hooks.rs`), filtered down to the events
+/// listed in `events`.
 #[derive(Debug, Deserialize, Clone)]
 pub struct HooksConfig {
     pub url: String,
+    /// Only these event kinds are delivered; changes producing other kinds
+    /// are silently skipped. Lets a receiver subscribe to e.g. deletions only.
     pub events: Vec<HookEvent>,
+    /// Total delivery attempts per payload (first try included).
     pub retry_attempts: u32,
+    /// Base delay for exponential backoff: attempt N waits
+    /// `retry_backoff_ms * 2^(N-1)` before retrying.
     pub retry_backoff_ms: u64,
+    /// Optional static header (e.g. `Authorization`) attached to every
+    /// delivery so the receiver can authenticate this server.
     pub auth: Option<HookAuthConfig>,
 }
 
@@ -179,6 +215,10 @@ impl HooksConfig {
     }
 }
 
+/// The four webhook event kinds, matching the `FileChange` variants in
+/// `git.rs` one-to-one. Serialised with dotted names (`"file.created"`)
+/// because that is the wire format used both in `config.toml` and in the
+/// delivered JSON payloads.
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {

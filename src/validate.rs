@@ -4,10 +4,33 @@
 // Copyright: 2026, Valerian Saliou <valerian@valeriansaliou.name>
 // License: Mozilla Public License v2.0 (MPL v2.0)
 
+//! Sanitisation of every user-controlled value that reaches the filesystem
+//! or git layer.
+//!
+//! This module is the security boundary of the service. Collection ids,
+//! tenant ids, file paths, and commit SHAs all arrive from URL segments and
+//! request bodies, and all of them are eventually interpolated into on-disk
+//! paths or git lookups. Each validator here follows the same philosophy:
+//!
+//! - **Allow-list, not deny-list.** Identifiers are restricted to a known
+//!   safe character set rather than trying to enumerate dangerous ones.
+//! - **Validate once, at the edge.** Route handlers call these functions
+//!   first thing; everything below (`git.rs`, `hooks.rs`) can then trust its
+//!   inputs and never re-checks them.
+//! - **Return the sanitised value.** Validators return the (possibly
+//!   trimmed) `&str` so callers cannot accidentally keep using the raw input.
+//!
+//! The threats being blocked: path traversal (`../../etc/passwd`), direct
+//! access to git internals (`.git/config`), absolute paths escaping the
+//! repo, identity confusion (`./foo.md` vs `foo.md`), and revspec injection
+//! into commit lookups (`HEAD~1`, `:/pattern`).
+
 use std::path::{Component, Path};
 
 use crate::error::AppError;
 
+// Identifier length caps keep on-disk directory names comfortably inside
+// filesystem limits (255 bytes on most systems) with room to spare.
 const MAX_TENANT_ID_LEN: usize = 64;
 const MAX_COLLECTION_ID_LEN: usize = 64;
 
@@ -101,6 +124,11 @@ pub fn file_extension(path: &str, allowed_extensions: Option<&[String]>) -> Resu
 /// Strips leading/trailing slashes and rejects folder paths that try to escape
 /// the repo root or access git internals. Returns the sanitised relative path,
 /// or an empty string if the caller passed `/` or an empty string (= repo root).
+///
+/// Used for the `prefix_path` listing parameter. Differs from [`file_path`]
+/// in two ways: an empty result is *valid* (it means "the repo root"), and
+/// trailing slashes are tolerated since callers naturally write folders as
+/// `/docs/`.
 pub fn folder_path(raw: &str) -> Result<&str, AppError> {
     let path = raw.trim_matches('/');
 
@@ -108,6 +136,9 @@ pub fn folder_path(raw: &str) -> Result<&str, AppError> {
         return Ok(path);
     }
 
+    // Component-wise inspection (rather than substring matching) is what
+    // makes this robust: `Path::components()` splits exactly the way the
+    // OS will interpret the path, so nothing can hide inside a segment.
     for component in Path::new(path).components() {
         match component {
             Component::ParentDir => {
@@ -139,6 +170,12 @@ pub fn folder_path(raw: &str) -> Result<&str, AppError> {
 
 /// Strips a leading slash and rejects paths that try to escape the repo root
 /// or access git internals. Returns the sanitised relative path.
+///
+/// This runs on every `*path` URL segment and on move destinations. The
+/// sanitised path becomes the file's identity everywhere: on disk, in commit
+/// trees, in hook payloads, and in `file_path` history filters — which is
+/// why normalisation must be strict (two spellings of the same file would
+/// split its history and confuse downstream receivers).
 pub fn file_path(raw: &str) -> Result<&str, AppError> {
     let path = raw.trim_start_matches('/');
 

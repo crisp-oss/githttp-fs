@@ -4,6 +4,42 @@
 // Copyright: 2026, Valerian Saliou <valerian@valeriansaliou.name>
 // License: Mozilla Public License v2.0 (MPL v2.0)
 
+//! Every git operation in the system, built on libgit2 (the `git2` crate,
+//! compiled with `vendored-libgit2` so no system git is needed).
+//!
+//! All functions here are **synchronous** and must be called through
+//! `util::run_blocking`; mutating functions must additionally be called
+//! while holding the tenant write lock (see `state.rs`).
+//!
+//! The module is organised into stateless namespace structs:
+//!
+//! - `GitUtils` — private low-level helpers (signatures, repo open/init,
+//!   blob reads, tree building)
+//! - `GitLocks` — stale `.git/index.lock` cleanup
+//! - `GitMaintenance` — loose-object packing + index refresh
+//! - `GitFiles` — file CRUD (list / read / exists / write / delete / move)
+//! - `GitCommits` — history listing, commit detail, revert
+//! - `GitTenant` — tenant repository deletion
+//!
+//! Two invariants shape everything below:
+//!
+//! **HEAD is authoritative; the working tree is a courtesy.** Every
+//! existence check, content read, and commit tree is derived from HEAD's
+//! tree — never from files on disk. The working tree is still kept in sync
+//! (so a human can `ls` and inspect a repo), but if a past operation died
+//! halfway and left stray files behind, they can never alter an operation's
+//! outcome or get silently swept into a later commit. Each commit contains
+//! exactly the intended change and nothing else.
+//!
+//! **Commits are built with `TreeUpdateBuilder`, not the git index.** The
+//! classic index route (`add_path` → `write_tree`) costs O(repository size)
+//! per commit because the whole index is rewritten. `TreeUpdateBuilder`
+//! instead grafts a single change onto HEAD's existing tree, costing
+//! O(touched path depth): only the trees along the changed path are
+//! rewritten, everything else is shared with the previous commit by oid.
+//! Large repositories therefore commit as fast as small ones, and moves and
+//! reverts reuse existing blob oids outright (no content rehash).
+
 use chrono::{DateTime, Utc};
 use git2::build::TreeUpdateBuilder;
 use git2::{
@@ -69,6 +105,10 @@ pub struct CommitFileDetail {
 
 /// Describes a single file change that occurred in a commit.
 /// Used internally to drive hook delivery.
+///
+/// `Created`/`Updated`/`Moved` carry the resulting content so the hook
+/// payload can be built later without re-opening the repository — by the
+/// time the hook consumer runs, further commits may already have landed.
 #[derive(Debug, Clone)]
 pub enum FileChange {
     Created {
@@ -90,6 +130,8 @@ pub enum FileChange {
 }
 
 /// Internal record used while building per-file commit details.
+/// An owned snapshot of one `git2::DiffDelta` — copied out because the
+/// diff object cannot be borrowed while also being consumed by `print`.
 struct DeltaRecord {
     status: Delta,
     old_oid: Oid,
@@ -105,6 +147,10 @@ struct DeltaRecord {
 struct GitUtils;
 
 impl GitUtils {
+    /// Builds the git author/committer signature from the caller-supplied
+    /// identity, timestamped "now". This is the single place where the
+    /// non-empty checks on `author.name`/`author.email` are enforced — every
+    /// commit path funnels through here.
     fn git_signature<'a>(
         author_name: &'a str,
         author_email: &'a str,
@@ -125,6 +171,10 @@ impl GitUtils {
         Signature::now(author_name, author_email).map_err(AppError::Git)
     }
 
+    /// Converts a git commit timestamp (unix seconds + offset) into the UTC
+    /// `DateTime` used in API responses. An out-of-range value — only
+    /// possible with a corrupted repository — degrades to the epoch rather
+    /// than failing the whole request.
     fn timestamp_from_git_time(git_time: git2::Time) -> DateTime<Utc> {
         DateTime::from_timestamp(git_time.seconds(), 0).unwrap_or(DateTime::UNIX_EPOCH)
     }
@@ -147,6 +197,12 @@ impl GitUtils {
 
     /// Opens an existing repo or initialises a new one with an empty root commit
     /// so that HEAD is always valid for subsequent operations.
+    ///
+    /// This is what makes tenant provisioning implicit: the first PUT to a
+    /// brand-new tenant lands here and creates the repository on the fly.
+    /// The immediate `"chore: initialize"` root commit matters — every other
+    /// function in this module assumes `repo.head()` resolves to a commit,
+    /// and an initialised-but-commitless repository would break that.
     fn open_or_init_repo(
         repo_path: &Path,
         author_name: &str,
@@ -187,7 +243,10 @@ impl GitUtils {
         Ok(repo)
     }
 
-    /// Reads a blob's content from `tree` at `file_path` and decodes it as UTF-8.
+    /// Reads a blob's content from `tree` at `file_path` and decodes it as
+    /// UTF-8. The UTF-8 requirement exists because content travels in JSON
+    /// string fields (API responses and hook payloads) — binary blobs have
+    /// no representation there, so they surface as a 422 instead.
     fn blob_content_from_tree(
         repo: &Repository,
         tree: &git2::Tree<'_>,
@@ -221,16 +280,29 @@ impl GitUtils {
     /// an explicit list of directory stub paths (directories whose contents
     /// were not walked due to a depth limit). Directories are sorted before files
     /// at each level; entries within each group are sorted alphabetically.
+    ///
+    /// The two-phase approach (flat paths in, nested tree out) exists
+    /// because the tree *walk* (`collect_subtree`) and the tree *shape*
+    /// wanted by the API differ: git walks entries in its own order, while
+    /// the response needs directories-before-files with alphabetical
+    /// sorting within each group.
     fn build_tree(
         flat: Vec<String>,
         stubs: Vec<String>,
         max_depth: Option<usize>,
     ) -> Vec<TreeNode> {
+        // Intermediate mutable representation. A BTreeMap keyed by entry
+        // name gives alphabetical iteration for free; the dir-before-file
+        // ordering is applied later, in `convert`.
         enum NodeBuilder {
             File,
             Dir(BTreeMap<String, NodeBuilder>),
         }
 
+        // Threads one slash-separated path into the nested map, creating
+        // intermediate directories as needed. When the depth limit is hit,
+        // the directory at the limit is recorded as an empty stub and the
+        // remainder of the path is dropped.
         fn insert(
             dir: &mut BTreeMap<String, NodeBuilder>,
             components: &[&str],
@@ -261,6 +333,9 @@ impl GitUtils {
             }
         }
 
+        // Inserts a depth-limited directory as an (empty) directory node.
+        // Kept separate from `insert` because a stub's final component is a
+        // directory, whereas `insert`'s final component is always a file.
         fn insert_stub(dir: &mut BTreeMap<String, NodeBuilder>, components: &[&str]) {
             match components {
                 [] => {}
@@ -279,6 +354,9 @@ impl GitUtils {
             }
         }
 
+        // Recursively converts the builder map into the serialisable
+        // `TreeNode` shape, applying the directories-first ordering at
+        // every level (the BTreeMap already yields names alphabetically).
         fn convert(name: String, node: NodeBuilder) -> TreeNode {
             match node {
                 NodeBuilder::File => TreeNode::File { name },
@@ -331,11 +409,24 @@ impl GitUtils {
 // GitLocks — stale lock file detection and cleanup
 // ---------------------------------------------------------------------------
 
+/// Cleanup of stale `.git/index.lock` files.
+///
+/// libgit2 creates `index.lock` while writing the index and removes it when
+/// done; a process killed in between leaves the lock behind forever, and any
+/// future index write fails until it is removed. The write path no longer
+/// touches the index at all (commits go through `TreeUpdateBuilder`), so
+/// only maintenance's index refresh can be blocked — but that still warrants
+/// cleaning locks up at startup and before each refresh.
 pub struct GitLocks;
 
 impl GitLocks {
     /// Removes `.git/index.lock` if it is older than 30 seconds.
     /// A stale lock is left behind when a process is killed mid-operation.
+    ///
+    /// The age threshold is the safety margin: a lock younger than 30 s
+    /// *could* belong to a live external process (say, an operator running
+    /// `git` by hand inside the repo), so it is left alone. No internal
+    /// operation holds the index lock anywhere near that long.
     pub fn cleanup_stale_index_lock(repo_path: &Path) -> Result<(), AppError> {
         const STALE_LOCK_THRESHOLD_SECS: u64 = 30;
 
@@ -373,6 +464,10 @@ impl GitLocks {
 
     /// Walks `repos_root` once on startup and removes any leftover `.git/index.lock`
     /// regardless of age — no live operation can hold a lock at boot.
+    ///
+    /// The directory layout being walked is `repos_root/<collection>/<tenant>/.git`.
+    /// Every error along the way is swallowed on purpose: lock cleanup is
+    /// best-effort hygiene and must never prevent the server from starting.
     pub fn cleanup_all_stale_locks(repos_root: &Path) {
         let collections_dir = match std::fs::read_dir(repos_root) {
             Ok(d) => d,
@@ -425,6 +520,9 @@ impl GitLocks {
 // GitMaintenance — background loose-object packing and index refresh
 // ---------------------------------------------------------------------------
 
+/// The maintenance pass itself (the *when* lives in `maintenance.rs`; this
+/// is the *what*). Equivalent in spirit to `git repack` + `git read-tree`,
+/// implemented directly against libgit2 so the binary stays self-contained.
 pub struct GitMaintenance;
 
 impl GitMaintenance {
@@ -511,6 +609,11 @@ impl GitMaintenance {
     /// Walks `.git/objects/` and returns every loose object with its file
     /// path. Non-object entries (`pack/`, `info/`, temporary files) are
     /// skipped by the hex-name filters.
+    ///
+    /// Loose objects live at `.git/objects/<2-hex-chars>/<38-hex-chars>` —
+    /// the object's SHA split after two characters (the "fan-out" scheme
+    /// that keeps any single directory from holding every object).
+    /// Re-joining the directory name and file name reconstructs the oid.
     fn enumerate_loose_objects(repo_path: &Path) -> Result<Vec<(Oid, PathBuf)>, AppError> {
         let objects_dir = repo_path.join(".git").join("objects");
         let mut loose_objects: Vec<(Oid, PathBuf)> = Vec::new();
@@ -559,6 +662,15 @@ impl GitMaintenance {
 pub struct GitFiles;
 
 impl GitFiles {
+    /// Lists the repository as a tree of `TreeNode`s, rooted at
+    /// `path_prefix` (or the repo root), paginated over root-level entries,
+    /// and optionally depth-limited.
+    ///
+    /// The performance contract: **no blob is ever opened**. Names and
+    /// entry kinds come entirely from git tree objects, so listing cost
+    /// scales with the number of tree entries actually visited — and the
+    /// pagination below is designed to keep that number small even on huge
+    /// repositories.
     pub fn list_files(
         repo_path: &Path,
         tenant_id: &str,
@@ -613,6 +725,9 @@ impl GitFiles {
         root_dirs.sort_by(|left, right| left.0.cmp(&right.0));
         root_files.sort();
 
+        // Page arithmetic over the combined (dirs-then-files) root sequence.
+        // `has_more` comes from the total count directly — no "fetch one
+        // extra" trick needed here since all root names are already known.
         let total = root_dirs.len() + root_files.len();
         let offset = ((page - 1) * per_page).min(total);
         let has_more = total > offset + per_page;
@@ -754,6 +869,12 @@ impl GitFiles {
 
     /// Writes a file to disk, stages it, and creates a commit.
     /// Returns the commit SHA and the type of change (created vs updated).
+    ///
+    /// Order of operations matters: the working-tree write happens *before*
+    /// the commit, so if the process dies in between, HEAD still points at
+    /// the last good commit and the stray on-disk file is harmless (it will
+    /// simply be overwritten or ignored — never committed — because commit
+    /// trees are built from HEAD, not from disk).
     pub fn write_file(
         repo_path: &Path,
         file_path: &str,
@@ -772,6 +893,10 @@ impl GitFiles {
         // Existence is decided from HEAD's tree, never from the working tree,
         // so leftovers from a previously failed operation cannot change the
         // outcome (created vs updated) or the hook event that is emitted.
+        // Writing *onto* a directory path is rejected outright — git would
+        // technically allow replacing a tree with a blob, but for a CMS that
+        // is almost certainly a caller mistake that would delete a whole
+        // folder of content in one PUT.
         let is_new_file = match head_tree.get_path(Path::new(file_path)) {
             Ok(entry) if entry.kind() == Some(git2::ObjectType::Blob) => false,
             Ok(_) => {
@@ -842,6 +967,10 @@ impl GitFiles {
     }
 
     /// Removes a file from disk, stages the deletion, and creates a commit.
+    ///
+    /// Unlike `write_file`, this opens the repo with `open_tenant_repo` (no
+    /// auto-init): deleting a file from a tenant that never existed is a
+    /// 404, not a reason to create an empty repository.
     pub fn delete_file(
         repo_path: &Path,
         tenant_id: &str,
@@ -916,6 +1045,11 @@ impl GitFiles {
 
     /// Renames a file on disk, stages both sides, and creates a single commit.
     /// This preserves rename semantics so hook receivers know an entity was moved.
+    ///
+    /// Doing the remove and the insert in *one* commit is the whole point:
+    /// two separate commits (delete + create) would fire two hooks and make
+    /// the downstream receiver treat the file as a brand-new entity, losing
+    /// whatever metadata it had attached to the old path.
     pub fn move_file(
         repo_path: &Path,
         tenant_id: &str,
@@ -1050,6 +1184,9 @@ impl GitFiles {
 pub struct GitCommits;
 
 impl GitCommits {
+    /// Lists commits newest-first, paginated. With a `file_path` filter the
+    /// work is delegated to [`Self::list_commits_by_file`], which follows
+    /// the file backward through renames.
     pub fn list_commits(
         repo_path: &Path,
         tenant_id: &str,
@@ -1108,6 +1245,16 @@ impl GitCommits {
     ///
     /// Pagination is applied after matching: we collect up to
     /// `(page-1)*per_page + per_page + 1` matching commits, then slice.
+    ///
+    /// How the walk stays cheap: for each commit, two O(path depth) tree
+    /// lookups (does the file exist in this commit? in its parent? same
+    /// oid?) decide whether the commit touched the file. This answers the
+    /// overwhelmingly common "untouched" case without ever loading content.
+    /// Only when a commit *introduced* the path (present in commit, absent
+    /// in parent) is a full rename-detecting diff computed, to distinguish
+    /// "created here" from "renamed from an older path" — and in the rename
+    /// case, `current_path` is rewritten so the walk keeps following the
+    /// file under its previous name.
     fn list_commits_by_file(
         repo_path: &Path,
         tenant_id: &str,
@@ -1308,6 +1455,12 @@ impl GitCommits {
         None
     }
 
+    /// Builds the full detail view of one commit: metadata, and for every
+    /// file it touched a change label, the post-commit content, and a
+    /// unified diff. The `sha` may be abbreviated — the validation layer has
+    /// already guaranteed it is plain hexadecimal, so the `revparse_single`
+    /// call can only ever resolve it as an object id prefix, never as a
+    /// revspec expression.
     pub fn get_commit(
         repo_path: &Path,
         tenant_id: &str,
@@ -1331,6 +1484,8 @@ impl GitCommits {
 
         let commit_tree = commit.tree()?;
 
+        // The root commit has no parent; diffing against `None` yields every
+        // file in the commit as "created", which is exactly right.
         let parent_tree = if commit.parent_count() > 0 {
             Some(commit.parent(0)?.tree()?)
         } else {
@@ -1386,6 +1541,9 @@ impl GitCommits {
 
         // Walk the entire patch once and route each line to its delta's bucket.
         // Linear scan via `position` is fine — commits hold a handful of files.
+        // `diff.print` streams the whole patch through one callback with no
+        // per-file grouping of its own, so each line is matched back to its
+        // delta by the (old oid, new oid) pair.
         let mut per_file_diffs: Vec<String> = vec![String::new(); records.len()];
 
         diff.print(DiffFormat::Patch, |delta, _hunk, line| {
@@ -1397,6 +1555,9 @@ impl GitCommits {
             {
                 let bucket = &mut per_file_diffs[idx];
 
+                // Content lines get their +/-/space marker re-attached
+                // (libgit2 strips it from `line.content()`); structural
+                // lines (hunk headers, file headers) pass through as-is.
                 match line.origin() {
                     '+' | '-' | ' ' | '\\' => bucket.push(line.origin()),
                     _ => {}
@@ -1411,6 +1572,10 @@ impl GitCommits {
         let mut file_details: Vec<CommitFileDetail> = Vec::with_capacity(records.len());
 
         for (index, record) in records.iter().enumerate() {
+            // Map git's Delta status onto the API's four change labels. The
+            // catch-all arm collapses the exotic statuses (typechange,
+            // copied, ...) into "updated" — for a store that only ever holds
+            // regular text files they cannot meaningfully occur.
             let (change_label, file_path, from_path) = match record.status {
                 Delta::Added => (
                     "created",
@@ -1487,6 +1652,19 @@ impl GitCommits {
     /// Reverts all changes introduced by the given commit by applying their inverse,
     /// then records the result as a new commit. Returns the new commit SHA and
     /// the list of file changes (for hook delivery).
+    ///
+    /// How the inverse is computed: diff `parent(target) → target` to learn
+    /// what the target commit introduced, then apply each delta *backwards*
+    /// on top of the **current HEAD** (added → remove, deleted → restore,
+    /// modified → restore old version, renamed → rename back). Restored
+    /// content and blob oids come from the target's parent tree — the exact
+    /// pre-commit state — so no content is ever rehashed.
+    ///
+    /// Note this is a "blind" revert of the git-revert family: if commits
+    /// *after* the target modified the same files, their changes are
+    /// overwritten by the restored versions (last-write-wins, consistent
+    /// with the rest of the API's semantics). Reverting the root commit is
+    /// rejected since there is no parent state to restore.
     pub fn revert_commit(
         repo_path: &Path,
         tenant_id: &str,
@@ -1557,6 +1735,10 @@ impl GitCommits {
 
         let mut file_changes: Vec<FileChange> = Vec::new();
 
+        // For each delta: mirror the inverse change onto the working tree
+        // (best-effort human-visible state), stage it into the tree builder
+        // (the authoritative commit state), and record the corresponding
+        // FileChange (drives one hook per file, in this order).
         for raw_delta in &raw_deltas {
             match raw_delta.status {
                 Delta::Added => {
@@ -1725,6 +1907,11 @@ impl GitCommits {
 pub struct GitTenant;
 
 impl GitTenant {
+    /// Permanently deletes a tenant's repository — working tree, `.git`
+    /// directory, full history, everything. There is no soft-delete or
+    /// trash: the API contract is that tenant deletion is irreversible.
+    /// Must be called under the tenant write lock (the route handler holds
+    /// it) so no commit can be in flight while the directory disappears.
     pub fn delete_repo(repo_path: &Path, tenant_id: &str) -> Result<(), AppError> {
         tracing::debug!(tenant_id = %tenant_id, "deleting tenant repository");
 

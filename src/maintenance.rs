@@ -4,6 +4,29 @@
 // Copyright: 2026, Valerian Saliou <valerian@valeriansaliou.name>
 // License: Mozilla Public License v2.0 (MPL v2.0)
 
+//! Background repository maintenance scheduling.
+//!
+//! Why maintenance is needed at all: every commit made through the write
+//! path stores its new objects (blob, trees, commit) as individual *loose*
+//! files under `.git/objects/`. A busy tenant accumulates thousands of tiny
+//! files, which slows down object lookups and wastes disk. Git normally
+//! solves this with `git gc` / `git repack`; githttp-fs does the equivalent
+//! in-process (see `GitMaintenance` in `git.rs`) — packing all loose objects
+//! into a single packfile — with no dependency on a `git` binary.
+//!
+//! Why the scheduler works the way it does:
+//!
+//! - **One-shot timer armed by the first write** — repos that receive no
+//!   writes are never touched (no wasted wake-ups scanning idle tenants),
+//!   and repos that write constantly are packed at most once per
+//!   `delay_secs`, not after every burst.
+//! - **In-memory only, doesn't survive restarts** — losing a pending timer
+//!   is harmless: the next write simply re-arms it. Persisting the schedule
+//!   would add state for no correctness benefit.
+//! - **Runs under the tenant write lock** — packing must see a frozen
+//!   object store; taking the same mutex as writers is the simplest way to
+//!   guarantee that, and readers remain unaffected throughout.
+
 use dashmap::DashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,7 +65,11 @@ impl MaintenanceScheduler {
             return;
         }
 
-        // Only arm when no pass is already pending for this tenant.
+        // Only arm when no pass is already pending for this tenant. The
+        // entry API makes check-and-insert atomic — two concurrent writers
+        // cannot both arm a timer (only one sees the vacant slot). The slot
+        // is first claimed with `None` and the JoinHandle is filled in
+        // below, after the task exists.
         match self.pending.entry(tenant_key.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(_) => return,
             dashmap::mapref::entry::Entry::Vacant(vacant) => {

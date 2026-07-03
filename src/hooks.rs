@@ -4,6 +4,34 @@
 // Copyright: 2026, Valerian Saliou <valerian@valeriansaliou.name>
 // License: Mozilla Public License v2.0 (MPL v2.0)
 
+//! Asynchronous, ordered, retried webhook delivery.
+//!
+//! Webhooks exist so a downstream system (typically a read-optimised SQL
+//! mirror of the content) can stay in sync with every commit. Three
+//! properties drive the whole design:
+//!
+//! 1. **Writes are never delayed by the receiver.** The HTTP handler only
+//!    *enqueues* a job and returns; actual delivery happens on a background
+//!    task. A slow or down receiver cannot slow down the write API.
+//! 2. **Per-tenant ordering is absolute.** Each tenant gets its own queue
+//!    with a single consumer task, and jobs are enqueued while the tenant
+//!    write lock is still held. Queue order therefore equals commit order,
+//!    and because one consumer processes jobs strictly one at a time, a
+//!    later commit's hooks can never overtake an earlier commit's — even if
+//!    the earlier one is stuck in retries. A receiver that applies events
+//!    as they arrive always converges to the correct state.
+//! 3. **Failures retry with exponential backoff, then give up loudly.**
+//!    After the configured attempts are exhausted the event is dropped and
+//!    a CRITICAL log line is emitted — at that point the receiver may be
+//!    out of sync and needs reconciliation. Blocking the queue forever on
+//!    one poisoned event would be worse: it would silently stall every
+//!    subsequent event for the tenant.
+//!
+//! The queue is deliberately unbounded and in-memory: payload volume is
+//! bounded by write traffic (which is itself serialised per tenant), and
+//! durability across restarts is explicitly out of scope — the downstream
+//! system is expected to have a reconciliation path anyway.
+
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use reqwest::Client;
@@ -20,6 +48,8 @@ use crate::git::FileChange;
 const MAX_BACKOFF_EXPONENT: u32 = 20;
 
 /// A single unit of hook work: all file changes produced by one commit.
+/// Single-file operations carry one change; a revert can carry many, and its
+/// changes are delivered one hook at a time, in order.
 pub struct HookJob {
     pub tenant_id: String,
     pub commit_sha: String,
@@ -55,6 +85,7 @@ impl HookQueue {
     /// consumer task on first use. Callers must enqueue while still holding the
     /// tenant write lock so queue order always matches commit order.
     pub fn enqueue(&self, queue_key: &str, job: HookJob) {
+        // No hooks configured → nothing to deliver, skip the queue entirely.
         if self.config.hooks.is_none() {
             return;
         }
@@ -72,6 +103,10 @@ impl HookQueue {
         }
     }
 
+    /// Spawns the single consumer task for one tenant's queue. The loop
+    /// `await`s each delivery to completion (including all its retries and
+    /// backoff sleeps) before picking up the next job — this sequential
+    /// processing is precisely what provides the ordering guarantee.
     fn spawn_consumer(&self) -> mpsc::UnboundedSender<HookJob> {
         let (sender, mut receiver) = mpsc::unbounded_channel::<HookJob>();
         let client = self.client.clone();
@@ -91,6 +126,9 @@ impl HookQueue {
 // HookDelivery — webhook dispatch and payload construction
 // ---------------------------------------------------------------------------
 
+/// Stateless namespace for the delivery machinery: payload construction,
+/// event filtering, the retry loop, and the actual HTTP POST. Kept separate
+/// from `HookQueue` so queueing concerns and wire concerns don't mix.
 struct HookDelivery;
 
 impl HookDelivery {
@@ -135,6 +173,11 @@ impl HookDelivery {
         }
     }
 
+    /// The retry loop for one payload: attempt, and on failure sleep
+    /// `retry_backoff_ms * 2^(attempt-1)` before trying again. Runs inside
+    /// the tenant's consumer task, so backoff sleeps intentionally hold up
+    /// that tenant's queue (ordering beats latency here) without affecting
+    /// any other tenant.
     async fn deliver_with_retries(
         client: &Client,
         hooks: &HooksConfig,
@@ -186,6 +229,10 @@ impl HookDelivery {
         }
     }
 
+    /// Performs one HTTP POST. Success means any 2xx status; everything else
+    /// (transport error or non-2xx) is an error string for the retry loop —
+    /// including the response body, since receivers often explain rejections
+    /// there and it is the only clue an operator gets in the logs.
     async fn send(client: &Client, hooks: &HooksConfig, payload: &Value) -> Result<(), String> {
         let mut request_builder = client.post(&hooks.url).json(payload);
 
@@ -216,6 +263,8 @@ impl HookDelivery {
         ))
     }
 
+    /// Maps a git-layer `FileChange` to its wire-level event kind, used to
+    /// check the change against the configured `events` subscription list.
     fn event_for_change(file_change: &FileChange) -> HookEvent {
         match file_change {
             FileChange::Created { .. } => HookEvent::FileCreated,
@@ -225,6 +274,8 @@ impl HookDelivery {
         }
     }
 
+    /// Compact human-readable summary of a change (`"updated:docs/intro.md"`)
+    /// used purely for log lines — never sent to the receiver.
     fn change_description(file_change: &FileChange) -> String {
         match file_change {
             FileChange::Created { path, .. } => format!("created:{}", path),
@@ -238,6 +289,12 @@ impl HookDelivery {
         }
     }
 
+    /// Builds the JSON payload for one file change. The envelope fields
+    /// (`tenant_id`, `commit_sha`, `committed_at`) are identical across all
+    /// event kinds; the event-specific part is the `file` object — or, for
+    /// moves, a `from`/`to` pair so the receiver can carry entity identity
+    /// (and any attached metadata) across the rename instead of seeing an
+    /// unrelated delete + create.
     fn build_payload(
         tenant_id: &str,
         commit_sha: &str,

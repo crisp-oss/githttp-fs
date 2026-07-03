@@ -4,6 +4,29 @@
 // Copyright: 2026, Valerian Saliou <valerian@valeriansaliou.name>
 // License: Mozilla Public License v2.0 (MPL v2.0)
 
+//! The single application error type and its mapping to HTTP responses.
+//!
+//! Every fallible function in the codebase returns `Result<_, AppError>`,
+//! and `AppError` implements axum's `IntoResponse`. That combination lets
+//! handlers be written as plain `?`-propagating functions: any error that
+//! bubbles up is automatically converted into a JSON error body with the
+//! right status code, in one place, with consistent shape
+//! (`{ "error": "<message>" }`).
+//!
+//! Design notes:
+//!
+//! - Variants are grouped by *HTTP semantics*, not by origin: "thing does
+//!   not exist" variants map to 404, "caller sent something invalid" map to
+//!   400, and infrastructure failures (git, io, task join) map to 500.
+//! - `InvalidUtf8` gets its own 422: the request was well-formed, but the
+//!   stored blob cannot be represented in a JSON string, which is an
+//!   entity-level problem rather than a syntax one.
+//! - The `#[from]` conversions on `Git` and `Io` are what make `?` work
+//!   directly on `git2` and `std::fs` calls throughout `git.rs`.
+//! - Only 5xx responses are logged. 4xx responses are the *caller's*
+//!   mistake and would just generate noise at error level; the message is
+//!   already returned to them in the body.
+
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -46,6 +69,8 @@ pub enum AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        // The single source of truth for error → status-code mapping. Adding
+        // a new variant forces a decision here (the match is exhaustive).
         let status = match &self {
             AppError::FileNotFound { .. }
             | AppError::CommitNotFound { .. }
@@ -62,6 +87,8 @@ impl IntoResponse for AppError {
             }
         };
 
+        // 5xx means *we* failed — log it so operators see it. 4xx means the
+        // caller failed — the message in the response body is enough.
         if status.is_server_error() {
             tracing::error!("server error response: {}", self);
         }

@@ -4,6 +4,14 @@
 // Copyright: 2026, Valerian Saliou <valerian@valeriansaliou.name>
 // License: Mozilla Public License v2.0 (MPL v2.0)
 
+//! Commit history routes: list, detail, and revert.
+//!
+//! These are the endpoints where git's history model surfaces in the API —
+//! but only as opaque `sha` identifiers and `committed_at` timestamps; no
+//! git terminology (refs, revspecs, branches) leaks through. The revert
+//! endpoint is a *write*: it follows the same lock → blocking op → hook →
+//! maintenance sequence as the file write handlers.
+
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -37,6 +45,11 @@ const MAX_PER_PAGE: usize = 500;
 
 /// GET /:collection_id/:tenant_id/commits?page=1&per_page=100
 /// Returns a paginated list of commits without file content.
+///
+/// The optional `file_path` query parameter narrows the list to commits that
+/// touched that file, following renames backward through history — callers
+/// always pass the file's *current* path and the server resolves what it was
+/// called before any moves.
 pub async fn list_commits(
     State(state): State<AppState>,
     Path((collection_id, tenant_id)): Path<(String, String)>,
@@ -127,6 +140,10 @@ pub async fn get_commit(
 /// POST /:collection_id/:tenant_id/commits/:sha/revert
 /// Reverts all changes from the specified commit by creating a new inverse
 /// commit. Fires individual hooks for each file that changes as a result.
+///
+/// History is never rewritten: the reverted commit stays in the log and the
+/// revert appears as a brand-new commit on top, so downstream mirrors and
+/// audit trails remain append-only.
 pub async fn revert_commit(
     State(state): State<AppState>,
     Path((collection_id, tenant_id, sha)): Path<(String, String, String)>,

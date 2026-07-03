@@ -4,6 +4,10 @@
 // Copyright: 2026, Valerian Saliou <valerian@valeriansaliou.name>
 // License: Mozilla Public License v2.0 (MPL v2.0)
 
+//! Tenant lifecycle routes. There is deliberately no *create* endpoint:
+//! repositories are auto-initialised by the first file write, so the only
+//! lifecycle operation the API needs is deletion.
+
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -35,7 +39,8 @@ pub async fn delete_tenant(
 
     let lock_key = format!("{}/{}", collection_id, tenant_id);
 
-    // Acquire the write lock so any in-flight write finishes first.
+    // Acquire the write lock so any in-flight write finishes first — we must
+    // never rip the directory out from under a commit in progress.
     let lock = state.get_repo_lock(&lock_key);
     let _lock_guard = lock.lock().await;
 
