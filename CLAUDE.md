@@ -33,7 +33,7 @@ All routes are prefixed `/v1` and require `Authorization: Bearer <api_key>`.
 | Method | Path | Description |
 |--------|------|-------------|
 | `DELETE` | `/v1/:collection_id/:tenant_id` | Delete entire tenant repository |
-| `GET` | `/v1/:collection_id/:tenant_id/files?prefix_path=` | List tracked files as a tree; optional `prefix_path` scopes the listing to a sub-directory (e.g. `?prefix_path=/docs`) |
+| `GET` | `/v1/:collection_id/:tenant_id/files?prefix_path=&maximum_depth=` | List tracked files as a tree; optional `prefix_path` scopes the listing to a sub-directory (e.g. `?prefix_path=/docs`); optional `maximum_depth` limits how many directory levels deep the listing goes |
 | `GET` | `/v1/:collection_id/:tenant_id/files/*path` | Read file content |
 | `HEAD` | `/v1/:collection_id/:tenant_id/files/*path` | Check that a file exists (`200` or `404`, no body) |
 | `PUT` | `/v1/:collection_id/:tenant_id/files/*path` | Create or update a file |
@@ -93,6 +93,8 @@ All write requests share a required `author` object. `message` is optional every
 ```
 
 The `prefix_path` query parameter must be a folder path (e.g. `/docs` or `docs/sub`). Leading and trailing slashes are stripped. `..`, `.`, and `.git` components are rejected with `400`. Passing `/` or omitting the parameter lists the full repository. When `prefix_path` points to a non-existent folder the response is an empty tree.
+
+The optional `maximum_depth` query parameter (positive integer, minimum 1) restricts the listing to that many directory levels from the listing root (after `prefix_path` is applied). `maximum_depth=1` returns only items directly in the listing root: root-level files appear as `file` nodes, any directories with content deeper than the limit appear as `directory` stubs with an empty `children` array. Omitting `maximum_depth` returns the full recursive tree. Passing `maximum_depth=0` returns `400`.
 
 **GET** `/files/*path` — read file
 ```json

@@ -22,6 +22,7 @@ use crate::{
 #[derive(Deserialize)]
 pub struct ListFilesQuery {
     pub prefix_path: Option<String>,
+    pub maximum_depth: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -65,7 +66,17 @@ pub async fn list_files(
         .filter(|p| !p.is_empty())
         .map(|p| p.to_string());
 
-    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path_prefix = ?path_prefix, "handling list files request");
+    let maximum_depth: Option<usize> = match query.maximum_depth {
+        Some(0) => {
+            return Err(AppError::InvalidOperation {
+                reason: "maximum_depth must be at least 1".to_string(),
+            })
+        }
+        Some(d) => Some(d as usize),
+        None => None,
+    };
+
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, "handling list files request");
 
     let repo_path = state
         .config
@@ -77,7 +88,12 @@ pub async fn list_files(
     let tenant_id_for_task = tenant_id.clone();
 
     let tree = run_blocking(move || {
-        git::GitFiles::list_files(&repo_path, &tenant_id_for_task, path_prefix.as_deref())
+        git::GitFiles::list_files(
+            &repo_path,
+            &tenant_id_for_task,
+            path_prefix.as_deref(),
+            maximum_depth,
+        )
     })
     .await?;
 

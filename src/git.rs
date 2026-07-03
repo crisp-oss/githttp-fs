@@ -222,25 +222,44 @@ impl GitUtils {
     /// Directories are sorted before files at each level; entries within each
     /// group are sorted alphabetically. Uses `BTreeMap` to keep insertion order
     /// deterministic regardless of the order git walks the tree.
-    fn build_tree(flat: Vec<(String, usize)>) -> Vec<TreeNode> {
+    ///
+    /// `max_depth` limits how many directory levels are expanded. Directories
+    /// whose contents would appear beyond `max_depth` are emitted as stubs
+    /// (`Directory` nodes with an empty `children` vec). `None` = no limit.
+    fn build_tree(flat: Vec<(String, usize)>, max_depth: Option<usize>) -> Vec<TreeNode> {
         enum NodeBuilder {
             File(usize),
             Dir(BTreeMap<String, NodeBuilder>),
         }
 
-        fn insert(dir: &mut BTreeMap<String, NodeBuilder>, components: &[&str], size: usize) {
+        fn insert(
+            dir: &mut BTreeMap<String, NodeBuilder>,
+            components: &[&str],
+            size: usize,
+            max_depth: Option<usize>,
+            current_depth: usize,
+        ) {
             match components {
                 [] => {}
                 [name] => {
                     dir.insert(name.to_string(), NodeBuilder::File(size));
                 }
                 [name, rest @ ..] => {
+                    if let Some(max) = max_depth {
+                        if current_depth >= max {
+                            // Directory at current_depth; its contents would exceed the
+                            // limit. Emit it as a stub (empty children).
+                            dir.entry(name.to_string())
+                                .or_insert_with(|| NodeBuilder::Dir(BTreeMap::new()));
+                            return;
+                        }
+                    }
                     let child = dir
                         .entry(name.to_string())
                         .or_insert_with(|| NodeBuilder::Dir(BTreeMap::new()));
 
                     if let NodeBuilder::Dir(children) = child {
-                        insert(children, rest, size);
+                        insert(children, rest, size, max_depth, current_depth + 1);
                     }
                 }
             }
@@ -273,7 +292,7 @@ impl GitUtils {
 
         for (path, size) in flat {
             let components: Vec<&str> = path.split('/').collect();
-            insert(&mut root, &components, size);
+            insert(&mut root, &components, size, max_depth, 1);
         }
 
         let mut dirs: Vec<TreeNode> = Vec::new();
@@ -395,8 +414,9 @@ impl GitFiles {
         repo_path: &Path,
         tenant_id: &str,
         path_prefix: Option<&str>,
+        maximum_depth: Option<usize>,
     ) -> Result<Vec<TreeNode>, AppError> {
-        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, "listing files");
+        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, "listing files");
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
         let head_commit = repo.head()?.peel_to_commit()?;
@@ -450,7 +470,7 @@ impl GitFiles {
             None => flat,
         };
 
-        Ok(GitUtils::build_tree(flat))
+        Ok(GitUtils::build_tree(flat, maximum_depth))
     }
 
     /// Returns the file content as recorded in HEAD's tree (not from the working
