@@ -46,7 +46,7 @@ use git2::{
     Delta, DiffFindOptions, DiffFormat, DiffOptions, FileMode, Oid, Repository, Signature, Sort,
 };
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::error::AppError;
@@ -517,81 +517,90 @@ impl GitLocks {
 }
 
 // ---------------------------------------------------------------------------
-// GitMaintenance — background loose-object packing and index refresh
+// GitMaintenance — background repack, prune, reflog expiry, index refresh
 // ---------------------------------------------------------------------------
 
+/// Summary of what one maintenance pass did, consumed by the scheduler's log
+/// line in `maintenance.rs`.
+#[derive(Debug, Default)]
+pub struct MaintenanceReport {
+    /// Reachable objects written into the consolidated packfile
+    /// (0 when the repack was skipped because nothing had changed).
+    pub packed_objects: usize,
+    /// Loose object files deleted. Reachable ones now live in the new pack;
+    /// the remainder were unreachable and are thereby pruned.
+    pub loose_objects_removed: usize,
+    /// Superseded packfiles deleted after consolidation.
+    pub old_packs_removed: usize,
+}
+
 /// The maintenance pass itself (the *when* lives in `maintenance.rs`; this
-/// is the *what*). Equivalent in spirit to `git repack` + `git read-tree`,
-/// implemented directly against libgit2 so the binary stays self-contained.
+/// is the *what*). Equivalent in spirit to `git repack -a -d` + `git prune`
+/// + `git reflog expire --all` + `git read-tree HEAD`, implemented directly
+/// against libgit2 so the binary stays self-contained.
 pub struct GitMaintenance;
 
 impl GitMaintenance {
-    /// Packs every loose object into a single new packfile (via libgit2 — no
-    /// dependency on a `git` binary) and deletes the packed loose files, then
-    /// refreshes the on-disk index to match HEAD so `git status` stays
-    /// meaningful for humans (the write path never touches the index).
+    /// Runs one full housekeeping pass over a tenant repository:
     ///
-    /// Must be called while holding the tenant write lock: object writes only
-    /// happen under that lock, so the loose object set is frozen. Concurrent
-    /// reads are safe — libgit2 refreshes its pack backends on a missed
-    /// lookup, so a reader that raced the loose-file deletion finds the
-    /// object in the new pack.
+    /// 1. **Reflog expiry** — reflogs are pure bloat here: history is never
+    ///    rewritten and the API never exposes them, yet every commit appends
+    ///    an entry, so they grow without bound. They are simply deleted (and
+    ///    start accumulating again until the next pass).
+    /// 2. **Reachability repack** — every object reachable from any ref is
+    ///    written into one new packfile, then *all* loose objects and *all*
+    ///    superseded packfiles are deleted. Consolidation and pruning fall
+    ///    out of the same step: reachable objects survive in the new pack,
+    ///    unreachable ones (e.g. blobs orphaned by a write that failed
+    ///    between blob creation and commit) simply aren't carried over.
+    ///    Skipped entirely when the repository is already consolidated (no
+    ///    loose objects, at most one pack).
+    /// 3. **Index refresh** — the on-disk index is reset to HEAD so
+    ///    `git status` stays meaningful for humans (the write path never
+    ///    touches the index).
     ///
-    /// Returns the number of loose objects that were packed.
-    pub fn run(repo_path: &Path) -> Result<usize, AppError> {
+    /// Must be called while holding the tenant write lock. That lock is also
+    /// why pruning needs no grace period, unlike `git gc` with its two-week
+    /// default: objects are only ever created under the same lock, so there
+    /// can be no in-flight object that is "not referenced *yet*" — anything
+    /// unreachable now is unreachable forever (the write path derives every
+    /// commit from HEAD, never from pre-existing stray objects).
+    ///
+    /// Concurrent reads are safe throughout: readers hold their own
+    /// `Repository` handles, deleting a pack file that a reader has mapped
+    /// does not invalidate the mapping (POSIX unlink semantics), and on a
+    /// missed lookup libgit2 rescans the pack directory and finds the new
+    /// consolidated pack.
+    pub fn run(repo_path: &Path) -> Result<MaintenanceReport, AppError> {
         // The tenant may have been deleted while the timer was armed.
         if !repo_path.join(".git").exists() {
             tracing::debug!(path = %repo_path.display(), "repository gone, skipping maintenance");
 
-            return Ok(0);
+            return Ok(MaintenanceReport::default());
         }
 
         let repo = Repository::open(repo_path)?;
 
+        Self::expire_reflogs(&repo);
+
         let loose_objects = Self::enumerate_loose_objects(repo_path)?;
+        let packs_before = Self::enumerate_pack_stems(repo_path)?;
 
         tracing::debug!(
             path = %repo_path.display(),
             loose_objects = loose_objects.len(),
+            packs = packs_before.len(),
             "running repository maintenance"
         );
 
-        if !loose_objects.is_empty() {
-            let mut pack_builder = repo.packbuilder()?;
-
-            for (oid, _) in &loose_objects {
-                pack_builder.insert_object(*oid, None)?;
-            }
-
-            // Stream the pack straight into the ODB — this writes both the
-            // .pack and its .idx under .git/objects/pack.
-            let odb = repo.odb()?;
-            let mut pack_writer = odb.packwriter()?;
-
-            pack_builder.foreach(|chunk| {
-                use std::io::Write;
-
-                pack_writer.write_all(chunk).is_ok()
-            })?;
-
-            pack_writer.commit()?;
-
-            // Only files that made it into the pack are deleted, so a failure
-            // above never loses objects. Empty fan-out directories are pruned
-            // best-effort (`remove_dir` refuses non-empty directories).
-            for (_, loose_path) in &loose_objects {
-                let _ = std::fs::remove_file(loose_path);
-            }
-
-            let fanout_dirs: std::collections::HashSet<PathBuf> = loose_objects
-                .iter()
-                .filter_map(|(_, loose_path)| loose_path.parent().map(PathBuf::from))
-                .collect();
-
-            for fanout_dir in fanout_dirs {
-                let _ = std::fs::remove_dir(fanout_dir);
-            }
-        }
+        // Already consolidated (single pack, no loose objects) means no write
+        // has landed since the previous pass — every write creates loose
+        // objects — so the repack would just rebuild the identical pack.
+        let report = if loose_objects.is_empty() && packs_before.len() <= 1 {
+            MaintenanceReport::default()
+        } else {
+            Self::repack_reachable(&repo, repo_path, &loose_objects, &packs_before)?
+        };
 
         // Refresh the on-disk index to HEAD. Clean a stale index.lock first —
         // this is the only code path left that writes the index.
@@ -603,7 +612,159 @@ impl GitMaintenance {
         index.read_tree(&head_tree)?;
         index.write()?;
 
-        Ok(loose_objects.len())
+        Ok(report)
+    }
+
+    /// Writes one packfile holding every reachable object, then deletes the
+    /// now-redundant loose objects and superseded packs.
+    ///
+    /// Crash safety: the new pack is fully written and committed to the ODB
+    /// *before* anything is deleted, so a failure at any point never loses
+    /// objects — at worst it leaves redundant copies that the next pass
+    /// cleans up.
+    fn repack_reachable(
+        repo: &Repository,
+        repo_path: &Path,
+        loose_objects: &[(Oid, PathBuf)],
+        packs_before: &HashSet<PathBuf>,
+    ) -> Result<MaintenanceReport, AppError> {
+        let mut pack_builder = repo.packbuilder()?;
+        let mut revwalk = repo.revwalk()?;
+
+        // Reachability roots: HEAD plus every ref. The service itself only
+        // ever creates HEAD/master, but a human may have added branches or
+        // tags while inspecting a repo — a destructive prune must honour
+        // those, not silently corrupt them.
+        revwalk.push_head()?;
+
+        for reference in repo.references()?.flatten() {
+            if let Ok(name) = reference.name() {
+                let _ = revwalk.push_ref(name);
+            }
+
+            // `push_ref` peels an annotated tag down to its commit for the
+            // walk; the tag *object* itself must be packed separately or the
+            // ref would dangle after the prune.
+            if let Some(oid) = reference.target() {
+                if let Ok(object) = repo.find_object(oid, None) {
+                    if object.kind() == Some(git2::ObjectType::Tag) {
+                        let _ = pack_builder.insert_object(oid, None);
+                    }
+                }
+            }
+        }
+
+        // Inserts every commit in the walk plus all trees and blobs they
+        // reference, deduplicated — the complete reachable object set.
+        pack_builder.insert_walk(&mut revwalk)?;
+
+        // Stream the pack straight into the ODB — this writes both the
+        // .pack and its .idx under .git/objects/pack.
+        let odb = repo.odb()?;
+        let mut pack_writer = odb.packwriter()?;
+
+        pack_builder.foreach(|chunk| {
+            use std::io::Write;
+
+            pack_writer.write_all(chunk).is_ok()
+        })?;
+
+        pack_writer.commit()?;
+
+        let mut report = MaintenanceReport {
+            packed_objects: pack_builder.object_count(),
+            ..Default::default()
+        };
+
+        // From here on the new pack is durable; deletions are best-effort
+        // (a leftover file is redundant data, not corruption).
+        for (_, loose_path) in loose_objects {
+            let _ = std::fs::remove_file(loose_path);
+        }
+
+        report.loose_objects_removed = loose_objects.len();
+
+        // Empty fan-out directories are pruned best-effort (`remove_dir`
+        // refuses non-empty directories).
+        let fanout_dirs: HashSet<PathBuf> = loose_objects
+            .iter()
+            .filter_map(|(_, loose_path)| loose_path.parent().map(PathBuf::from))
+            .collect();
+
+        for fanout_dir in fanout_dirs {
+            let _ = std::fs::remove_dir(fanout_dir);
+        }
+
+        // Superseded packs are identified by directory diff rather than by
+        // predicting the new pack's name (a libgit2 implementation detail).
+        // If no new stem appeared, the consolidated pack was byte-identical
+        // to an existing one — possible when only unreachable garbage
+        // accumulated since the last pass — and the ODB just rewrote that
+        // file in place. In that case nothing is deleted: we cannot tell
+        // which old pack is the keeper, and redundant packs are merely
+        // wasteful, never wrong. The next pass after a real write (distinct
+        // pack name guaranteed by the new commit) sweeps them.
+        let packs_after = Self::enumerate_pack_stems(repo_path)?;
+        let new_pack_appeared = packs_after.difference(packs_before).next().is_some();
+
+        if new_pack_appeared {
+            for stem in packs_before {
+                // libgit2 writes only .pack/.idx, but a human running `git
+                // repack` inside the repo may have produced auxiliary files
+                // sharing the stem — remove those too, not just the pair.
+                for extension in ["pack", "idx", "rev", "mtimes", "keep", "bitmap"] {
+                    let _ = std::fs::remove_file(stem.with_extension(extension));
+                }
+
+                report.old_packs_removed += 1;
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Deletes the reflogs for HEAD and the branch it points at. Best-effort:
+    /// a missing reflog is fine, and reflog loss is never worth failing a
+    /// maintenance pass over.
+    fn expire_reflogs(repo: &Repository) {
+        // Resolve the branch name before deleting anything (`repo.head()`
+        // resolves the HEAD symref to e.g. `refs/heads/master`).
+        let branch_ref_name = repo
+            .head()
+            .ok()
+            .and_then(|head_ref| head_ref.name().ok().map(str::to_owned));
+
+        let _ = repo.reflog_delete("HEAD");
+
+        if let Some(name) = branch_ref_name {
+            tracing::trace!(reference = %name, "expiring reflog");
+
+            let _ = repo.reflog_delete(&name);
+        }
+    }
+
+    /// Lists the packfiles under `.git/objects/pack` as extension-less path
+    /// stems (each pack is a family of files — `.pack`, `.idx`, ... —
+    /// sharing one stem).
+    fn enumerate_pack_stems(repo_path: &Path) -> Result<HashSet<PathBuf>, AppError> {
+        let pack_dir = repo_path.join(".git").join("objects").join("pack");
+        let mut stems: HashSet<PathBuf> = HashSet::new();
+
+        // A repository that has never been packed has no pack directory.
+        let entries = match std::fs::read_dir(&pack_dir) {
+            Ok(entries) => entries,
+            Err(_) => return Ok(stems),
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            if path.extension().and_then(|extension| extension.to_str()) == Some("pack") {
+                stems.insert(path.with_extension(""));
+            }
+        }
+
+        Ok(stems)
     }
 
     /// Walks `.git/objects/` and returns every loose object with its file

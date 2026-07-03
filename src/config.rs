@@ -63,7 +63,8 @@ impl Config {
     }
 }
 
-/// Background repository maintenance (loose object packing + index refresh).
+/// Background repository maintenance (repack into a single consolidated
+/// packfile, prune unreachable objects, expire reflogs, refresh the index).
 /// The section is optional; omitting it enables maintenance with a 24h delay.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]

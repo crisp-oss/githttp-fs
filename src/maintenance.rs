@@ -8,11 +8,14 @@
 //!
 //! Why maintenance is needed at all: every commit made through the write
 //! path stores its new objects (blob, trees, commit) as individual *loose*
-//! files under `.git/objects/`. A busy tenant accumulates thousands of tiny
-//! files, which slows down object lookups and wastes disk. Git normally
-//! solves this with `git gc` / `git repack`; githttp-fs does the equivalent
-//! in-process (see `GitMaintenance` in `git.rs`) — packing all loose objects
-//! into a single packfile — with no dependency on a `git` binary.
+//! files under `.git/objects/`, every commit appends reflog entries, and
+//! failed writes can orphan unreachable blobs. A busy tenant accumulates
+//! thousands of tiny files, which slows down object lookups and wastes
+//! disk. Git normally solves this with `git gc`; githttp-fs does the
+//! equivalent in-process (see `GitMaintenance` in `git.rs`) — repacking all
+//! reachable objects into a single consolidated packfile, pruning
+//! unreachable ones, and expiring reflogs — with no dependency on a `git`
+//! binary.
 //!
 //! Why the scheduler works the way it does:
 //!
@@ -93,10 +96,12 @@ impl MaintenanceScheduler {
             let repo_path_for_task = repo_path.clone();
 
             match run_blocking(move || GitMaintenance::run(&repo_path_for_task)).await {
-                Ok(packed_objects) => {
+                Ok(report) => {
                     tracing::info!(
                         tenant = %task_tenant_key,
-                        packed_objects = packed_objects,
+                        packed_objects = report.packed_objects,
+                        loose_objects_removed = report.loose_objects_removed,
+                        old_packs_removed = report.old_packs_removed,
                         "maintenance complete"
                     );
                 }

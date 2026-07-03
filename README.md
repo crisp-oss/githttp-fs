@@ -95,7 +95,7 @@ Use the sample [config.toml](https://github.com/crisp-oss/githttp-fs/blob/master
 
 **[maintenance]**
 
-* `enabled` (type: _boolean_, allowed: `true`, `false`, default: `true`) — Whether to run background repository maintenance (packs loose Git objects so long-lived repositories stay fast)
+* `enabled` (type: _boolean_, allowed: `true`, `false`, default: `true`) — Whether to run background repository maintenance (repacks Git objects into a single packfile, prunes unreachable objects and expires reflogs, so long-lived repositories stay fast and compact)
 * `delay_secs` (type: _number_, allowed: seconds, default: `86400`) — How long after the first write to a repository its maintenance pass should run; the timer re-arms on the next write after each pass, and repositories that receive no writes are never maintained
 
 ## :fire: Report A Vulnerability
