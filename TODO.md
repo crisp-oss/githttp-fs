@@ -4,6 +4,8 @@
 
 - [x] Add query parameter to list files starting at given root (eg. `/en/articles`) — sanitize paths to prevent path escape!
 - [x] Update commit history to support per-file path history only, using an optional query parameter
+- [x] Add paging in file list route + maximum depth
+- [ ] Review whole code for security issues & performance issues on large/deep repositories w/ Fable
 
 ## Later
 
