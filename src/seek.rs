@@ -6,17 +6,18 @@
 
 //! Line-based content windowing ("seek") for file read endpoints.
 //!
-//! Two types split the wire format from the scan:
+//! Three types split the wire formats from the scan:
 //!
 //! - [`SeekOptions`] deserialises straight from `seek_`-prefixed HTTP query
-//!   parameters on the single-file read route, and — because the field
-//!   names live on the struct itself — the exact same type can later be
-//!   embedded in the JSON body of a batch read route. Prefix lists travel
-//!   as JSON-array *strings* (one canonical spelling, no polymorphism for
-//!   client libraries); [`SeekOptions::parse`] is where they are decoded
-//!   and where every malformed value becomes a `400`.
+//!   parameters on the single-file read route. Prefix lists travel as
+//!   JSON-array *strings* (query parameters are strings — one canonical
+//!   spelling, no polymorphism for client libraries).
+//! - [`SeekBody`] is the JSON-body twin used by the batch read route:
+//!   native arrays and no `seek_` prefix on the field names, since they
+//!   already nest under a `"seek"` object.
 //! - [`SeekFilter`] is the parsed, trusted form that the git layer feeds
-//!   with content.
+//!   with content. Both wire types funnel through [`SeekFilter::build`],
+//!   so every malformed value becomes a `400` with identical rules.
 //!
 //! The scan is a single forward pass over an [`std::io::BufRead`], so the
 //! git layer can feed it either a streaming ODB reader (stops inflating a
@@ -38,6 +39,26 @@ use crate::error::AppError;
 /// from `["## ", "### "]` to `$seek_from_line_starts_with` selects a
 /// section up to and including the next heading of the same level).
 pub const SEEK_TO_FROM_META: &str = "$seek_from_line_starts_with";
+
+/// How the seek fields are named on a given wire format, so validation
+/// errors point at the exact parameter the caller sent.
+struct SeekParameterNames {
+    from: &'static str,
+    to: &'static str,
+    maximum: &'static str,
+}
+
+const QUERY_PARAMETER_NAMES: SeekParameterNames = SeekParameterNames {
+    from: "seek_from_line_starts_with",
+    to: "seek_to_line_starts_with",
+    maximum: "seek_lines_maximum",
+};
+
+const BODY_PARAMETER_NAMES: SeekParameterNames = SeekParameterNames {
+    from: "seek.from_line_starts_with",
+    to: "seek.to_line_starts_with",
+    maximum: "seek.lines_maximum",
+};
 
 /// The seek filters exactly as they arrive on the wire, before any
 /// validation. All fields are optional and combinable; an empty struct is
@@ -63,10 +84,12 @@ impl SeekOptions {
     /// `$seek_from_line_starts_with` meta value with no `from` filter to
     /// resolve it.
     pub fn parse(&self) -> Result<SeekFilter, AppError> {
+        let names = &QUERY_PARAMETER_NAMES;
+
         let from_prefixes = self
             .seek_from_line_starts_with
             .as_deref()
-            .map(|raw| Self::parse_prefix_array(raw, "seek_from_line_starts_with"))
+            .map(|raw| Self::parse_prefix_array(raw, names.from))
             .transpose()?;
 
         let to_prefixes = match self.seek_to_line_starts_with.as_deref() {
@@ -75,63 +98,82 @@ impl SeekOptions {
             // Bare meta value: shorthand for an array holding only the meta.
             Some(SEEK_TO_FROM_META) => Some(vec![SEEK_TO_FROM_META.to_string()]),
 
-            Some(raw) => Some(Self::parse_prefix_array(raw, "seek_to_line_starts_with")?),
+            Some(raw) => Some(Self::parse_prefix_array(raw, names.to)?),
         };
 
-        if from_prefixes.is_none() {
-            if let Some(to_prefixes) = &to_prefixes {
-                if to_prefixes
-                    .iter()
-                    .any(|prefix| prefix.contains(SEEK_TO_FROM_META))
-                {
-                    return Err(AppError::InvalidOperation {
-                        reason: format!(
-                            "seek_to_line_starts_with uses {} but seek_from_line_starts_with is not set",
-                            SEEK_TO_FROM_META
-                        ),
-                    });
-                }
-            }
-        }
-
-        if self.seek_lines_maximum == Some(0) {
-            return Err(AppError::InvalidOperation {
-                reason: "seek_lines_maximum must be at least 1".to_string(),
-            });
-        }
-
-        Ok(SeekFilter {
-            from_prefixes,
-            to_prefixes,
-            lines_maximum: self.seek_lines_maximum,
-        })
+        SeekFilter::build(from_prefixes, to_prefixes, self.seek_lines_maximum, names)
     }
 
-    /// Decodes one prefix-list value: a JSON array of non-empty strings.
-    /// An empty prefix would match every line, and an empty array would
-    /// match none — both can only be caller bugs.
+    /// Decodes one prefix-list value from its JSON-array-string spelling.
     fn parse_prefix_array(raw: &str, parameter: &str) -> Result<Vec<String>, AppError> {
-        let prefixes: Vec<String> =
-            serde_json::from_str(raw).map_err(|_err| AppError::InvalidOperation {
-                reason: format!(
-                    "{} must be a JSON array of strings, e.g. [\"## \"]",
-                    parameter
-                ),
-            })?;
+        serde_json::from_str(raw).map_err(|_err| AppError::InvalidOperation {
+            reason: format!(
+                "{} must be a JSON array of strings, e.g. [\"## \"]",
+                parameter
+            ),
+        })
+    }
+}
 
-        if prefixes.is_empty() {
-            return Err(AppError::InvalidOperation {
-                reason: format!("{} must contain at least one prefix", parameter),
-            });
-        }
+/// The seek filters as they appear in JSON request bodies (batch read
+/// route), nested under a `"seek"` object: native arrays, no `seek_`
+/// prefix on the field names. Same semantics and validation rules as
+/// [`SeekOptions`] — [`parse`](Self::parse) applies them and rejects
+/// malformed values with a `400`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SeekBody {
+    pub from_line_starts_with: Option<Vec<String>>,
+    pub to_line_starts_with: Option<SeekBodyToPrefixes>,
+    pub lines_maximum: Option<usize>,
+}
 
-        if prefixes.iter().any(|prefix| prefix.is_empty()) {
-            return Err(AppError::InvalidOperation {
-                reason: format!("{} prefixes must not be empty", parameter),
-            });
-        }
+/// The two accepted spellings of `seek.to_line_starts_with` in a JSON body,
+/// mirroring the query parameter exactly: prefix values must be an array,
+/// and the only bare string allowed is the [`SEEK_TO_FROM_META`] operator
+/// (shorthand for an array holding only it) — so clients passing the
+/// operator do not have to wrap it. Any other bare string is a `400`,
+/// enforced in [`SeekBody::parse`] (serde's untagged repartition alone
+/// cannot tell the operator from an arbitrary string).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SeekBodyToPrefixes {
+    Value(String),
+    Values(Vec<String>),
+}
 
-        Ok(prefixes)
+impl SeekBody {
+    /// Validates the body filters into a usable [`SeekFilter`]. Arrays are
+    /// already native here, so unlike [`SeekOptions::parse`] there is no
+    /// JSON-string decoding step.
+    pub fn parse(&self) -> Result<SeekFilter, AppError> {
+        let names = &BODY_PARAMETER_NAMES;
+
+        let to_prefixes = match &self.to_line_starts_with {
+            None => None,
+
+            // Bare meta value: shorthand for an array holding only the meta.
+            Some(SeekBodyToPrefixes::Value(value)) if value == SEEK_TO_FROM_META => {
+                Some(vec![SEEK_TO_FROM_META.to_string()])
+            }
+
+            Some(SeekBodyToPrefixes::Value(_)) => {
+                return Err(AppError::InvalidOperation {
+                    reason: format!(
+                        "{} must be a JSON array of strings, or the bare meta value {}",
+                        names.to, SEEK_TO_FROM_META
+                    ),
+                });
+            }
+
+            Some(SeekBodyToPrefixes::Values(values)) => Some(values.clone()),
+        };
+
+        SeekFilter::build(
+            self.from_line_starts_with.clone(),
+            to_prefixes,
+            self.lines_maximum,
+            names,
+        )
     }
 }
 
@@ -164,6 +206,64 @@ pub struct SeekFilter {
 }
 
 impl SeekFilter {
+    /// Validates decoded filter values into a trusted `SeekFilter` — the
+    /// single funnel behind every wire format. Rejections are
+    /// `InvalidOperation` (HTTP `400`), naming the parameter as the caller
+    /// spelled it: empty arrays and empty prefixes (an empty prefix would
+    /// match every line, an empty array none — both can only be caller
+    /// bugs), a zero maximum, and a `$seek_from_line_starts_with` meta
+    /// value with no `from` filter to resolve it.
+    fn build(
+        from_prefixes: Option<Vec<String>>,
+        to_prefixes: Option<Vec<String>>,
+        lines_maximum: Option<usize>,
+        names: &SeekParameterNames,
+    ) -> Result<Self, AppError> {
+        for (prefixes, parameter) in [(&from_prefixes, names.from), (&to_prefixes, names.to)] {
+            let Some(prefixes) = prefixes else { continue };
+
+            if prefixes.is_empty() {
+                return Err(AppError::InvalidOperation {
+                    reason: format!("{} must contain at least one prefix", parameter),
+                });
+            }
+
+            if prefixes.iter().any(|prefix| prefix.is_empty()) {
+                return Err(AppError::InvalidOperation {
+                    reason: format!("{} prefixes must not be empty", parameter),
+                });
+            }
+        }
+
+        if from_prefixes.is_none() {
+            if let Some(to_prefixes) = &to_prefixes {
+                if to_prefixes
+                    .iter()
+                    .any(|prefix| prefix.contains(SEEK_TO_FROM_META))
+                {
+                    return Err(AppError::InvalidOperation {
+                        reason: format!(
+                            "{} uses {} but {} is not set",
+                            names.to, SEEK_TO_FROM_META, names.from
+                        ),
+                    });
+                }
+            }
+        }
+
+        if lines_maximum == Some(0) {
+            return Err(AppError::InvalidOperation {
+                reason: format!("{} must be at least 1", names.maximum),
+            });
+        }
+
+        Ok(Self {
+            from_prefixes,
+            to_prefixes,
+            lines_maximum,
+        })
+    }
+
     /// True when no filter is set, i.e. the scan would return the content
     /// untouched. Lets callers keep the plain whole-blob read path.
     pub fn is_noop(&self) -> bool {

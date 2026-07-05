@@ -20,9 +20,17 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
 
+use std::collections::HashSet;
+
 use crate::{
-    error::AppError, git, hooks::HookJob, routes::AuthorRequest, seek::SeekOptions,
-    state::AppState, util::run_blocking, validate,
+    error::AppError,
+    git,
+    hooks::HookJob,
+    routes::AuthorRequest,
+    seek::{SeekBody, SeekOptions},
+    state::AppState,
+    util::run_blocking,
+    validate,
 };
 
 /// Query parameters for the listing endpoint. All optional: the bare
@@ -42,6 +50,14 @@ pub struct ListFilesQuery {
 // and a hard cap so a caller cannot request unbounded response sizes.
 const DEFAULT_PER_PAGE: usize = 100;
 const MAX_PER_PAGE: usize = 500;
+
+/// Body of the batch read endpoint: the paths to read, plus an optional
+/// seek window applied to every file (see `seek.rs` for the field formats).
+#[derive(Deserialize)]
+pub struct BatchReadFilesRequest {
+    pub files: Vec<String>,
+    pub seek: Option<SeekBody>,
+}
 
 #[derive(Deserialize)]
 pub struct WriteFileRequest {
@@ -185,6 +201,90 @@ pub async fn read_file(
     })))
 }
 
+/// POST /:collection_id/:tenant_id/batch/files/read
+/// Reads several files in one request. The response array is index-aligned
+/// with the request's `files` array: each slot is either the same
+/// `{ path, content }` object the single read route returns, or `null`
+/// when that path does not exist (or is a folder). An optional `seek`
+/// object applies the same line window to every file.
+///
+/// The whole request is rejected upfront (400) when a path is invalid,
+/// paths are duplicated, or more than `limits.batch_read_maximum_files`
+/// paths are asked for — a safety cap against unbounded response sizes.
+/// A file that exists but cannot be represented (invalid UTF-8) fails the
+/// whole batch with a 422, so `null` strictly means "not found".
+pub async fn batch_read_files(
+    State(state): State<AppState>,
+    Path((collection_id, tenant_id)): Path<(String, String)>,
+    Json(body): Json<BatchReadFilesRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let collection_id = validate::collection_id(&collection_id)?.to_string();
+    let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
+
+    if body.files.is_empty() {
+        return Err(AppError::InvalidOperation {
+            reason: "files must contain at least one path".to_string(),
+        });
+    }
+
+    let maximum_files = state.config.limits.batch_read_maximum_files;
+
+    if body.files.len() > maximum_files {
+        return Err(AppError::InvalidOperation {
+            reason: format!(
+                "files must not contain more than {} paths ({} requested)",
+                maximum_files,
+                body.files.len()
+            ),
+        });
+    }
+
+    // Sanitise every path with the same rules as the single read route,
+    // *before* the uniqueness check so that two spellings of the same file
+    // (e.g. `a.md` and `/a.md`) are caught as duplicates.
+    let file_paths = body
+        .files
+        .iter()
+        .map(|raw_path| validate::file_path(raw_path).map(|path| path.to_string()))
+        .collect::<Result<Vec<String>, AppError>>()?;
+
+    let mut seen_paths = HashSet::new();
+
+    for file_path in &file_paths {
+        if !seen_paths.insert(file_path.as_str()) {
+            return Err(AppError::InvalidOperation {
+                reason: format!("files must be unique: '{}' is requested twice", file_path),
+            });
+        }
+    }
+
+    let seek = body.seek.unwrap_or_default().parse()?;
+
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, count = file_paths.len(), seek = ?seek, "handling batch read files request");
+
+    let repo_path = state
+        .config
+        .server
+        .repos_path
+        .join(&collection_id)
+        .join(&tenant_id);
+
+    let file_paths_for_task = file_paths.clone();
+
+    let contents = run_blocking(move || {
+        git::GitFiles::batch_read_files(&repo_path, &tenant_id, &file_paths_for_task, &seek)
+    })
+    .await?;
+
+    let files: Vec<_> = file_paths
+        .iter()
+        .zip(contents)
+        .map(|(path, content)| content.map(|content| json!({ "path": path, "content": content })))
+        .collect();
+
+    Ok(Json(json!({ "files": files })))
+}
+
 /// HEAD /:collection_id/:tenant_id/files/*path
 /// Returns 200 with no body when the file exists in HEAD, 404 otherwise.
 /// Cheaper than GET as the blob content is never loaded.
@@ -232,7 +332,7 @@ pub async fn write_file(
 
     validate::file_extension(
         &file_path,
-        state.config.server.allowed_extensions.as_deref(),
+        state.config.limits.allowed_extensions.as_deref(),
     )?;
 
     tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %file_path, "handling write file request");
@@ -388,7 +488,7 @@ pub async fn move_file(
 
     // Only the destination is checked against the whitelist: files written
     // before the whitelist was configured must remain movable.
-    validate::file_extension(&to_path, state.config.server.allowed_extensions.as_deref())?;
+    validate::file_extension(&to_path, state.config.limits.allowed_extensions.as_deref())?;
 
     tracing::debug!(
         collection_id = %collection_id,

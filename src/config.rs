@@ -7,8 +7,9 @@
 //! TOML configuration types and startup validation.
 //!
 //! The structs here mirror the sections of `config.toml` one-to-one
-//! (`[server]`, `[hooks]`, `[hooks.auth]`, `[maintenance]`) and are
-//! deserialised by serde. Two conventions run through the whole module:
+//! (`[server]`, `[limits]`, `[hooks]`, `[hooks.auth]`, `[maintenance]`)
+//! and are deserialised by serde. Two conventions run through the whole
+//! module:
 //!
 //! - **Fail at startup, not at request time.** Every section implements a
 //!   `collect_errors` method that appends human-readable problems to a
@@ -35,6 +36,8 @@ const VALID_LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub server: ServerConfig,
+    #[serde(default)]
+    pub limits: LimitsConfig,
     pub hooks: Option<HooksConfig>,
     #[serde(default)]
     pub maintenance: MaintenanceConfig,
@@ -48,6 +51,7 @@ impl Config {
         let mut errors = Vec::new();
 
         self.server.collect_errors(&mut errors);
+        self.limits.collect_errors(&mut errors);
 
         if let Some(hooks) = &self.hooks {
             hooks.collect_errors(&mut errors);
@@ -108,9 +112,57 @@ pub struct ServerConfig {
     pub api_key: String,
     pub repos_path: PathBuf,
     pub log_level: Option<LogLevel>,
+}
+
+/// Request-level guard rails, grouped in their own `[limits]` section.
+/// The section is optional; omitting it (or any key) applies the defaults.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct LimitsConfig {
     /// Optional whitelist of file extensions accepted on writes and move
     /// destinations (e.g. `["md", "mdx"]`). Unset means all extensions.
     pub allowed_extensions: Option<Vec<String>>,
+    /// Safety cap on how many files one batch read request may ask for;
+    /// larger requests are rejected with a 400.
+    pub batch_read_maximum_files: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            allowed_extensions: None,
+            batch_read_maximum_files: 100,
+        }
+    }
+}
+
+impl LimitsConfig {
+    fn collect_errors(&self, errors: &mut Vec<String>) {
+        if self.batch_read_maximum_files < 1 {
+            errors.push("limits.batch_read_maximum_files must be at least 1".to_string());
+        }
+
+        if let Some(extensions) = &self.allowed_extensions {
+            if extensions.is_empty() {
+                errors.push(
+                    "limits.allowed_extensions must contain at least one extension".to_string(),
+                );
+            }
+
+            for extension in extensions {
+                let normalized = extension.trim_start_matches('.');
+
+                if normalized.is_empty()
+                    || !normalized.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                {
+                    errors.push(format!(
+                        "limits.allowed_extensions entry '{}' is invalid; must be alphanumeric like \"md\"",
+                        extension
+                    ));
+                }
+            }
+        }
+    }
 }
 
 impl ServerConfig {
@@ -130,27 +182,6 @@ impl ServerConfig {
                     level,
                     VALID_LOG_LEVELS.join(", ")
                 ));
-            }
-        }
-
-        if let Some(extensions) = &self.allowed_extensions {
-            if extensions.is_empty() {
-                errors.push(
-                    "server.allowed_extensions must contain at least one extension".to_string(),
-                );
-            }
-
-            for extension in extensions {
-                let normalized = extension.trim_start_matches('.');
-
-                if normalized.is_empty()
-                    || !normalized.bytes().all(|byte| byte.is_ascii_alphanumeric())
-                {
-                    errors.push(format!(
-                        "server.allowed_extensions entry '{}' is invalid; must be alphanumeric like \"md\"",
-                        extension
-                    ));
-                }
             }
         }
 

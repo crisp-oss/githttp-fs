@@ -164,6 +164,13 @@ fn build_router(app_state: AppState) -> Router {
             "/{collection_id}/{tenant_id}/files",
             get(routes::files::list_files),
         )
+        // Batch file reading. Lives under `/batch/files/read` — a literal
+        // segment distinct from `/files`, so it can never collide with the
+        // `{*path}` wildcard below.
+        .route(
+            "/{collection_id}/{tenant_id}/batch/files/read",
+            post(routes::files::batch_read_files),
+        )
         // Individual file operations. Note that POST here is the *move*
         // operation: axum's `{*path}` wildcard cannot match a fixed `/move`
         // suffix after the wildcard, so the handler receives the full path

@@ -273,6 +273,70 @@ impl GitUtils {
             })
     }
 
+    /// Resolves `file_path` to its blob oid in `tree`, or `None` when the
+    /// path is absent or resolves to a folder — "not a file" either way.
+    fn blob_oid_in_tree(tree: &git2::Tree<'_>, file_path: &str) -> Option<Oid> {
+        let tree_entry = tree.get_path(Path::new(file_path)).ok()?;
+
+        if tree_entry.kind() != Some(git2::ObjectType::Blob) {
+            return None;
+        }
+
+        Some(tree_entry.id())
+    }
+
+    /// Reads a blob's content with the seek window applied — or whole when
+    /// the filter is a no-op. Shared by the single and batch read paths.
+    ///
+    /// Windowed reads prefer a streaming ODB read (`git_odb_open_rstream`),
+    /// so on loose objects — every blob written since the last maintenance
+    /// repack — inflation stops as soon as the window is complete. Packed
+    /// objects cannot be streamed by libgit2 (the packfile backend stores
+    /// them delta'd, so it implements no `readstream`); those fall back to
+    /// scanning the blob borrowed from the object cache. Either way only
+    /// the selected window is allocated — the full content is never copied
+    /// into a `String`.
+    fn windowed_blob_content(
+        repo: &Repository,
+        oid: Oid,
+        file_path: &str,
+        seek: &SeekFilter,
+    ) -> Result<String, AppError> {
+        if seek.is_noop() {
+            let blob = repo.find_blob(oid)?;
+
+            return std::str::from_utf8(blob.content())
+                .map(|text| text.to_string())
+                .map_err(|_err| AppError::InvalidUtf8 {
+                    path: file_path.to_string(),
+                });
+        }
+
+        let odb = repo.odb()?;
+
+        // Bound to a local so the stream (which borrows `odb`) is dropped
+        // before `odb` itself at the end of the function.
+        let window = match odb.reader(oid) {
+            Ok((reader, _size, _object_type)) => {
+                tracing::trace!(path = %file_path, blob_id = %oid, "seek-reading blob via odb stream");
+
+                seek.apply_reader(std::io::BufReader::new(reader), file_path)
+            }
+
+            // The backend holding this object does not support streaming
+            // reads (packed objects) — scan the whole inflated blob instead.
+            Err(_stream_unsupported) => {
+                tracing::trace!(path = %file_path, blob_id = %oid, "seek-reading blob in memory (streaming unsupported)");
+
+                let blob = repo.find_blob(oid)?;
+
+                seek.apply_reader(std::io::Cursor::new(blob.content()), file_path)
+            }
+        };
+
+        window
+    }
+
     fn path_string(path: Option<&Path>) -> String {
         path.map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default()
@@ -1024,15 +1088,9 @@ impl GitFiles {
     /// Returns the file content as recorded in HEAD's tree (not from the working
     /// tree) so the response always reflects the last successfully committed state.
     ///
-    /// When a seek window is requested, the content is scanned line by line
-    /// instead of being decoded whole. The scan prefers a streaming ODB read
-    /// (`git_odb_open_rstream`), so on loose objects — every blob written
-    /// since the last maintenance repack — inflation stops as soon as the
-    /// window is complete. Packed objects cannot be streamed by libgit2
-    /// (the packfile backend stores them delta'd, so it implements no
-    /// `readstream`); those fall back to scanning the blob borrowed from
-    /// the object cache. Either way only the selected window is allocated —
-    /// the full content is never copied into a `String`.
+    /// A path resolving to a folder answers the same 404 as a missing file —
+    /// consistent with the HEAD existence endpoint. See
+    /// `GitUtils::windowed_blob_content` for how seek windows are read.
     pub fn read_file(
         repo_path: &Path,
         tenant_id: &str,
@@ -1048,49 +1106,48 @@ impl GitFiles {
 
         let head_tree = head_commit.tree()?;
 
-        if seek.is_noop() {
-            return GitUtils::blob_content_from_tree(&repo, &head_tree, file_path);
-        }
-
-        let tree_entry =
-            head_tree
-                .get_path(Path::new(file_path))
-                .map_err(|_err| AppError::FileNotFound {
-                    path: file_path.to_string(),
-                })?;
-
-        // A path resolving to a folder is "not a file" — same 404 the HEAD
-        // existence endpoint gives, and required here anyway before handing
-        // the oid to the ODB (which knows nothing about entry kinds).
-        if tree_entry.kind() != Some(git2::ObjectType::Blob) {
-            return Err(AppError::FileNotFound {
+        let blob_oid = GitUtils::blob_oid_in_tree(&head_tree, file_path).ok_or_else(|| {
+            AppError::FileNotFound {
                 path: file_path.to_string(),
-            });
-        }
-
-        let odb = repo.odb()?;
-
-        // Bound to a local so the stream (which borrows `odb`) is dropped
-        // before `odb` itself at the end of the function.
-        let window = match odb.reader(tree_entry.id()) {
-            Ok((reader, _size, _object_type)) => {
-                tracing::trace!(tenant_id = %tenant_id, path = %file_path, blob_id = %tree_entry.id(), "seek-reading blob via odb stream");
-
-                seek.apply_reader(std::io::BufReader::new(reader), file_path)
             }
+        })?;
 
-            // The backend holding this object does not support streaming
-            // reads (packed objects) — scan the whole inflated blob instead.
-            Err(_stream_unsupported) => {
-                tracing::trace!(tenant_id = %tenant_id, path = %file_path, blob_id = %tree_entry.id(), "seek-reading blob in memory (streaming unsupported)");
+        GitUtils::windowed_blob_content(&repo, blob_oid, file_path, seek)
+    }
 
-                let blob = repo.find_blob(tree_entry.id())?;
+    /// Reads several files from HEAD's tree in one repository pass. The
+    /// returned vector is index-aligned with `file_paths`: `None` marks a
+    /// path that is absent (or a folder), `Some` carries the content with
+    /// the shared seek window applied. Unreadable content (invalid UTF-8)
+    /// is a hard error for the whole batch, so `None` strictly means "not
+    /// found".
+    pub fn batch_read_files(
+        repo_path: &Path,
+        tenant_id: &str,
+        file_paths: &[String],
+        seek: &SeekFilter,
+    ) -> Result<Vec<Option<String>>, AppError> {
+        tracing::debug!(tenant_id = %tenant_id, count = file_paths.len(), "batch reading files");
 
-                seek.apply_reader(std::io::Cursor::new(blob.content()), file_path)
-            }
-        };
+        let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
+        let head_commit = repo.head()?.peel_to_commit()?;
 
-        window
+        tracing::trace!(tenant_id = %tenant_id, head_sha = %head_commit.id(), "resolved HEAD for batch read");
+
+        let head_tree = head_commit.tree()?;
+
+        file_paths
+            .iter()
+            .map(
+                |file_path| match GitUtils::blob_oid_in_tree(&head_tree, file_path) {
+                    None => Ok(None),
+
+                    Some(blob_oid) => {
+                        GitUtils::windowed_blob_content(&repo, blob_oid, file_path, seek).map(Some)
+                    }
+                },
+            )
+            .collect()
     }
 
     /// Checks that a file exists in HEAD's tree without reading its content.

@@ -8,7 +8,11 @@ api_key = "MySecretAPIKey"
 repos_path = "./dev/repositories"
 log_level = "debug"
 
+[limits]
+
 allowed_extensions = ["html", "txt", "toml", "json", "md", "mdx"]
+
+batch_read_maximum_files = 100
 
 [hooks]
 

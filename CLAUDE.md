@@ -22,7 +22,7 @@ src/
   seek.rs          — SeekOptions: line-based content windowing for file reads
   routes/
     mod.rs         — shared request types (AuthorRequest)
-    files.rs       — GET/PUT/DELETE/POST on /:collection_id/:tenant_id/files and /:collection_id/:tenant_id/files/*path
+    files.rs       — GET/PUT/DELETE/POST on /:collection_id/:tenant_id/files and /:collection_id/:tenant_id/files/*path, plus POST /:collection_id/:tenant_id/batch/files/read
     commits.rs     — commit list, commit detail, revert
     tenant.rs      — DELETE /:collection_id/:tenant_id
 ```
@@ -37,6 +37,7 @@ All routes are prefixed `/v1` and require `Authorization: Bearer <api_key>`.
 | `DELETE` | `/v1/:collection_id/:tenant_id` | Delete entire tenant repository |
 | `GET` | `/v1/:collection_id/:tenant_id/files?prefix_path=&maximum_depth=&page=&per_page=` | List tracked files as a tree; optional `prefix_path` scopes the listing to a sub-directory (e.g. `?prefix_path=/docs`); optional `maximum_depth` limits how many directory levels deep the listing goes; `page`/`per_page` paginate over the root-level entries of the listing (default 100, max 500) |
 | `GET` | `/v1/:collection_id/:tenant_id/files/*path?seek_from_line_starts_with=&seek_to_line_starts_with=&seek_lines_maximum=` | Read file content; optional `seek_*` parameters narrow the response to a line window (see below) |
+| `POST` | `/v1/:collection_id/:tenant_id/batch/files/read` | Batch-read several files in one request, with an optional shared seek window; capped by `limits.batch_read_maximum_files` |
 | `HEAD` | `/v1/:collection_id/:tenant_id/files/*path` | Check that a file exists (`200` or `404`, no body) |
 | `PUT` | `/v1/:collection_id/:tenant_id/files/*path` | Create or update a file |
 | `DELETE` | `/v1/:collection_id/:tenant_id/files/*path` | Delete a file |
@@ -82,6 +83,20 @@ All write requests share a required `author` object. `message` is optional every
   "message": "optional commit message"
 }
 ```
+
+**POST** `/batch/files/read` — batch-read several files (no `author`: reads commit nothing)
+```json
+{
+  "files": ["docs/a.md", "docs/b.md"],
+  "seek": {
+    "from_line_starts_with": ["---", "+++"],
+    "to_line_starts_with": ["$seek_from_line_starts_with"],
+    "lines_maximum": 20
+  }
+}
+```
+
+`files` is required: 1 to `limits.batch_read_maximum_files` paths (more is a `400`), each validated with the same rules as the single read route's `*path`, and unique after sanitisation (duplicates are a `400`). `seek` is optional and applies the same line window to every file; its fields carry the exact semantics of the read route's `seek_*` query parameters, but as native JSON arrays and without the `seek_` prefix (they already nest under `seek`). Exactly like the query parameter, `to_line_starts_with` also accepts the bare string `"$seek_from_line_starts_with"` as a shorthand for an array holding only the meta operator — that is the only bare string allowed (any other must be array-wrapped, else `400`); the meta value is also usable as an array element.
 
 ### Response shapes
 
@@ -133,6 +148,18 @@ Three optional, combinable `seek_*` query parameters narrow `content` to a line 
 - `seek_lines_maximum` — caps the window to this many lines, counted from the window's first line (line 0, or the `seek_from_line_starts_with` match if set). Must be at least 1; `0` returns `400`.
 
 Filters resolve in that order: from → to → maximum.
+
+**POST** `/batch/files/read` — batch read result
+```json
+{
+  "files": [
+    { "path": "docs/a.md", "content": "# A" },
+    null
+  ]
+}
+```
+
+The `files` array is index-aligned with the request's `files` array. Each slot is either the same `{ path, content }` object the single read route returns (with the seek window applied, `path` in sanitised form), or `null` when that path does not exist in HEAD (or is a folder). `null` strictly means "not found": a file that exists but cannot be represented in JSON (invalid UTF-8) fails the whole request with a `422` naming the path. The tenant not existing at all is a `404`, as on the single read route.
 
 **HEAD** `/files/*path` — check file existence. Responds `200` with an empty body when the file exists in the last committed state, `404` when it doesn't (including when the path points to a folder or the tenant doesn't exist). Blob content is never loaded, so this is cheaper than a GET.
 
@@ -201,11 +228,16 @@ repos_path = "./dev/repositories"
 # Tracing log level: "trace" | "debug" | "info" | "warn" | "error"
 # Defaults to "info" if unset. Overridden by the RUST_LOG env var.
 log_level = "debug"
+
+[limits]              # optional; request-level guard rails
 # Optional whitelist of file extensions (compared case-insensitively) accepted
 # on PUT paths and move destinations; other extensions are rejected with 400.
 # Unset means all extensions are accepted. Move sources are not checked, so
 # files written before the whitelist was configured remain movable.
 allowed_extensions = ["md", "mdx"]
+# Safety cap on how many files one batch read request may ask for; larger
+# requests are rejected with 400. Defaults to 100 if unset.
+batch_read_maximum_files = 100
 
 [hooks]
 url = "https://your-receiver.example.com/hook"
@@ -251,7 +283,8 @@ Log verbosity priority: `RUST_LOG` env var → `log_level` in config → `"info"
 - **Commits are built with `TreeUpdateBuilder`, not the git index** — cost per write is proportional to the touched path depth, not the repository size, so large repos write as fast as small ones. Moves and reverts reuse existing blob oids (no content rehash). The working tree is still kept in sync with single-file fs operations so humans can inspect repos, and the on-disk index is refreshed to HEAD during maintenance so `git status` stays meaningful.
 - **Background maintenance repacks and expires (pruning is opt-in)** — the first write to a repository arms a one-shot timer (`[maintenance] delay_secs`, default 24 h; `enabled = false` turns it off). When it fires, the pass takes the tenant write lock and, via libgit2 (no `git` binary needed): expires reflogs, writes one consolidated packfile, deletes all loose objects and superseded packs, refreshes the index, and clears the slot so the next write re-arms it. By default every object is carried over into the new pack, so maintenance can never destroy data; with `destructive_prune = true` only objects reachable from a ref are kept, permanently dropping orphaned garbage (e.g. blobs from writes that failed mid-operation). Commit history is safe in both modes — history is append-only, so every past file version (including versions of since-deleted files) stays reachable through its commit. Pruning needs no grace period because objects are only ever created under the same write lock the pass holds. The repack is skipped when the repo is already consolidated (no loose objects, ≤ 1 pack). Repos receiving no writes are never touched; the schedule is in-memory only and does not survive restarts. Deleting a tenant disarms its pending timer.
 - **File listing never opens blobs** — the tree endpoint is served from git tree objects alone (no sizes are reported), and pagination over root-level entries is decided before any subtree is opened, so off-page directories are never walked.
-- **Seek windowing lives in its own module (`seek.rs`) and scans, never decodes whole** — `SeekOptions` is the raw wire type: it deserialises straight from the `seek_*` query parameters on the single-file read route, and because the field names live on the struct itself the exact same type can be embedded in the JSON body of the planned batch read route. Prefix lists travel as JSON-array strings (one canonical spelling, no polymorphism for client libraries); `SeekOptions::parse()` decodes them into the validated `SeekFilter` the git layer consumes, turning every malformed value into a `400`. The scan is a single forward pass over any `BufRead` that stops reading the moment the window is complete. The git layer feeds it a streaming ODB read (`git_odb_open_rstream`) when the blob is a loose object — every blob written since the last maintenance repack — so inflation halts early; packed objects cannot be streamed by libgit2 and fall back to a `Cursor` over the in-memory blob. Either way only the selected window is allocated (and only the window must be valid UTF-8 — prefix matching is byte-level). Seeked reads answer `404` when the path resolves to a folder, same as the HEAD existence endpoint.
+- **Seek windowing lives in its own module (`seek.rs`) and scans, never decodes whole** — `SeekOptions` (query wire type, JSON-array strings since query parameters are strings) and `SeekBody` (JSON-body wire type for the batch route: native arrays, no `seek_` prefix) both parse into the validated `SeekFilter` the git layer consumes, through one shared funnel that turns every malformed value into a `400` naming the parameter as the caller spelled it. One canonical spelling per wire format — the only polymorphism, in both formats, is that the `to` filter accepts the bare `$seek_from_line_starts_with` operator unwrapped. The scan is a single forward pass over any `BufRead` that stops reading the moment the window is complete. The git layer feeds it a streaming ODB read (`git_odb_open_rstream`) when the blob is a loose object — every blob written since the last maintenance repack — so inflation halts early; packed objects cannot be streamed by libgit2 and fall back to a `Cursor` over the in-memory blob. Either way only the selected window is allocated (and only the window must be valid UTF-8 — prefix matching is byte-level). Seeked reads answer `404` when the path resolves to a folder, same as the HEAD existence endpoint.
+- **Batch read is one repository pass** — the batch endpoint opens the repo and resolves HEAD's tree once, then reads every requested blob through the same windowed-read helper as the single route (streaming ODB read where possible). Results are index-aligned with the request; `null` strictly means "not found" (invalid-UTF-8 content fails the whole batch with 422 instead of masquerading as missing). All request-level validation — path sanitisation, uniqueness after sanitisation, the `limits.batch_read_maximum_files` cap (default 100) — happens before the repository is touched. Reads never take the tenant write lock, so a large batch cannot stall writers.
 - **Per-tenant lock entries are never removed** — not even on tenant deletion. Removing an entry would let a writer holding the old mutex run concurrently with a writer holding a freshly-created one for the same repository.
 - **Timestamps are named `committed_at`** — follows the `*_at` suffix convention (Stripe, GitHub API, Rails); unambiguous about what the value represents.
 - **`/move` URL suffix on POST** — axum's wildcard router cannot match a fixed suffix after `*path`, so the handler is registered on `POST /*path` and enforces the `/move` suffix internally, returning 400 otherwise.
