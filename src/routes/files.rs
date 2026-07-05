@@ -21,8 +21,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
-    error::AppError, git, hooks::HookJob, routes::AuthorRequest, state::AppState,
-    util::run_blocking, validate,
+    error::AppError, git, hooks::HookJob, routes::AuthorRequest, seek::SeekOptions,
+    state::AppState, util::run_blocking, validate,
 };
 
 /// Query parameters for the listing endpoint. All optional: the bare
@@ -145,15 +145,24 @@ pub async fn list_files(
 
 /// GET /:collection_id/:tenant_id/files/*path
 /// Returns the file content and path as JSON.
+///
+/// Optional `seek_*` query parameters (`seek_from_line_starts_with`,
+/// `seek_to_line_starts_with`, `seek_lines_maximum`) narrow `content` to a
+/// line window — see `seek.rs` for the exact semantics and accepted
+/// formats. The seek runs inside the git read so it can scan the blob as a
+/// line stream instead of decoding it whole.
 pub async fn read_file(
     State(state): State<AppState>,
     Path((collection_id, tenant_id, file_path)): Path<(String, String, String)>,
+    Query(seek): Query<SeekOptions>,
 ) -> Result<impl IntoResponse, AppError> {
     let collection_id = validate::collection_id(&collection_id)?.to_string();
     let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
     let file_path = validate::file_path(&file_path)?.to_string();
 
-    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %file_path, "handling read file request");
+    let seek = seek.parse()?;
+
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %file_path, seek = ?seek, "handling read file request");
 
     let repo_path = state
         .config
@@ -166,7 +175,7 @@ pub async fn read_file(
     let tenant_id_for_task = tenant_id.clone();
 
     let content = run_blocking(move || {
-        git::GitFiles::read_file(&repo_path, &tenant_id_for_task, &file_path_for_task)
+        git::GitFiles::read_file(&repo_path, &tenant_id_for_task, &file_path_for_task, &seek)
     })
     .await?;
 

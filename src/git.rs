@@ -51,6 +51,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::error::AppError;
+use crate::seek::SeekFilter;
 
 /// A node in the repository file tree returned by the list endpoint.
 /// Serialises with a `"type"` discriminant field so clients can distinguish
@@ -1022,10 +1023,21 @@ impl GitFiles {
 
     /// Returns the file content as recorded in HEAD's tree (not from the working
     /// tree) so the response always reflects the last successfully committed state.
+    ///
+    /// When a seek window is requested, the content is scanned line by line
+    /// instead of being decoded whole. The scan prefers a streaming ODB read
+    /// (`git_odb_open_rstream`), so on loose objects — every blob written
+    /// since the last maintenance repack — inflation stops as soon as the
+    /// window is complete. Packed objects cannot be streamed by libgit2
+    /// (the packfile backend stores them delta'd, so it implements no
+    /// `readstream`); those fall back to scanning the blob borrowed from
+    /// the object cache. Either way only the selected window is allocated —
+    /// the full content is never copied into a `String`.
     pub fn read_file(
         repo_path: &Path,
         tenant_id: &str,
         file_path: &str,
+        seek: &SeekFilter,
     ) -> Result<String, AppError> {
         tracing::debug!(tenant_id = %tenant_id, path = %file_path, "reading file");
 
@@ -1036,7 +1048,49 @@ impl GitFiles {
 
         let head_tree = head_commit.tree()?;
 
-        GitUtils::blob_content_from_tree(&repo, &head_tree, file_path)
+        if seek.is_noop() {
+            return GitUtils::blob_content_from_tree(&repo, &head_tree, file_path);
+        }
+
+        let tree_entry =
+            head_tree
+                .get_path(Path::new(file_path))
+                .map_err(|_err| AppError::FileNotFound {
+                    path: file_path.to_string(),
+                })?;
+
+        // A path resolving to a folder is "not a file" — same 404 the HEAD
+        // existence endpoint gives, and required here anyway before handing
+        // the oid to the ODB (which knows nothing about entry kinds).
+        if tree_entry.kind() != Some(git2::ObjectType::Blob) {
+            return Err(AppError::FileNotFound {
+                path: file_path.to_string(),
+            });
+        }
+
+        let odb = repo.odb()?;
+
+        // Bound to a local so the stream (which borrows `odb`) is dropped
+        // before `odb` itself at the end of the function.
+        let window = match odb.reader(tree_entry.id()) {
+            Ok((reader, _size, _object_type)) => {
+                tracing::trace!(tenant_id = %tenant_id, path = %file_path, blob_id = %tree_entry.id(), "seek-reading blob via odb stream");
+
+                seek.apply_reader(std::io::BufReader::new(reader), file_path)
+            }
+
+            // The backend holding this object does not support streaming
+            // reads (packed objects) — scan the whole inflated blob instead.
+            Err(_stream_unsupported) => {
+                tracing::trace!(tenant_id = %tenant_id, path = %file_path, blob_id = %tree_entry.id(), "seek-reading blob in memory (streaming unsupported)");
+
+                let blob = repo.find_blob(tree_entry.id())?;
+
+                seek.apply_reader(std::io::Cursor::new(blob.content()), file_path)
+            }
+        };
+
+        window
     }
 
     /// Checks that a file exists in HEAD's tree without reading its content.

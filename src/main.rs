@@ -34,6 +34,7 @@
 //! - [`maintenance`] — background loose-object packing
 //! - [`middleware`] — Bearer API-key guard
 //! - [`routes`] — axum HTTP handlers (thin orchestration over `git`)
+//! - [`seek`] — line-based content windowing shared by file read endpoints
 //! - [`util`] — `spawn_blocking` wrapper and constant-time comparison
 //! - [`validate`] — sanitisation of all user-supplied identifiers and paths
 
@@ -44,6 +45,7 @@ mod hooks;
 mod maintenance;
 mod middleware;
 mod routes;
+mod seek;
 mod state;
 mod util;
 mod validate;
