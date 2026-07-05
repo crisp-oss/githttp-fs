@@ -2,11 +2,7 @@
 
 ## Now
 
-- [x] Add options to githttp-fs in read file to seek from start line to end line (array) + maximum lines to seek, can be combined
-  - [x] Seek start should be a fuzzy match, at start of line.
-  - [x] Make 'seek_from_line_starts_with' multi-format: can be an array, where 'seek_to_line_starts_with' can be set up to repeat the matched 'from' (eg. with $from meta argument)
-- [ ] Add a batch file read route to githttp-fs (returning empty or file content — with a batch size safety maximum)
-  - [ ] Re-use seek options in the batch read file route too.
+(nothing)
 
 ## Later
 
@@ -16,6 +12,11 @@
 
 ## Done
 
+- [x] Add options to githttp-fs in read file to seek from start line to end line (array) + maximum lines to seek, can be combined
+  - [x] Seek start should be a fuzzy match, at start of line.
+  - [x] Make 'seek_from_line_starts_with' multi-format: can be an array, where 'seek_to_line_starts_with' can be set up to repeat the matched 'from' (eg. with $from meta argument)
+- [x] Add a batch file read route to githttp-fs (returning empty or file content — with a batch size safety maximum)
+  - [x] Re-use seek options in the batch read file route too.
 - [x] Add query parameter to list files starting at given root (eg. `/en/articles`) — sanitize paths to prevent path escape!
 - [x] Update commit history to support per-file path history only, using an optional query parameter
 - [x] Add paging in file list route + maximum depth
