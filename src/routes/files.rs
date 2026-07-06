@@ -27,7 +27,7 @@ use crate::{
     git,
     hooks::HookJob,
     routes::AuthorRequest,
-    seek::{SeekBody, SeekOptions},
+    seek::{SeekBody, SeekFilter, SeekOptions},
     state::AppState,
     util::run_blocking,
     validate,
@@ -51,12 +51,37 @@ pub struct ListFilesQuery {
 const DEFAULT_PER_PAGE: usize = 100;
 const MAX_PER_PAGE: usize = 500;
 
-/// Body of the batch read endpoint: the paths to read, plus an optional
-/// seek window applied to every file (see `seek.rs` for the field formats).
+/// Body of the batch read endpoint: the entries to read, plus an optional
+/// seek window applied to every file that does not carry its own (see
+/// `seek.rs` for the field formats).
 #[derive(Deserialize)]
 pub struct BatchReadFilesRequest {
-    pub files: Vec<String>,
+    pub files: Vec<BatchReadFileRequest>,
     pub seek: Option<SeekBody>,
+}
+
+/// One entry of the batch read `files` array: either a bare path string,
+/// or an object holding the path plus an optional per-file seek window.
+/// When the per-file `seek` is set it *replaces* the request-level `seek`
+/// for that file (no field-by-field merge).
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum BatchReadFileRequest {
+    Path(String),
+    Options {
+        path: String,
+        seek: Option<SeekBody>,
+    },
+}
+
+impl BatchReadFileRequest {
+    /// The raw path and optional per-file seek, whichever spelling was used.
+    fn parts(&self) -> (&str, Option<&SeekBody>) {
+        match self {
+            Self::Path(path) => (path, None),
+            Self::Options { path, seek } => (path, seek.as_ref()),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -205,8 +230,10 @@ pub async fn read_file(
 /// Reads several files in one request. The response array is index-aligned
 /// with the request's `files` array: each slot is either the same
 /// `{ path, content }` object the single read route returns, or `null`
-/// when that path does not exist (or is a folder). An optional `seek`
-/// object applies the same line window to every file.
+/// when that path does not exist (or is a folder). Each entry is a bare
+/// path string or a `{ path, seek? }` object; an optional request-level
+/// `seek` object applies the same line window to every file, and an
+/// entry-level `seek` replaces it for that file.
 ///
 /// The whole request is rejected upfront (400) when a path is invalid,
 /// paths are duplicated, or more than `limits.batch_read_maximum_files`
@@ -239,28 +266,45 @@ pub async fn batch_read_files(
         });
     }
 
+    let global_seek = body.seek.unwrap_or_default().parse()?;
+
     // Sanitise every path with the same rules as the single read route,
     // *before* the uniqueness check so that two spellings of the same file
-    // (e.g. `a.md` and `/a.md`) are caught as duplicates.
-    let file_paths = body
-        .files
-        .iter()
-        .map(|raw_path| validate::file_path(raw_path).map(|path| path.to_string()))
-        .collect::<Result<Vec<String>, AppError>>()?;
-
+    // (e.g. `a.md` and `/a.md`) are caught as duplicates. Each entry's
+    // effective seek is resolved here too: its own window when it carries
+    // one, the request-level window otherwise.
     let mut seen_paths = HashSet::new();
+    let mut file_reads: Vec<(String, SeekFilter)> = Vec::with_capacity(body.files.len());
 
-    for file_path in &file_paths {
-        if !seen_paths.insert(file_path.as_str()) {
+    for (index, entry) in body.files.iter().enumerate() {
+        let (raw_path, entry_seek) = entry.parts();
+
+        let file_path = validate::file_path(raw_path)?.to_string();
+
+        if !seen_paths.insert(file_path.clone()) {
             return Err(AppError::InvalidOperation {
                 reason: format!("files must be unique: '{}' is requested twice", file_path),
             });
         }
+
+        let seek = match entry_seek {
+            None => global_seek.clone(),
+
+            // Prefix validation errors with the entry's index so the caller
+            // knows which per-file seek is malformed (the request-level one
+            // reports without a prefix).
+            Some(entry_seek) => entry_seek.parse().map_err(|err| match err {
+                AppError::InvalidOperation { reason } => AppError::InvalidOperation {
+                    reason: format!("files[{}]: {}", index, reason),
+                },
+                other => other,
+            })?,
+        };
+
+        file_reads.push((file_path, seek));
     }
 
-    let seek = body.seek.unwrap_or_default().parse()?;
-
-    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, count = file_paths.len(), seek = ?seek, "handling batch read files request");
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, count = file_reads.len(), seek = ?global_seek, "handling batch read files request");
 
     let repo_path = state
         .config
@@ -269,17 +313,19 @@ pub async fn batch_read_files(
         .join(&collection_id)
         .join(&tenant_id);
 
-    let file_paths_for_task = file_paths.clone();
+    let file_reads_for_task = file_reads.clone();
 
     let contents = run_blocking(move || {
-        git::GitFiles::batch_read_files(&repo_path, &tenant_id, &file_paths_for_task, &seek)
+        git::GitFiles::batch_read_files(&repo_path, &tenant_id, &file_reads_for_task)
     })
     .await?;
 
-    let files: Vec<_> = file_paths
+    let files: Vec<_> = file_reads
         .iter()
         .zip(contents)
-        .map(|(path, content)| content.map(|content| json!({ "path": path, "content": content })))
+        .map(|((path, _seek), content)| {
+            content.map(|content| json!({ "path": path, "content": content }))
+        })
         .collect();
 
     Ok(Json(json!({ "files": files })))

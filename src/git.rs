@@ -1116,18 +1116,18 @@ impl GitFiles {
     }
 
     /// Reads several files from HEAD's tree in one repository pass. The
-    /// returned vector is index-aligned with `file_paths`: `None` marks a
+    /// returned vector is index-aligned with `file_reads`: `None` marks a
     /// path that is absent (or a folder), `Some` carries the content with
-    /// the shared seek window applied. Unreadable content (invalid UTF-8)
-    /// is a hard error for the whole batch, so `None` strictly means "not
+    /// that entry's seek window applied (the route resolves each entry's
+    /// effective window upfront). Unreadable content (invalid UTF-8) is a
+    /// hard error for the whole batch, so `None` strictly means "not
     /// found".
     pub fn batch_read_files(
         repo_path: &Path,
         tenant_id: &str,
-        file_paths: &[String],
-        seek: &SeekFilter,
+        file_reads: &[(String, SeekFilter)],
     ) -> Result<Vec<Option<String>>, AppError> {
-        tracing::debug!(tenant_id = %tenant_id, count = file_paths.len(), "batch reading files");
+        tracing::debug!(tenant_id = %tenant_id, count = file_reads.len(), "batch reading files");
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
         let head_commit = repo.head()?.peel_to_commit()?;
@@ -1136,10 +1136,10 @@ impl GitFiles {
 
         let head_tree = head_commit.tree()?;
 
-        file_paths
+        file_reads
             .iter()
             .map(
-                |file_path| match GitUtils::blob_oid_in_tree(&head_tree, file_path) {
+                |(file_path, seek)| match GitUtils::blob_oid_in_tree(&head_tree, file_path) {
                     None => Ok(None),
 
                     Some(blob_oid) => {
