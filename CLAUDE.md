@@ -35,7 +35,7 @@ All routes are prefixed `/v1` and require `Authorization: Bearer <api_key>`.
 |--------|------|-------------|
 | `GET` | `/v1` | Check that the API key is valid (`200` with body `{ "pong": true }`, or `401`) |
 | `DELETE` | `/v1/:collection_id/:tenant_id` | Delete entire tenant repository |
-| `GET` | `/v1/:collection_id/:tenant_id/files?prefix_path=&maximum_depth=&page=&per_page=` | List tracked files as a tree; optional `prefix_path` scopes the listing to a sub-directory (e.g. `?prefix_path=/docs`); optional `maximum_depth` limits how many directory levels deep the listing goes; `page`/`per_page` paginate over the root-level entries of the listing (default 100, max 500) |
+| `GET` | `/v1/:collection_id/:tenant_id/files?prefix_path=&maximum_depth=&include_hidden_files=&page=&per_page=` | List tracked files as a tree; optional `prefix_path` scopes the listing to a sub-directory (e.g. `?prefix_path=/docs`); optional `maximum_depth` limits how many directory levels deep the listing goes; optional `include_hidden_files` (default `false`) includes dot-prefixed entries; `page`/`per_page` paginate over the root-level entries of the listing (default 100, max 500) |
 | `GET` | `/v1/:collection_id/:tenant_id/files/*path?seek_from_line_starts_with=&seek_to_line_starts_with=&seek_lines_maximum=` | Read file content; optional `seek_*` parameters narrow the response to a line window (see below) |
 | `POST` | `/v1/:collection_id/:tenant_id/batch/files/read` | Batch-read several files in one request, with an optional shared seek window (overridable per file); capped by `limits.batch_read_maximum_files` |
 | `HEAD` | `/v1/:collection_id/:tenant_id/files/*path` | Check that a file exists (`200` or `404`, no body) |
@@ -135,6 +135,8 @@ Directories sort before files at every level; entries within each group sort alp
 The `prefix_path` query parameter must be a folder path (e.g. `/docs` or `docs/sub`). Leading and trailing slashes are stripped. `..`, `.`, and `.git` components are rejected with `400`. Passing `/` or omitting the parameter lists the full repository. When `prefix_path` points to a non-existent folder the response is an empty tree.
 
 The optional `maximum_depth` query parameter (positive integer, minimum 1) restricts the listing to that many directory levels from the listing root (after `prefix_path` is applied). `maximum_depth=1` returns only items directly in the listing root: root-level files appear as `file` nodes, any directories with content deeper than the limit appear as `directory` stubs with an empty `children` array. Omitting `maximum_depth` returns the full recursive tree. Passing `maximum_depth=0` returns `400`.
+
+Hidden entries — files *and* directories whose name starts with a dot, per the Unix convention (e.g. `.gitignore`, `.templates/`) — are excluded from the listing by default; a hidden directory is pruned wholesale, its subtree never walked. Pass `include_hidden_files=true` to include them. The filter applies before pagination, so page counts only cover visible entries. It applies to entry *names* only, not to `prefix_path` resolution: explicitly listing `?prefix_path=/.templates` returns that folder's (non-hidden) contents, mirroring `ls .templates/`.
 
 **GET** `/files/*path` — read file
 ```json

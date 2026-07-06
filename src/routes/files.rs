@@ -42,6 +42,9 @@ pub struct ListFilesQuery {
     /// How many directory levels to descend from the listing root; full
     /// recursion if omitted.
     pub maximum_depth: Option<u32>,
+    /// When true, hidden entries (names starting with `.`, per the Unix
+    /// convention) are included in the listing; excluded if omitted or false.
+    pub include_hidden_files: Option<bool>,
     pub page: Option<usize>,
     pub per_page: Option<usize>,
 }
@@ -145,13 +148,15 @@ pub async fn list_files(
         None => None,
     };
 
+    let include_hidden_files = query.include_hidden_files.unwrap_or(false);
+
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query
         .per_page
         .unwrap_or(DEFAULT_PER_PAGE)
         .clamp(1, MAX_PER_PAGE);
 
-    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, page = page, per_page = per_page, "handling list files request");
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, page = page, per_page = per_page, "handling list files request");
 
     let repo_path = state
         .config
@@ -168,6 +173,7 @@ pub async fn list_files(
             &tenant_id_for_task,
             path_prefix.as_deref(),
             maximum_depth,
+            include_hidden_files,
             page,
             per_page,
         )

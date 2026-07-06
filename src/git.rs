@@ -941,10 +941,11 @@ impl GitFiles {
         tenant_id: &str,
         path_prefix: Option<&str>,
         maximum_depth: Option<usize>,
+        include_hidden_files: bool,
         page: usize,
         per_page: usize,
     ) -> Result<(Vec<TreeNode>, bool), AppError> {
-        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, page = page, per_page = per_page, "listing files");
+        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, page = page, per_page = per_page, "listing files");
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
         let head_commit = repo.head()?.peel_to_commit()?;
@@ -979,6 +980,14 @@ impl GitFiles {
             let Ok(name) = entry.name() else {
                 continue;
             };
+
+            // Hidden entries (Unix dot convention) are dropped before the
+            // page window is computed, so pagination counts visible entries
+            // only. Hidden directories are pruned wholesale: their subtrees
+            // are never opened.
+            if !include_hidden_files && name.starts_with('.') {
+                continue;
+            }
 
             match entry.kind() {
                 Some(git2::ObjectType::Tree) => root_dirs.push((name.to_string(), entry.id())),
@@ -1033,7 +1042,8 @@ impl GitFiles {
                     // Depth limits below are relative to this subtree, which
                     // sits one level down from the listing root.
                     let subtree_max_depth = maximum_depth.map(|max| max - 1);
-                    let children = Self::collect_subtree(&subtree, subtree_max_depth)?;
+                    let children =
+                        Self::collect_subtree(&subtree, subtree_max_depth, include_hidden_files)?;
 
                     nodes.push(TreeNode::Directory { name, children });
                 }
@@ -1052,11 +1062,23 @@ impl GitFiles {
     fn collect_subtree(
         subtree: &git2::Tree<'_>,
         max_depth: Option<usize>,
+        include_hidden_files: bool,
     ) -> Result<Vec<TreeNode>, AppError> {
         let mut flat: Vec<String> = Vec::new();
         let mut dir_stubs: Vec<String> = Vec::new();
 
         subtree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            // Hidden entries (Unix dot convention) are excluded at the walk
+            // level: `Skip` prunes a hidden directory's whole subtree, so
+            // libgit2 never descends into it.
+            if !include_hidden_files && entry.name().is_ok_and(|name| name.starts_with('.')) {
+                return if entry.kind() == Some(git2::ObjectType::Tree) {
+                    git2::TreeWalkResult::Skip
+                } else {
+                    git2::TreeWalkResult::Ok
+                };
+            }
+
             // Depth of this entry relative to the subtree: "" = depth 1, "a/" = depth 2, …
             let entry_depth = root.chars().filter(|c| *c == '/').count() + 1;
 
