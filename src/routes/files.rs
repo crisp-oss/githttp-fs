@@ -54,6 +54,25 @@ pub struct ListFilesQuery {
 const DEFAULT_PER_PAGE: usize = 100;
 const MAX_PER_PAGE: usize = 500;
 
+/// Query parameters for the count endpoint. All optional: the bare endpoint
+/// counts the full recursive tree. The first three carry the exact
+/// semantics of their `ListFilesQuery` namesakes.
+#[derive(Deserialize)]
+pub struct CountFilesQuery {
+    /// Folder to root the count at (e.g. `/docs`); repo root if omitted.
+    pub prefix_path: Option<String>,
+    /// How many directory levels to descend from the count root; full
+    /// recursion if omitted.
+    pub maximum_depth: Option<u32>,
+    /// When true, hidden entries (names starting with `.`, per the Unix
+    /// convention) are included in the count; excluded if omitted or false.
+    pub include_hidden_files: Option<bool>,
+    /// A JSON array of file extensions as a string (query parameters are
+    /// strings), e.g. `["md", "mdx"]`; when set, only files carrying one of
+    /// these extensions are counted. Omitted: every file counts.
+    pub restrict_file_extensions: Option<String>,
+}
+
 /// Body of the batch read endpoint: the entries to read, plus an optional
 /// seek window applied to every file that does not carry its own (see
 /// `seek.rs` for the field formats).
@@ -188,6 +207,118 @@ pub async fn list_files(
         "has_more": has_more,
         "files": tree,
     })))
+}
+
+/// GET /:collection_id/:tenant_id/count/files
+/// Returns file and directory count statistics for the repository.
+///
+/// `prefix_path`, `maximum_depth` and `include_hidden_files` scope the
+/// count exactly like the listing endpoint (sub-directory root, depth
+/// bound, hidden filter). `restrict_file_extensions` — a JSON-array string,
+/// same wire spelling as the `seek_*` prefix lists — narrows the file count
+/// to files carrying one of the given extensions, compared
+/// case-insensitively; directories are counted regardless.
+pub async fn count_files(
+    State(state): State<AppState>,
+    Path((collection_id, tenant_id)): Path<(String, String)>,
+    Query(query): Query<CountFilesQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let collection_id = validate::collection_id(&collection_id)?.to_string();
+    let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
+
+    // An empty sanitised prefix ("/" or "") means "repo root", which is the
+    // same as no prefix at all — normalise it to None here so the git layer
+    // only ever sees a meaningful prefix.
+    let path_prefix: Option<String> = query
+        .prefix_path
+        .as_deref()
+        .map(validate::folder_path)
+        .transpose()?
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_string());
+
+    // maximum_depth=0 would mean "count nothing", which is more likely a
+    // caller bug than an intent — reject it explicitly.
+    let maximum_depth: Option<usize> = match query.maximum_depth {
+        Some(0) => {
+            return Err(AppError::InvalidOperation {
+                reason: "maximum_depth must be at least 1".to_string(),
+            })
+        }
+        Some(d) => Some(d as usize),
+        None => None,
+    };
+
+    let include_hidden_files = query.include_hidden_files.unwrap_or(false);
+
+    let restrict_file_extensions: Option<Vec<String>> = query
+        .restrict_file_extensions
+        .as_deref()
+        .map(parse_restrict_file_extensions)
+        .transpose()?;
+
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, restrict_file_extensions = ?restrict_file_extensions, "handling count files request");
+
+    let repo_path = state
+        .config
+        .server
+        .repos_path
+        .join(&collection_id)
+        .join(&tenant_id);
+
+    let tenant_id_for_task = tenant_id.clone();
+
+    let counts = run_blocking(move || {
+        git::GitFiles::count_files(
+            &repo_path,
+            &tenant_id_for_task,
+            path_prefix.as_deref(),
+            maximum_depth,
+            include_hidden_files,
+            restrict_file_extensions.as_deref(),
+        )
+    })
+    .await?;
+
+    tracing::debug!(tenant_id = %tenant_id, files = counts.files, directories = counts.directories, "count files response ready");
+
+    Ok(Json(json!({
+        "files": counts.files,
+        "directories": counts.directories,
+    })))
+}
+
+/// Decodes and validates the `restrict_file_extensions` query parameter
+/// from its JSON-array-string spelling. Entries are normalised by trimming
+/// leading dots (`".md"` and `"md"` name the same extension); a non-array
+/// value, an empty array, or an entry left empty after trimming are all
+/// caller bugs and rejected with a `400`.
+fn parse_restrict_file_extensions(raw: &str) -> Result<Vec<String>, AppError> {
+    let extensions: Vec<String> =
+        serde_json::from_str(raw).map_err(|_err| AppError::InvalidOperation {
+            reason:
+                "restrict_file_extensions must be a JSON array of strings, e.g. [\"md\", \"mdx\"]"
+                    .to_string(),
+        })?;
+
+    if extensions.is_empty() {
+        return Err(AppError::InvalidOperation {
+            reason: "restrict_file_extensions must contain at least one extension".to_string(),
+        });
+    }
+
+    let normalized: Vec<String> = extensions
+        .iter()
+        .map(|extension| extension.trim_start_matches('.').to_string())
+        .collect();
+
+    if normalized.iter().any(|extension| extension.is_empty()) {
+        return Err(AppError::InvalidOperation {
+            reason: "restrict_file_extensions extensions must not be empty".to_string(),
+        });
+    }
+
+    Ok(normalized)
 }
 
 /// GET /:collection_id/:tenant_id/files/*path

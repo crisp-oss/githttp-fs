@@ -164,6 +164,13 @@ fn build_router(app_state: AppState) -> Router {
             "/{collection_id}/{tenant_id}/files",
             get(routes::files::list_files),
         )
+        // File/directory count statistics. Lives under `/count/files` — a
+        // literal segment distinct from `/files`, so it can never collide
+        // with the `{*path}` wildcard below.
+        .route(
+            "/{collection_id}/{tenant_id}/count/files",
+            get(routes::files::count_files),
+        )
         // Batch file reading. Lives under `/batch/files/read` — a literal
         // segment distinct from `/files`, so it can never collide with the
         // `{*path}` wildcard below.

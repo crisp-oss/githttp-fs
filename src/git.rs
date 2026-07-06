@@ -68,6 +68,15 @@ pub enum TreeNode {
     },
 }
 
+/// File and directory totals returned by the count endpoint. Directories
+/// are counted as visited — the extension restriction only narrows which
+/// files count, never which directories are entered.
+#[derive(Debug, Default)]
+pub struct FileCounts {
+    pub files: usize,
+    pub directories: usize,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CommitAuthor {
     pub name: String,
@@ -1105,6 +1114,112 @@ impl GitFiles {
         })?;
 
         Ok(GitUtils::build_tree(flat, dir_stubs, max_depth))
+    }
+
+    /// Counts files and directories reachable from the listing root, with
+    /// the exact scoping semantics of `list_files`: `path_prefix` roots the
+    /// count at a sub-directory (absent or non-directory prefix yields zero
+    /// counts), `maximum_depth` bounds how many levels are descended
+    /// (directories sitting at the limit are counted but never entered),
+    /// and hidden entries are excluded unless `include_hidden_files` is set
+    /// (a hidden directory's whole subtree is pruned).
+    ///
+    /// `restrict_file_extensions`, when set, narrows the *file* count to
+    /// files carrying one of the given extensions (compared
+    /// case-insensitively; extension-less files never match). Directories
+    /// are counted regardless — they have no extension to compare.
+    ///
+    /// Same performance contract as the listing: **no blob is ever opened**.
+    /// Names and entry kinds come entirely from git tree objects.
+    pub fn count_files(
+        repo_path: &Path,
+        tenant_id: &str,
+        path_prefix: Option<&str>,
+        maximum_depth: Option<usize>,
+        include_hidden_files: bool,
+        restrict_file_extensions: Option<&[String]>,
+    ) -> Result<FileCounts, AppError> {
+        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, restrict_file_extensions = ?restrict_file_extensions, "counting files");
+
+        let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
+        let head_commit = repo.head()?.peel_to_commit()?;
+
+        tracing::trace!(tenant_id = %tenant_id, head_sha = %head_commit.id(), "resolved HEAD for file counting");
+
+        let head_tree = head_commit.tree()?;
+
+        // Resolve the prefix subtree directly so the walk never visits unrelated
+        // directories. An absent or non-directory prefix yields zero counts.
+        let walk_tree: git2::Tree<'_> = match path_prefix.filter(|p| !p.is_empty()) {
+            Some(prefix) => match head_tree.get_path(Path::new(prefix)) {
+                Ok(entry) => match repo.find_tree(entry.id()) {
+                    Ok(tree) => tree,
+                    Err(_) => return Ok(FileCounts::default()),
+                },
+                Err(_) => return Ok(FileCounts::default()),
+            },
+            None => head_tree,
+        };
+
+        let mut counts = FileCounts::default();
+
+        walk_tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            // Hidden entries (Unix dot convention) are excluded at the walk
+            // level: `Skip` prunes a hidden directory's whole subtree, so
+            // libgit2 never descends into it.
+            if !include_hidden_files && entry.name().is_ok_and(|name| name.starts_with('.')) {
+                return if entry.kind() == Some(git2::ObjectType::Tree) {
+                    git2::TreeWalkResult::Skip
+                } else {
+                    git2::TreeWalkResult::Ok
+                };
+            }
+
+            match entry.kind() {
+                Some(git2::ObjectType::Tree) => {
+                    counts.directories += 1;
+
+                    // Depth of this entry relative to the listing root:
+                    // "" = depth 1, "a/" = depth 2, … A directory sitting at
+                    // the depth limit is counted (it exists at a visible
+                    // level, matching the listing's childless stubs) but its
+                    // subtree is never entered.
+                    if let Some(max) = maximum_depth {
+                        let entry_depth = root.chars().filter(|c| *c == '/').count() + 1;
+
+                        if entry_depth >= max {
+                            return git2::TreeWalkResult::Skip;
+                        }
+                    }
+                }
+                Some(git2::ObjectType::Blob) => {
+                    let counted = match restrict_file_extensions {
+                        None => true,
+                        Some(allowed) => entry
+                            .name()
+                            .ok()
+                            .and_then(|name| Path::new(name).extension())
+                            .and_then(|extension| extension.to_str())
+                            .is_some_and(|extension| {
+                                allowed
+                                    .iter()
+                                    .any(|entry| entry.eq_ignore_ascii_case(extension))
+                            }),
+                    };
+
+                    if counted {
+                        counts.files += 1;
+                    }
+                }
+                _ => {}
+            }
+
+            git2::TreeWalkResult::Ok
+        })?;
+
+        tracing::debug!(tenant_id = %tenant_id, files = counts.files, directories = counts.directories, "file counting complete");
+
+        Ok(counts)
     }
 
     /// Returns the file content as recorded in HEAD's tree (not from the working
