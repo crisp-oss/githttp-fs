@@ -89,6 +89,19 @@ pub struct CommitSummary {
     pub message: String,
     pub author: CommitAuthor,
     pub committed_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub statistics: Option<CommitStatistics>,
+}
+
+/// Aggregate insertion/deletion/file counts for a single commit, computed
+/// against its first parent (or, for the root commit, against an empty
+/// tree). Renames are similarity-detected first so a pure rename does not
+/// register as a full delete+add of the file's content.
+#[derive(Debug, Serialize)]
+pub struct CommitStatistics {
+    pub insertions: usize,
+    pub deletions: usize,
+    pub files_changed: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -1663,12 +1676,20 @@ impl GitCommits {
         page: usize,
         per_page: usize,
         file_path: Option<&str>,
+        include_statistics: bool,
     ) -> Result<(Vec<CommitSummary>, bool), AppError> {
         if let Some(path) = file_path {
-            return Self::list_commits_by_file(repo_path, tenant_id, page, per_page, path);
+            return Self::list_commits_by_file(
+                repo_path,
+                tenant_id,
+                page,
+                per_page,
+                path,
+                include_statistics,
+            );
         }
 
-        tracing::debug!(tenant_id = %tenant_id, page = page, per_page = per_page, "listing commits");
+        tracing::debug!(tenant_id = %tenant_id, page = page, per_page = per_page, include_statistics = include_statistics, "listing commits");
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
 
@@ -1684,21 +1705,33 @@ impl GitCommits {
         tracing::trace!(tenant_id = %tenant_id, skip_count = skip_count, per_page = per_page, "walking commit graph");
 
         // Fetch one extra to detect whether a next page exists without a full count.
+        // When line stats are requested, that extra commit is diffed too — one
+        // wasted diff per page is an acceptable trade for keeping this branch
+        // free of a second, stats-only pass.
         let mut commits: Vec<CommitSummary> = revwalk
             .skip(skip_count)
             .take(per_page + 1)
             .filter_map(|oid_result| oid_result.ok())
             .filter_map(|oid| repo.find_commit(oid).ok())
-            .map(|commit| CommitSummary {
-                sha: commit.id().to_string(),
-                message: commit.message().unwrap_or("").to_string(),
-                author: CommitAuthor {
-                    name: commit.author().name().unwrap_or("").to_string(),
-                    email: commit.author().email().unwrap_or("").to_string(),
-                },
-                committed_at: GitUtils::timestamp_from_git_time(commit.time()),
+            .map(|commit| {
+                let statistics = if include_statistics {
+                    Some(Self::statistics_for_commit(&repo, &commit)?)
+                } else {
+                    None
+                };
+
+                Ok(CommitSummary {
+                    sha: commit.id().to_string(),
+                    message: commit.message().unwrap_or("").to_string(),
+                    author: CommitAuthor {
+                        name: commit.author().name().unwrap_or("").to_string(),
+                        email: commit.author().email().unwrap_or("").to_string(),
+                    },
+                    committed_at: GitUtils::timestamp_from_git_time(commit.time()),
+                    statistics,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<CommitSummary>, AppError>>()?;
 
         let has_more = commits.len() > per_page;
 
@@ -1731,12 +1764,14 @@ impl GitCommits {
         page: usize,
         per_page: usize,
         file_path: &str,
+        include_statistics: bool,
     ) -> Result<(Vec<CommitSummary>, bool), AppError> {
         tracing::debug!(
             tenant_id = %tenant_id,
             page = page,
             per_page = per_page,
             file_path = %file_path,
+            include_statistics = include_statistics,
             "listing commits by file path"
         );
 
@@ -1841,6 +1876,7 @@ impl GitCommits {
                         email: commit.author().email().unwrap_or("").to_string(),
                     },
                     committed_at: GitUtils::timestamp_from_git_time(commit.time()),
+                    statistics: None,
                 });
 
                 if let Some(old_name) = rename_from {
@@ -1851,11 +1887,25 @@ impl GitCommits {
 
         let has_more = matching.len() > skip_count + per_page;
 
-        let commits = matching
+        // Line stats are only computed for the final page window, not for
+        // every matching commit found while walking history — the match
+        // scan already runs a rename-detecting diff per introduction, so
+        // deferring this avoids doubling that cost across unpaginated rows.
+        let commits: Vec<CommitSummary> = matching
             .into_iter()
             .skip(skip_count)
             .take(per_page)
-            .collect();
+            .map(|mut summary| {
+                if include_statistics {
+                    let oid = Oid::from_str(&summary.sha)?;
+                    let commit = repo.find_commit(oid)?;
+
+                    summary.statistics = Some(Self::statistics_for_commit(&repo, &commit)?);
+                }
+
+                Ok(summary)
+            })
+            .collect::<Result<Vec<CommitSummary>, AppError>>()?;
 
         tracing::debug!(
             tenant_id = %tenant_id,
@@ -1923,6 +1973,49 @@ impl GitCommits {
         }
 
         None
+    }
+
+    /// Computes aggregate line-change stats for one commit against its first
+    /// parent (or an empty tree for the root commit). Rename detection runs
+    /// first so a pure rename doesn't count as a full delete+add of its
+    /// content. Only called when a caller opts in via `include_statistics`,
+    /// since it requires an actual content diff rather than the cheap
+    /// oid/tree comparisons the rest of commit listing relies on.
+    fn statistics_for_commit(
+        repo: &Repository,
+        commit: &git2::Commit,
+    ) -> Result<CommitStatistics, AppError> {
+        let commit_tree = commit.tree()?;
+
+        let parent_tree = if commit.parent_count() > 0 {
+            Some(commit.parent(0)?.tree()?)
+        } else {
+            None
+        };
+
+        let mut diff_options = DiffOptions::new();
+
+        diff_options.include_untracked(false);
+
+        let mut diff = repo.diff_tree_to_tree(
+            parent_tree.as_ref(),
+            Some(&commit_tree),
+            Some(&mut diff_options),
+        )?;
+
+        let mut find_options = DiffFindOptions::new();
+
+        find_options.renames(true);
+
+        diff.find_similar(Some(&mut find_options))?;
+
+        let stats = diff.stats()?;
+
+        Ok(CommitStatistics {
+            insertions: stats.insertions(),
+            deletions: stats.deletions(),
+            files_changed: stats.files_changed(),
+        })
     }
 
     /// Builds the full detail view of one commit: metadata, and for every

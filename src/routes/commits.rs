@@ -32,6 +32,7 @@ pub struct ListCommitsQuery {
     pub page: Option<usize>,
     pub per_page: Option<usize>,
     pub file_path: Option<String>,
+    pub include_statistics: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -75,8 +76,9 @@ pub async fn list_commits(
         .map(validate::file_path)
         .transpose()?
         .map(|p| p.to_string());
+    let include_statistics = query_params.include_statistics.unwrap_or(false);
 
-    tracing::debug!(tenant_id = %tenant_id, page = page, per_page = per_page, file_path = ?file_path, "handling list commits request");
+    tracing::debug!(tenant_id = %tenant_id, page = page, per_page = per_page, file_path = ?file_path, include_statistics = include_statistics, "handling list commits request");
 
     let tenant_id_for_task = tenant_id.clone();
 
@@ -87,6 +89,7 @@ pub async fn list_commits(
             page,
             per_page,
             file_path.as_deref(),
+            include_statistics,
         )
     })
     .await?;
