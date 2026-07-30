@@ -227,11 +227,12 @@ This requires an actual content diff against each commit's parent (renames are s
       "content": "# Hello world\n...",
       "diff": "@@ -1,3 +1,4 @@\n ..."
     }
-  ]
+  ],
+  "statistics": { "insertions": 12, "deletions": 4, "files_changed": 2 }
 }
 ```
 
-`change` is one of `"created"`, `"updated"`, `"deleted"`, `"moved"`. Moved files include an additional `"from_path"` field. `content` is empty string for deleted files.
+`change` is one of `"created"`, `"updated"`, `"deleted"`, `"moved"`. Moved files include an additional `"from_path"` field. `content` is empty string for deleted files. Unlike the commit list route, `statistics` is always present here — it is unconditional, computed from the same parent diff already built to derive `files`, so there is no extra diff pass to opt out of.
 
 **POST** `/commits/:sha/revert`
 ```json

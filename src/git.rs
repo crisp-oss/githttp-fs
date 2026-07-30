@@ -111,6 +111,7 @@ pub struct CommitDetail {
     pub author: CommitAuthor,
     pub committed_at: DateTime<Utc>,
     pub files: Vec<CommitFileDetail>,
+    pub statistics: CommitStatistics,
 }
 
 #[derive(Debug, Serialize)]
@@ -2079,6 +2080,13 @@ impl GitCommits {
 
         diff.find_similar(Some(&mut find_options))?;
 
+        let diff_stats = diff.stats()?;
+        let statistics = CommitStatistics {
+            insertions: diff_stats.insertions(),
+            deletions: diff_stats.deletions(),
+            files_changed: diff_stats.files_changed(),
+        };
+
         let records: Vec<DeltaRecord> = (0..diff.deltas().count())
             .filter_map(|index| diff.get_delta(index))
             .map(|delta| {
@@ -2209,6 +2217,7 @@ impl GitCommits {
             author,
             committed_at,
             files: file_details,
+            statistics,
         })
     }
 
