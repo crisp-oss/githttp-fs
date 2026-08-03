@@ -954,21 +954,29 @@ impl GitFiles {
     /// `path_prefix` (or the repo root), paginated over root-level entries,
     /// and optionally depth-limited.
     ///
-    /// The performance contract: **no blob is ever opened**. Names and
-    /// entry kinds come entirely from git tree objects, so listing cost
-    /// scales with the number of tree entries actually visited — and the
-    /// pagination below is designed to keep that number small even on huge
-    /// repositories.
+    /// When `file_name_starts_with` is set, the listing is narrowed to files
+    /// whose leaf name begins with that string (case-insensitively); see
+    /// `search_by_file_name` for the exact semantics. In that mode the
+    /// "off-page directories are never walked" optimisation below does not
+    /// apply — matches can be nested anywhere, so the whole in-scope tree is
+    /// walked before pagination.
+    ///
+    /// The performance contract (search mode aside): **no blob is ever
+    /// opened**. Names and entry kinds come entirely from git tree objects,
+    /// so listing cost scales with the number of tree entries actually
+    /// visited — and the pagination below is designed to keep that number
+    /// small even on huge repositories.
     pub fn list_files(
         repo_path: &Path,
         tenant_id: &str,
         path_prefix: Option<&str>,
         maximum_depth: Option<usize>,
         include_hidden_files: bool,
+        file_name_starts_with: Option<&str>,
         page: usize,
         per_page: usize,
     ) -> Result<(Vec<TreeNode>, bool), AppError> {
-        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, page = page, per_page = per_page, "listing files");
+        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, file_name_starts_with = ?file_name_starts_with, page = page, per_page = per_page, "listing files");
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
         let head_commit = repo.head()?.peel_to_commit()?;
@@ -989,6 +997,21 @@ impl GitFiles {
             },
             None => head_tree,
         };
+
+        // Name search takes a different route entirely: matches may be nested
+        // arbitrarily deep, so the "decide the page window before opening any
+        // subtree" optimisation cannot hold — the in-scope tree is walked in
+        // full, then the *filtered* result is paginated.
+        if let Some(needle) = file_name_starts_with {
+            return Self::search_by_file_name(
+                &walk_tree,
+                needle,
+                maximum_depth,
+                include_hidden_files,
+                page,
+                per_page,
+            );
+        }
 
         // The listing root's immediate entries are already in memory as part
         // of the tree object — no further object reads are needed to
@@ -1128,6 +1151,135 @@ impl GitFiles {
         })?;
 
         Ok(GitUtils::build_tree(flat, dir_stubs, max_depth))
+    }
+
+    /// Walks `walk_tree` in full and returns the tree of entries whose *leaf
+    /// name* begins with `needle`, compared case-insensitively (Unicode
+    /// lower-casing, so `Intro` matches `intro.md`). Both files *and*
+    /// directories are matched:
+    ///
+    /// - a matching **file** is returned as a leaf, with its ancestor
+    ///   directories present purely as the structure leading to it;
+    /// - a matching **directory** is returned with its whole subtree expanded
+    ///   (every descendant file, whether or not its own name matches), so the
+    ///   caller sees what is inside the folder they searched for.
+    ///
+    /// A directory that neither matches nor contains a match is pruned, so the
+    /// result never carries a dead-end empty directory (a matched directory
+    /// whose only visible content is filtered out still shows, as a childless
+    /// node — it is itself the match).
+    ///
+    /// `maximum_depth` and `include_hidden_files` carry the same meaning as on
+    /// the plain listing, and bound the whole operation uniformly: descent
+    /// stops at the depth limit — a match deeper than it is never found, and a
+    /// directory sitting *at* the limit renders as a childless stub even when
+    /// it matched (exactly as the plain listing stubs depth-limited
+    /// directories) — and hidden entries are skipped, a hidden directory's
+    /// whole subtree along with them. Pagination is parent-based, as
+    /// everywhere else: `page`/`per_page` window over the matched tree's
+    /// root-level entries. Same performance contract otherwise — **no blob is
+    /// ever opened**, matching is on names alone.
+    fn search_by_file_name(
+        walk_tree: &git2::Tree<'_>,
+        needle: &str,
+        maximum_depth: Option<usize>,
+        include_hidden_files: bool,
+        page: usize,
+        per_page: usize,
+    ) -> Result<(Vec<TreeNode>, bool), AppError> {
+        let needle = needle.to_lowercase();
+        let mut flat: Vec<String> = Vec::new();
+        let mut dir_stubs: Vec<String> = Vec::new();
+
+        // While walking inside a directory whose name matched, this holds that
+        // directory's path with a trailing slash. Every descendant is then
+        // collected unconditionally (the whole matched subtree is expanded);
+        // the trailing slash keeps the prefix test from leaking across sibling
+        // names (`docs/` must not swallow `docs2/`). Cleared the moment the
+        // pre-order walk steps back out of that subtree.
+        let mut inside_matched: Option<String> = None;
+
+        walk_tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            // Left the matched subtree? (Pre-order visits all of a directory's
+            // descendants contiguously, so one prefix test per entry suffices.)
+            if let Some(prefix) = &inside_matched {
+                if !root.starts_with(prefix.as_str()) {
+                    inside_matched = None;
+                }
+            }
+
+            // Hidden entries (Unix dot convention) are excluded at the walk
+            // level, even inside a matched subtree: `Skip` prunes a hidden
+            // directory's whole subtree, so libgit2 never descends into it.
+            if !include_hidden_files && entry.name().is_ok_and(|name| name.starts_with('.')) {
+                return if entry.kind() == Some(git2::ObjectType::Tree) {
+                    git2::TreeWalkResult::Skip
+                } else {
+                    git2::TreeWalkResult::Ok
+                };
+            }
+
+            let Ok(name) = entry.name() else {
+                return git2::TreeWalkResult::Ok;
+            };
+            let full_path = format!("{}{}", root, name);
+            let in_matched = inside_matched.is_some();
+            let self_matches = name.to_lowercase().starts_with(&needle);
+
+            match entry.kind() {
+                Some(git2::ObjectType::Tree) => {
+                    let matched = in_matched || self_matches;
+
+                    // Depth of this entry relative to the listing root:
+                    // "" = depth 1, "a/" = depth 2, … A directory sitting at
+                    // the depth limit is not descended into; when it is part
+                    // of the result (it or an ancestor matched) it renders as
+                    // a childless stub, mirroring the plain listing.
+                    if let Some(max) = maximum_depth {
+                        let entry_depth = root.chars().filter(|c| *c == '/').count() + 1;
+
+                        if entry_depth >= max {
+                            if matched {
+                                dir_stubs.push(full_path);
+                            }
+
+                            return git2::TreeWalkResult::Skip;
+                        }
+                    }
+
+                    // Entering a freshly matched directory: record it so its
+                    // descendants are collected wholesale, and stub it so it
+                    // still appears if every descendant turns out hidden.
+                    if self_matches && !in_matched {
+                        inside_matched = Some(format!("{}/", full_path));
+                        dir_stubs.push(full_path);
+                    }
+                }
+                Some(git2::ObjectType::Blob) => {
+                    if in_matched || self_matches {
+                        flat.push(full_path);
+                    }
+                }
+                _ => {}
+            }
+
+            git2::TreeWalkResult::Ok
+        })?;
+
+        // The walk already bounded depth, so every collected path is within
+        // scope and `build_tree` needs no depth handling of its own (`None`);
+        // the stubs it receives are matched directories that were not (or
+        // could not be) expanded. The matched tree is then paginated over its
+        // root-level entries, exactly like the plain listing.
+        let tree = GitUtils::build_tree(flat, dir_stubs, None);
+
+        let total = tree.len();
+        let offset = ((page - 1) * per_page).min(total);
+        let has_more = total > offset + per_page;
+
+        let nodes: Vec<TreeNode> = tree.into_iter().skip(offset).take(per_page).collect();
+
+        Ok((nodes, has_more))
     }
 
     /// Counts files and directories reachable from the listing root, with

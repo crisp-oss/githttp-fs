@@ -45,6 +45,10 @@ pub struct ListFilesQuery {
     /// When true, hidden entries (names starting with `.`, per the Unix
     /// convention) are included in the listing; excluded if omitted or false.
     pub include_hidden_files: Option<bool>,
+    /// When set, narrows the listing to files *and directories* whose leaf
+    /// name begins with this string, compared case-insensitively (a matched
+    /// directory brings its subtree along). Empty is rejected (`400`).
+    pub file_name_starts_with: Option<String>,
     pub page: Option<usize>,
     pub per_page: Option<usize>,
 }
@@ -169,13 +173,25 @@ pub async fn list_files(
 
     let include_hidden_files = query.include_hidden_files.unwrap_or(false);
 
+    // An empty search term would match every file (every name starts with
+    // ""), which is indistinguishable from omitting it — more likely a caller
+    // bug than an intent, so reject it explicitly.
+    let file_name_starts_with: Option<String> = match query.file_name_starts_with {
+        Some(needle) if needle.is_empty() => {
+            return Err(AppError::InvalidOperation {
+                reason: "file_name_starts_with must not be empty".to_string(),
+            })
+        }
+        other => other,
+    };
+
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query
         .per_page
         .unwrap_or(DEFAULT_PER_PAGE)
         .clamp(1, MAX_PER_PAGE);
 
-    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, page = page, per_page = per_page, "handling list files request");
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, file_name_starts_with = ?file_name_starts_with, page = page, per_page = per_page, "handling list files request");
 
     let repo_path = state
         .config
@@ -193,6 +209,7 @@ pub async fn list_files(
             path_prefix.as_deref(),
             maximum_depth,
             include_hidden_files,
+            file_name_starts_with.as_deref(),
             page,
             per_page,
         )
