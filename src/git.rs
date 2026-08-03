@@ -955,8 +955,8 @@ impl GitFiles {
     /// and optionally depth-limited.
     ///
     /// When `file_name_starts_with` is set, the listing is narrowed to files
-    /// whose leaf name begins with that string (case-insensitively); see
-    /// `search_by_file_name` for the exact semantics. In that mode the
+    /// whose leaf name begins with any of those prefixes (case-insensitively);
+    /// see `search_by_file_name` for the exact semantics. In that mode the
     /// "off-page directories are never walked" optimisation below does not
     /// apply — matches can be nested anywhere, so the whole in-scope tree is
     /// walked before pagination.
@@ -972,7 +972,7 @@ impl GitFiles {
         path_prefix: Option<&str>,
         maximum_depth: Option<usize>,
         include_hidden_files: bool,
-        file_name_starts_with: Option<&str>,
+        file_name_starts_with: Option<&[String]>,
         page: usize,
         per_page: usize,
     ) -> Result<(Vec<TreeNode>, bool), AppError> {
@@ -1002,10 +1002,10 @@ impl GitFiles {
         // arbitrarily deep, so the "decide the page window before opening any
         // subtree" optimisation cannot hold — the in-scope tree is walked in
         // full, then the *filtered* result is paginated.
-        if let Some(needle) = file_name_starts_with {
+        if let Some(needles) = file_name_starts_with {
             return Self::search_by_file_name(
                 &walk_tree,
-                needle,
+                needles,
                 maximum_depth,
                 include_hidden_files,
                 page,
@@ -1154,7 +1154,7 @@ impl GitFiles {
     }
 
     /// Walks `walk_tree` in full and returns the tree of entries whose *leaf
-    /// name* begins with `needle`, compared case-insensitively (Unicode
+    /// name* begins with any of `needles`, compared case-insensitively (Unicode
     /// lower-casing, so `Intro` matches `intro.md`). Both files *and*
     /// directories are matched:
     ///
@@ -1181,13 +1181,13 @@ impl GitFiles {
     /// ever opened**, matching is on names alone.
     fn search_by_file_name(
         walk_tree: &git2::Tree<'_>,
-        needle: &str,
+        needles: &[String],
         maximum_depth: Option<usize>,
         include_hidden_files: bool,
         page: usize,
         per_page: usize,
     ) -> Result<(Vec<TreeNode>, bool), AppError> {
-        let needle = needle.to_lowercase();
+        let needles: Vec<String> = needles.iter().map(|needle| needle.to_lowercase()).collect();
         let mut flat: Vec<String> = Vec::new();
         let mut dir_stubs: Vec<String> = Vec::new();
 
@@ -1224,7 +1224,8 @@ impl GitFiles {
             };
             let full_path = format!("{}{}", root, name);
             let in_matched = inside_matched.is_some();
-            let self_matches = name.to_lowercase().starts_with(&needle);
+            let lower_name = name.to_lowercase();
+            let self_matches = needles.iter().any(|needle| lower_name.starts_with(needle));
 
             match entry.kind() {
                 Some(git2::ObjectType::Tree) => {

@@ -46,8 +46,11 @@ pub struct ListFilesQuery {
     /// convention) are included in the listing; excluded if omitted or false.
     pub include_hidden_files: Option<bool>,
     /// When set, narrows the listing to files *and directories* whose leaf
-    /// name begins with this string, compared case-insensitively (a matched
-    /// directory brings its subtree along). Empty is rejected (`400`).
+    /// name begins with the given prefix(es), compared case-insensitively (a
+    /// matched directory brings its subtree along). Accepts either a bare
+    /// string (a single prefix) or a JSON-array string of prefixes, e.g.
+    /// `["intro", "readme"]` — an entry matches if its leaf name begins with
+    /// *any* of them. Empty is rejected (`400`).
     pub file_name_starts_with: Option<String>,
     pub page: Option<usize>,
     pub per_page: Option<usize>,
@@ -130,6 +133,39 @@ pub struct MoveFileRequest {
     pub message: Option<String>,
 }
 
+/// Decodes the `file_name_starts_with` query value into its list of prefixes.
+/// A value that looks like a JSON array (its first non-whitespace character is
+/// `[`) must be a valid JSON array of strings; any other value is taken
+/// verbatim as a single prefix — the original bare-string spelling, kept for
+/// backward compatibility. Empty arrays and empty prefixes are rejected with
+/// `400`: an empty prefix would match every entry (indistinguishable from
+/// omitting the parameter), an empty array none — both only caller bugs.
+fn parse_file_name_prefixes(raw: &str) -> Result<Vec<String>, AppError> {
+    let prefixes = if raw.trim_start().starts_with('[') {
+        serde_json::from_str::<Vec<String>>(raw).map_err(|_err| AppError::InvalidOperation {
+            reason:
+                "file_name_starts_with must be a string or a JSON array of strings, e.g. [\"intro\", \"readme\"]"
+                    .to_string(),
+        })?
+    } else {
+        vec![raw.to_string()]
+    };
+
+    if prefixes.is_empty() {
+        return Err(AppError::InvalidOperation {
+            reason: "file_name_starts_with must contain at least one prefix".to_string(),
+        });
+    }
+
+    if prefixes.iter().any(|prefix| prefix.is_empty()) {
+        return Err(AppError::InvalidOperation {
+            reason: "file_name_starts_with must not be empty".to_string(),
+        });
+    }
+
+    Ok(prefixes)
+}
+
 /// GET /:collection_id/:tenant_id/files
 /// Returns the repository contents as a recursive file tree.
 /// Accepts an optional `prefix_path` query parameter (e.g. `?prefix_path=/docs`) to scope
@@ -173,17 +209,16 @@ pub async fn list_files(
 
     let include_hidden_files = query.include_hidden_files.unwrap_or(false);
 
-    // An empty search term would match every file (every name starts with
-    // ""), which is indistinguishable from omitting it — more likely a caller
-    // bug than an intent, so reject it explicitly.
-    let file_name_starts_with: Option<String> = match query.file_name_starts_with {
-        Some(needle) if needle.is_empty() => {
-            return Err(AppError::InvalidOperation {
-                reason: "file_name_starts_with must not be empty".to_string(),
-            })
-        }
-        other => other,
-    };
+    // Accepts either a bare string (a single prefix) or a JSON-array string
+    // of prefixes (query parameters are strings, so an array travels the same
+    // way `seek_from_line_starts_with` does), so several prefixes can be
+    // searched at once — an entry matches if its leaf name begins with *any*
+    // of them.
+    let file_name_starts_with: Option<Vec<String>> = query
+        .file_name_starts_with
+        .as_deref()
+        .map(parse_file_name_prefixes)
+        .transpose()?;
 
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query
