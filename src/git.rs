@@ -47,7 +47,7 @@ use git2::{
     Delta, DiffFindOptions, DiffFormat, DiffOptions, FileMode, Oid, Repository, Signature, Sort,
 };
 use serde::Serialize;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::error::AppError;
@@ -75,6 +75,51 @@ pub enum TreeNode {
 pub struct FileCounts {
     pub files: usize,
     pub directories: usize,
+}
+
+/// Which git date a listing's date-range filter keys off. Both are derived
+/// from commit history (a tree object carries no timestamp), so any listing
+/// carrying a date bound pays for a history walk — see
+/// [`GitFiles::file_dates`].
+#[derive(Debug, Clone, Copy)]
+pub enum DateKind {
+    /// The oldest commit that introduced the file under its current path
+    /// (renames are *not* followed). Requires walking to the root of history.
+    Created,
+    /// The most recent commit that touched the file. The walk can stop as
+    /// soon as every in-scope file has been dated.
+    Updated,
+}
+
+/// A date-range filter applied to a file listing: only files whose
+/// [`DateKind`] date falls inside the window survive. The window is
+/// half-open — `from` inclusive, `to` exclusive (`[from, to)`) — and each
+/// bound is independently optional (an open-ended range). A file's date is
+/// compared at whole-second (git commit) resolution, in UTC.
+#[derive(Debug, Clone, Copy)]
+pub struct DateFilter {
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
+    pub kind: DateKind,
+}
+
+impl DateFilter {
+    /// Whether `date` falls inside the half-open window.
+    fn matches(&self, date: DateTime<Utc>) -> bool {
+        if let Some(from) = self.from {
+            if date < from {
+                return false;
+            }
+        }
+
+        if let Some(to) = self.to {
+            if date >= to {
+                return false;
+            }
+        }
+
+        true
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -961,11 +1006,18 @@ impl GitFiles {
     /// apply — matches can be nested anywhere, so the whole in-scope tree is
     /// walked before pagination.
     ///
-    /// The performance contract (search mode aside): **no blob is ever
-    /// opened**. Names and entry kinds come entirely from git tree objects,
-    /// so listing cost scales with the number of tree entries actually
-    /// visited — and the pagination below is designed to keep that number
-    /// small even on huge repositories.
+    /// When `date_filter` is set, the listing is narrowed to files whose git
+    /// created/updated date falls inside the window (see `file_dates`). Like
+    /// name search it forgoes the off-page optimisation — a file's date can
+    /// move it in or out, so the whole in-scope tree must be examined before
+    /// pagination — and it additionally walks commit history (still no blob
+    /// opened, but cost scales with history length rather than page size).
+    ///
+    /// The performance contract (search and date-filter modes aside): **no
+    /// blob is ever opened**. Names and entry kinds come entirely from git
+    /// tree objects, so listing cost scales with the number of tree entries
+    /// actually visited — and the pagination below is designed to keep that
+    /// number small even on huge repositories.
     pub fn list_files(
         repo_path: &Path,
         tenant_id: &str,
@@ -973,10 +1025,11 @@ impl GitFiles {
         maximum_depth: Option<usize>,
         include_hidden_files: bool,
         file_name_starts_with: Option<&[String]>,
+        date_filter: Option<DateFilter>,
         page: usize,
         per_page: usize,
     ) -> Result<(Vec<TreeNode>, bool), AppError> {
-        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, file_name_starts_with = ?file_name_starts_with, page = page, per_page = per_page, "listing files");
+        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, file_name_starts_with = ?file_name_starts_with, date_filter = ?date_filter, page = page, per_page = per_page, "listing files");
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
         let head_commit = repo.head()?.peel_to_commit()?;
@@ -1004,10 +1057,29 @@ impl GitFiles {
         // full, then the *filtered* result is paginated.
         if let Some(needles) = file_name_starts_with {
             return Self::search_by_file_name(
+                &repo,
                 &walk_tree,
+                path_prefix,
                 needles,
                 maximum_depth,
                 include_hidden_files,
+                date_filter,
+                page,
+                per_page,
+            );
+        }
+
+        // A date filter (without a name search) likewise walks the whole
+        // in-scope tree, dates each file against commit history, and paginates
+        // the surviving set — the off-page optimisation cannot hold.
+        if let Some(date_filter) = date_filter {
+            return Self::list_with_date_filter(
+                &repo,
+                &walk_tree,
+                path_prefix,
+                maximum_depth,
+                include_hidden_files,
+                date_filter,
                 page,
                 per_page,
             );
@@ -1180,10 +1252,13 @@ impl GitFiles {
     /// root-level entries. Same performance contract otherwise — **no blob is
     /// ever opened**, matching is on names alone.
     fn search_by_file_name(
+        repo: &Repository,
         walk_tree: &git2::Tree<'_>,
+        path_prefix: Option<&str>,
         needles: &[String],
         maximum_depth: Option<usize>,
         include_hidden_files: bool,
+        date_filter: Option<DateFilter>,
         page: usize,
         per_page: usize,
     ) -> Result<(Vec<TreeNode>, bool), AppError> {
@@ -1267,6 +1342,20 @@ impl GitFiles {
             git2::TreeWalkResult::Ok
         })?;
 
+        // A date filter, when present, composes with the name search: only
+        // name matches that also fall inside the date window survive. Because
+        // directories carry no date, the matched tree is rebuilt from the
+        // surviving *files* alone — a name-matched directory left with no
+        // in-window file is pruned (and depth stubs, whose contents we never
+        // walked and so cannot date, are dropped).
+        let (flat, dir_stubs) = match date_filter {
+            Some(date_filter) => (
+                Self::retain_by_date(repo, path_prefix, flat, date_filter)?,
+                Vec::new(),
+            ),
+            None => (flat, dir_stubs),
+        };
+
         // The walk already bounded depth, so every collected path is within
         // scope and `build_tree` needs no depth handling of its own (`None`);
         // the stubs it receives are matched directories that were not (or
@@ -1281,6 +1370,219 @@ impl GitFiles {
         let nodes: Vec<TreeNode> = tree.into_iter().skip(offset).take(per_page).collect();
 
         Ok((nodes, has_more))
+    }
+
+    /// Lists the in-scope tree narrowed to files whose git date falls inside
+    /// `date_filter`'s window. The whole in-scope tree is walked (the off-page
+    /// optimisation cannot hold — a date can move any file in or out), each
+    /// file is dated against commit history, and the surviving set is
+    /// paginated over its root-level entries. Directories survive only as the
+    /// structure leading to a surviving file, so an emptied directory is
+    /// pruned. `maximum_depth` and `include_hidden_files` bound the walk
+    /// exactly as elsewhere; files below the depth limit are never candidates.
+    fn list_with_date_filter(
+        repo: &Repository,
+        walk_tree: &git2::Tree<'_>,
+        path_prefix: Option<&str>,
+        maximum_depth: Option<usize>,
+        include_hidden_files: bool,
+        date_filter: DateFilter,
+        page: usize,
+        per_page: usize,
+    ) -> Result<(Vec<TreeNode>, bool), AppError> {
+        let flat = Self::collect_flat_files(walk_tree, maximum_depth, include_hidden_files)?;
+        let matched = Self::retain_by_date(repo, path_prefix, flat, date_filter)?;
+
+        // Depth was already applied during collection, so `build_tree` needs
+        // no depth handling of its own, and there are no stubs (a directory we
+        // could not descend into cannot be date-classified, so it is dropped).
+        let tree = GitUtils::build_tree(matched, Vec::new(), None);
+
+        let total = tree.len();
+        let offset = ((page - 1) * per_page).min(total);
+        let has_more = total > offset + per_page;
+
+        let nodes: Vec<TreeNode> = tree.into_iter().skip(offset).take(per_page).collect();
+
+        Ok((nodes, has_more))
+    }
+
+    /// Collects every in-scope file as a flat path relative to `tree`,
+    /// honouring the hidden-entry and depth-limit rules (a hidden directory's
+    /// subtree is skipped, and descent stops at the depth limit so files below
+    /// it are never collected). Unlike `collect_subtree` it records no
+    /// directory stubs and returns bare paths rather than a built tree —
+    /// callers that need a tree feed the result back through `build_tree`.
+    fn collect_flat_files(
+        tree: &git2::Tree<'_>,
+        max_depth: Option<usize>,
+        include_hidden_files: bool,
+    ) -> Result<Vec<String>, AppError> {
+        let mut flat: Vec<String> = Vec::new();
+
+        tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            if !include_hidden_files && entry.name().is_ok_and(|name| name.starts_with('.')) {
+                return if entry.kind() == Some(git2::ObjectType::Tree) {
+                    git2::TreeWalkResult::Skip
+                } else {
+                    git2::TreeWalkResult::Ok
+                };
+            }
+
+            if entry.kind() == Some(git2::ObjectType::Tree) {
+                if let Some(max) = max_depth {
+                    let entry_depth = root.chars().filter(|c| *c == '/').count() + 1;
+
+                    if entry_depth >= max {
+                        return git2::TreeWalkResult::Skip;
+                    }
+                }
+
+                return git2::TreeWalkResult::Ok;
+            }
+
+            if entry.kind() == Some(git2::ObjectType::Blob) {
+                let name = entry.name().unwrap_or("");
+                flat.push(format!("{}{}", root, name));
+            }
+
+            git2::TreeWalkResult::Ok
+        })?;
+
+        Ok(flat)
+    }
+
+    /// Keeps only those `flat` paths (relative to the listing root) whose git
+    /// date falls inside `date_filter`'s window. The date map returned by
+    /// `file_dates` is keyed by repo-root paths, so the listing-root
+    /// `path_prefix` is re-joined before each lookup. A path with no date in
+    /// history (which cannot happen for a file present in HEAD) is dropped.
+    fn retain_by_date(
+        repo: &Repository,
+        path_prefix: Option<&str>,
+        flat: Vec<String>,
+        date_filter: DateFilter,
+    ) -> Result<Vec<String>, AppError> {
+        let to_full = |leaf: &str| -> String {
+            match path_prefix {
+                Some(prefix) if !prefix.is_empty() => format!("{}/{}", prefix, leaf),
+                _ => leaf.to_string(),
+            }
+        };
+
+        let full_paths: HashSet<String> = flat.iter().map(|leaf| to_full(leaf)).collect();
+
+        if full_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let dates = Self::file_dates(repo, &full_paths, date_filter.kind)?;
+
+        Ok(flat
+            .into_iter()
+            .filter(|leaf| {
+                dates
+                    .get(&to_full(leaf))
+                    .is_some_and(|date| date_filter.matches(*date))
+            })
+            .collect())
+    }
+
+    /// Walks commit history once (newest-first, diffing each commit against
+    /// its first parent) and returns, for each requested repo-root path, the
+    /// commit time that defines its `kind` date.
+    ///
+    /// The diff is computed from tree/oid deltas alone — no patch, no stats,
+    /// no rename detection — so **no blob is opened** and a rename surfaces as
+    /// an add of the new path plus a delete of the old (renames are not
+    /// followed). Cost is therefore O(commits), not O(history × files).
+    ///
+    /// - `Updated`: the first commit seen (walking newest-first) that touched
+    ///   a path is its most-recent touch; the walk stops as soon as every
+    ///   requested path has a date.
+    /// - `Created`: the oldest commit that *added* a path; the walk must reach
+    ///   the root of history, so this is the heavier of the two.
+    fn file_dates(
+        repo: &Repository,
+        paths: &HashSet<String>,
+        kind: DateKind,
+    ) -> Result<HashMap<String, DateTime<Utc>>, AppError> {
+        let mut dates: HashMap<String, DateTime<Utc>> = HashMap::new();
+
+        let mut revwalk = repo.revwalk()?;
+
+        revwalk.push_head()?;
+        revwalk.set_sorting(Sort::TIME | Sort::TOPOLOGICAL)?;
+
+        for oid_result in revwalk {
+            // Updated: once every requested path is dated, every older commit
+            // can only hold an older (irrelevant) touch — nothing left to find.
+            if matches!(kind, DateKind::Updated) && dates.len() == paths.len() {
+                break;
+            }
+
+            let Ok(oid) = oid_result else {
+                continue;
+            };
+            let Ok(commit) = repo.find_commit(oid) else {
+                continue;
+            };
+            let Ok(commit_tree) = commit.tree() else {
+                continue;
+            };
+
+            // The root commit has no parent — diff against an empty tree
+            // (`None`), so its entries register as additions.
+            let parent_tree = commit.parent(0).and_then(|parent| parent.tree()).ok();
+
+            let mut diff_options = DiffOptions::new();
+
+            diff_options.include_untracked(false);
+
+            let diff = match repo.diff_tree_to_tree(
+                parent_tree.as_ref(),
+                Some(&commit_tree),
+                Some(&mut diff_options),
+            ) {
+                Ok(diff) => diff,
+                Err(_) => continue,
+            };
+
+            let commit_time = GitUtils::timestamp_from_git_time(commit.time());
+
+            for delta in diff.deltas() {
+                // A delete carries the path only on the old side; every other
+                // status carries it on the new side.
+                let Some(path) = delta
+                    .new_file()
+                    .path()
+                    .or_else(|| delta.old_file().path())
+                    .map(|path| path.to_string_lossy().into_owned())
+                else {
+                    continue;
+                };
+
+                if !paths.contains(&path) {
+                    continue;
+                }
+
+                match kind {
+                    // Newest-first, so the first touch seen is the latest.
+                    DateKind::Updated => {
+                        dates.entry(path).or_insert(commit_time);
+                    }
+                    // Keep overwriting on each older addition so the final
+                    // value is the earliest introduction of the path.
+                    DateKind::Created => {
+                        if delta.status() == Delta::Added {
+                            dates.insert(path, commit_time);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(dates)
     }
 
     /// Counts files and directories reachable from the listing root, with

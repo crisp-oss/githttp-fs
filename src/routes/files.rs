@@ -16,7 +16,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -52,6 +52,16 @@ pub struct ListFilesQuery {
     /// `["intro", "readme"]` — an entry matches if its leaf name begins with
     /// *any* of them. Empty is rejected (`400`).
     pub file_name_starts_with: Option<String>,
+    /// Lower bound (inclusive) of the created/updated date-range filter, as an
+    /// RFC 3339 date-time (e.g. `2026-06-16T10:00:00Z`).
+    pub include_date_from: Option<String>,
+    /// Upper bound (exclusive) of the created/updated date-range filter, as an
+    /// RFC 3339 date-time.
+    pub include_date_to: Option<String>,
+    /// Which date the range applies to: `updated` (default) or `created`.
+    /// Its value is always validated, but the filter is only active — and the
+    /// history walk only paid for — when at least one bound is set.
+    pub include_date_type: Option<String>,
     pub page: Option<usize>,
     pub per_page: Option<usize>,
 }
@@ -166,6 +176,69 @@ fn parse_file_name_prefixes(raw: &str) -> Result<Vec<String>, AppError> {
     Ok(prefixes)
 }
 
+/// Parses a single RFC 3339 date-time query value into UTC, mapping any
+/// malformed value to a `400` naming the parameter (strict validation — only
+/// the RFC 3339 spelling is accepted).
+fn parse_rfc3339(raw: &str, parameter: &str) -> Result<DateTime<Utc>, AppError> {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|date_time| date_time.with_timezone(&Utc))
+        .map_err(|_err| AppError::InvalidOperation {
+            reason: format!(
+                "{} must be an RFC 3339 date-time, e.g. 2026-06-16T10:00:00Z",
+                parameter
+            ),
+        })
+}
+
+/// Builds the optional created/updated date-range filter from the three query
+/// parameters. `include_date_type` is validated strictly whenever present
+/// (only `updated` or `created`, defaulting to `updated`), but the filter is
+/// left inactive — so the listing keeps its cheap tree-only fast path and no
+/// commit history is walked — unless at least one date bound is given. When
+/// both bounds are present, `from` must be strictly before `to` (the window
+/// is `[from, to)`, so equal bounds would select nothing).
+fn parse_date_filter(
+    from: Option<&str>,
+    to: Option<&str>,
+    date_type: Option<&str>,
+) -> Result<Option<git::DateFilter>, AppError> {
+    let kind = match date_type {
+        None | Some("updated") => git::DateKind::Updated,
+        Some("created") => git::DateKind::Created,
+        Some(other) => {
+            return Err(AppError::InvalidOperation {
+                reason: format!(
+                    "include_date_type must be 'updated' or 'created': {}",
+                    other
+                ),
+            })
+        }
+    };
+
+    let from = from
+        .map(|raw| parse_rfc3339(raw, "include_date_from"))
+        .transpose()?;
+    let to = to
+        .map(|raw| parse_rfc3339(raw, "include_date_to"))
+        .transpose()?;
+
+    // No bound set: the type is validated but the filter stays inactive, so
+    // the listing avoids the history walk entirely.
+    if from.is_none() && to.is_none() {
+        return Ok(None);
+    }
+
+    if let (Some(from), Some(to)) = (from, to) {
+        if from >= to {
+            return Err(AppError::InvalidOperation {
+                reason: "include_date_from must be strictly before include_date_to".to_string(),
+            });
+        }
+    }
+
+    Ok(Some(git::DateFilter { from, to, kind }))
+}
+
 /// GET /:collection_id/:tenant_id/files
 /// Returns the repository contents as a recursive file tree.
 /// Accepts an optional `prefix_path` query parameter (e.g. `?prefix_path=/docs`) to scope
@@ -220,13 +293,19 @@ pub async fn list_files(
         .map(parse_file_name_prefixes)
         .transpose()?;
 
+    let date_filter = parse_date_filter(
+        query.include_date_from.as_deref(),
+        query.include_date_to.as_deref(),
+        query.include_date_type.as_deref(),
+    )?;
+
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query
         .per_page
         .unwrap_or(DEFAULT_PER_PAGE)
         .clamp(1, MAX_PER_PAGE);
 
-    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, file_name_starts_with = ?file_name_starts_with, page = page, per_page = per_page, "handling list files request");
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, file_name_starts_with = ?file_name_starts_with, date_filter = ?date_filter, page = page, per_page = per_page, "handling list files request");
 
     let repo_path = state
         .config
@@ -245,6 +324,7 @@ pub async fn list_files(
             maximum_depth,
             include_hidden_files,
             file_name_starts_with.as_deref(),
+            date_filter,
             page,
             per_page,
         )
