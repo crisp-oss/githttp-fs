@@ -203,6 +203,13 @@ fn build_router(app_state: AppState) -> Router {
             "/{collection_id}/{tenant_id}/commits/{sha}/revert",
             post(routes::commits::revert_commit),
         )
+        // Point-in-time rollback, sibling of the revert route above: same
+        // files, same POST verb (it records a new commit rather than removing
+        // anything from history), other side of the commit.
+        .route(
+            "/{collection_id}/{tenant_id}/commits/{sha}/rollback",
+            post(routes::commits::rollback_commit),
+        )
         // Require a valid Bearer token on every route.
         .layer(axum_middleware::from_fn_with_state(
             app_state.clone(),

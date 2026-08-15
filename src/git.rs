@@ -2925,6 +2925,342 @@ impl GitCommits {
 
         Ok((new_commit_oid.to_string(), file_changes))
     }
+
+    /// Rolls every file the commit `sha` touched back to the exact state it
+    /// had *at* that commit — point-in-time rollback, the "time machine"
+    /// counterpart to the whole-commit revert above. Returns the new commit
+    /// SHA and one change per file that actually moved (empty when the
+    /// repository already holds that state).
+    ///
+    /// Which files are in scope is derived from `sha` itself — the same delta
+    /// set a revert walks — so the caller passes no paths: the commit already
+    /// says what it touched. What differs from `revert_commit` is which *side*
+    /// of the target commit is restored. A revert restores `parent(sha)` (undo
+    /// what that commit did); a rollback restores `sha` itself (make those
+    /// files look the way they looked then), collapsing every later change to
+    /// those paths into one commit. Rolling back to the root commit is legal —
+    /// with no parent, its delta set is simply its whole tree.
+    ///
+    /// The target state is read from `sha`'s tree and staged onto **current
+    /// HEAD**, reusing existing blob oids so no content is rehashed. Per file:
+    ///
+    /// - present at `sha`, absent in HEAD → re-created (a file deleted since
+    ///   comes back from the dead)
+    /// - present at `sha`, different in HEAD → updated
+    /// - absent at `sha` (the commit deleted it), present in HEAD → deleted
+    ///   again
+    /// - identical on both sides → skipped entirely: no staging, no hook
+    ///
+    /// A rename inside the commit rolls back as a rename (one `file.moved`
+    /// hook, preserving downstream entity identity) whenever HEAD still holds
+    /// the pre-rename path and not the post-rename one; otherwise each side is
+    /// settled on its own. When nothing at all needs to move, no commit is
+    /// created and HEAD's sha is returned — same contract as an unchanged PUT.
+    ///
+    /// History is never rewritten: the rollback is a new commit on top, and
+    /// the state it replaces stays reachable through its own commit.
+    pub fn rollback_commit(
+        repo_path: &Path,
+        tenant_id: &str,
+        sha: &str,
+        commit_message: Option<&str>,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<(String, Vec<FileChange>), AppError> {
+        tracing::debug!(tenant_id = %tenant_id, sha = %sha, author_name = %author_name, author_email = %author_email, "rolling files back to commit");
+
+        // Stages `path` holding `oid` — the state at the target commit —
+        // unless HEAD already holds that exact blob, in which case there is
+        // nothing to roll back for this path.
+        fn restore_path(
+            repo: &Repository,
+            repo_path: &Path,
+            head_tree: &git2::Tree<'_>,
+            target_tree: &git2::Tree<'_>,
+            tree_update: &mut TreeUpdateBuilder,
+            path: &Path,
+            oid: Oid,
+        ) -> Result<Option<FileChange>, AppError> {
+            let path_string = path.to_string_lossy().into_owned();
+            let head_oid = GitUtils::blob_oid_in_tree(head_tree, &path_string);
+
+            if head_oid == Some(oid) {
+                tracing::trace!(path = %path_string, "rollback: file already in target state");
+
+                return Ok(None);
+            }
+
+            tracing::trace!(
+                path = %path_string,
+                existed_in_head = head_oid.is_some(),
+                "rollback: restoring file content from target commit"
+            );
+
+            let content = GitUtils::blob_content_from_tree(repo, target_tree, &path_string)?;
+
+            let absolute_path = repo_path.join(path);
+
+            if let Some(parent_dir) = absolute_path.parent() {
+                std::fs::create_dir_all(parent_dir)?;
+            }
+
+            std::fs::write(&absolute_path, &content)?;
+
+            tree_update.upsert(path, oid, FileMode::Blob);
+
+            Ok(Some(if head_oid.is_some() {
+                FileChange::Updated {
+                    path: path_string,
+                    content,
+                }
+            } else {
+                FileChange::Created {
+                    path: path_string,
+                    content,
+                }
+            }))
+        }
+
+        // Stages the removal of `path` — absent at the target commit — unless
+        // HEAD does not hold it as a file either.
+        fn remove_path(
+            repo_path: &Path,
+            head_tree: &git2::Tree<'_>,
+            tree_update: &mut TreeUpdateBuilder,
+            path: &Path,
+        ) -> Result<Option<FileChange>, AppError> {
+            let path_string = path.to_string_lossy().into_owned();
+
+            if GitUtils::blob_oid_in_tree(head_tree, &path_string).is_none() {
+                tracing::trace!(path = %path_string, "rollback: file already absent");
+
+                return Ok(None);
+            }
+
+            tracing::trace!(path = %path_string, "rollback: removing file absent from target commit");
+
+            // A file already missing from the working tree just means the
+            // working tree had diverged from HEAD; HEAD is what counts.
+            match std::fs::remove_file(repo_path.join(path)) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(AppError::Io(err)),
+            }
+
+            tree_update.remove(path);
+
+            Ok(Some(FileChange::Deleted { path: path_string }))
+        }
+
+        let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
+
+        let object = repo
+            .revparse_single(sha)
+            .map_err(|_err| AppError::CommitNotFound {
+                sha: sha.to_string(),
+            })?;
+
+        let target_commit = object
+            .peel_to_commit()
+            .map_err(|_err| AppError::CommitNotFound {
+                sha: sha.to_string(),
+            })?;
+
+        let target_tree = target_commit.tree()?;
+
+        // Diff parent → target tells us which paths this commit touched, and
+        // what each of them looked like once it landed. The root commit has no
+        // parent, so it diffs against nothing: its whole tree is in scope.
+        tracing::trace!(tenant_id = %tenant_id, sha = %sha, "computing diff for rollback");
+
+        let parent_tree = match target_commit.parent_count() {
+            0 => None,
+            _ => Some(target_commit.parent(0)?.tree()?),
+        };
+
+        let mut diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&target_tree), None)?;
+
+        let mut find_options = DiffFindOptions::new();
+
+        find_options.renames(true);
+
+        diff.find_similar(Some(&mut find_options))?;
+
+        let raw_deltas: Vec<DeltaRecord> = (0..diff.deltas().count())
+            .filter_map(|index| diff.get_delta(index))
+            .map(|delta| DeltaRecord {
+                status: delta.status(),
+                old_oid: delta.old_file().id(),
+                new_oid: delta.new_file().id(),
+                old_path: delta.old_file().path().map(PathBuf::from),
+                new_path: delta.new_file().path().map(PathBuf::from),
+            })
+            .collect();
+
+        tracing::trace!(tenant_id = %tenant_id, sha = %sha, delta_count = raw_deltas.len(), "applying rollback deltas");
+
+        let head_commit = repo.head()?.peel_to_commit()?;
+        let head_tree = head_commit.tree()?;
+
+        // The rollback tree is HEAD's tree with each touched path forced back
+        // to its target-commit state — no index round-trip, no rehashing.
+        let mut tree_update = TreeUpdateBuilder::new();
+
+        let mut file_changes: Vec<FileChange> = Vec::new();
+
+        // For each delta: mirror the target state onto the working tree
+        // (best-effort human-visible state), stage it into the tree builder
+        // (the authoritative commit state), and record the corresponding
+        // FileChange (drives one hook per file, in this order).
+        for raw_delta in &raw_deltas {
+            match raw_delta.status {
+                // The commit created or changed this file → restore that version.
+                Delta::Added | Delta::Modified => {
+                    if let Some(new_path) = &raw_delta.new_path {
+                        let change = restore_path(
+                            &repo,
+                            repo_path,
+                            &head_tree,
+                            &target_tree,
+                            &mut tree_update,
+                            new_path,
+                            raw_delta.new_oid,
+                        )?;
+
+                        file_changes.extend(change);
+                    }
+                }
+
+                // The commit deleted this file → at that point in time it was
+                // gone, so rolling back deletes it again.
+                Delta::Deleted => {
+                    if let Some(old_path) = &raw_delta.old_path {
+                        let change =
+                            remove_path(repo_path, &head_tree, &mut tree_update, old_path)?;
+
+                        file_changes.extend(change);
+                    }
+                }
+
+                // The commit renamed old → new. Rolling back re-applies that
+                // rename; when HEAD still has the file under its old name and
+                // nothing at the new one, it is reported as a single move so
+                // downstream receivers keep the entity's identity instead of
+                // seeing a delete followed by an unrelated create.
+                Delta::Renamed => {
+                    if let (Some(old_path), Some(new_path)) =
+                        (&raw_delta.old_path, &raw_delta.new_path)
+                    {
+                        let old_in_head =
+                            GitUtils::blob_oid_in_tree(&head_tree, &old_path.to_string_lossy())
+                                .is_some();
+                        let new_in_head =
+                            GitUtils::blob_oid_in_tree(&head_tree, &new_path.to_string_lossy())
+                                .is_some();
+
+                        if old_in_head && !new_in_head {
+                            tracing::trace!(
+                                tenant_id = %tenant_id,
+                                sha = %sha,
+                                from_path = %old_path.display(),
+                                to_path = %new_path.display(),
+                                "rollback: re-applying rename"
+                            );
+
+                            let content = GitUtils::blob_content_from_tree(
+                                &repo,
+                                &target_tree,
+                                &new_path.to_string_lossy(),
+                            )?;
+
+                            let absolute_old = repo_path.join(old_path);
+                            let absolute_new = repo_path.join(new_path);
+
+                            match std::fs::remove_file(&absolute_old) {
+                                Ok(()) => {}
+                                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(err) => return Err(AppError::Io(err)),
+                            }
+
+                            if let Some(parent_dir) = absolute_new.parent() {
+                                std::fs::create_dir_all(parent_dir)?;
+                            }
+
+                            std::fs::write(&absolute_new, &content)?;
+
+                            tree_update.remove(old_path);
+                            tree_update.upsert(new_path, raw_delta.new_oid, FileMode::Blob);
+
+                            file_changes.push(FileChange::Moved {
+                                from_path: old_path.to_string_lossy().into_owned(),
+                                to_path: new_path.to_string_lossy().into_owned(),
+                                content,
+                            });
+                        } else {
+                            // HEAD's shape does not match a plain rename-back
+                            // (the destination is occupied, or the source is
+                            // already gone), so each side is settled on its
+                            // own terms.
+                            let restored = restore_path(
+                                &repo,
+                                repo_path,
+                                &head_tree,
+                                &target_tree,
+                                &mut tree_update,
+                                new_path,
+                                raw_delta.new_oid,
+                            )?;
+
+                            file_changes.extend(restored);
+
+                            let removed =
+                                remove_path(repo_path, &head_tree, &mut tree_update, old_path)?;
+
+                            file_changes.extend(removed);
+                        }
+                    }
+                }
+
+                _ => {}
+            }
+        }
+
+        // Every staged path yields exactly one change, so an empty list means
+        // the repository already holds the target state: no commit, no hook.
+        if file_changes.is_empty() {
+            tracing::debug!(tenant_id = %tenant_id, sha = %sha, "files already in target state, skipping commit");
+
+            return Ok((head_commit.id().to_string(), file_changes));
+        }
+
+        tracing::trace!(tenant_id = %tenant_id, sha = %sha, "building rollback tree and committing");
+
+        let tree_id = tree_update.create_updated(&repo, &head_tree)?;
+        let tree = repo.find_tree(tree_id)?;
+        let signature = GitUtils::git_signature(author_name, author_email)?;
+
+        let auto_message = format!("rollback: {}", target_commit.message().unwrap_or("unknown"));
+        let message = commit_message.unwrap_or(&auto_message);
+
+        let new_commit_oid = repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &[&head_commit],
+        )?;
+
+        tracing::debug!(
+            tenant_id = %tenant_id,
+            rolled_back_to_sha = %sha,
+            new_sha = %new_commit_oid,
+            file_change_count = file_changes.len(),
+            "rollback committed"
+        );
+
+        Ok((new_commit_oid.to_string(), file_changes))
+    }
 }
 
 // ---------------------------------------------------------------------------

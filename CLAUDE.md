@@ -16,14 +16,14 @@ src/
   config.rs        — TOML config types (ServerConfig, HooksConfig, HookEvent)
   state.rs         — AppState: Arc<Config>, reqwest::Client, per-tenant DashMap<Mutex>
   error.rs         — AppError enum with axum IntoResponse (JSON error bodies)
-  git.rs           — all git2 operations (write, delete, move, list, commits, revert)
+  git.rs           — all git2 operations (write, delete, move, list, commits, revert, rollback)
   hooks.rs         — async hook delivery with exponential backoff retry
   middleware.rs    — Bearer API key guard (axum middleware)
   seek.rs          — SeekOptions: line-based content windowing for file reads
   routes/
     mod.rs         — shared request types (AuthorRequest)
     files.rs       — GET/PUT/DELETE/POST on /:collection_id/:tenant_id/files and /:collection_id/:tenant_id/files/*path, plus POST /:collection_id/:tenant_id/batch/files/read and GET /:collection_id/:tenant_id/count/files
-    commits.rs     — commit list, commit detail, revert
+    commits.rs     — commit list, commit detail, revert / point-in-time rollback
     tenant.rs      — DELETE /:collection_id/:tenant_id
 ```
 
@@ -46,6 +46,7 @@ All routes are prefixed `/v1` and require `Authorization: Bearer <api_key>`.
 | `GET` | `/v1/:collection_id/:tenant_id/commits?page=&per_page=&file_path=&include_statistics=` | List commits, paginated (default 100, max 500); optional `file_path` filters to commits touching that file, following renames backward; optional `include_statistics` adds per-commit insertion/deletion/files-changed counts |
 | `GET` | `/v1/:collection_id/:tenant_id/commits/:sha` | Commit detail with per-file diffs and snapshots |
 | `POST` | `/v1/:collection_id/:tenant_id/commits/:sha/revert` | Revert a commit |
+| `POST` | `/v1/:collection_id/:tenant_id/commits/:sha/rollback` | Roll the files that commit touched back to the state they had *at* it (point-in-time rollback) |
 
 ### Request bodies
 
@@ -84,6 +85,16 @@ All write requests share a required `author` object. `message` is optional every
   "message": "optional commit message"
 }
 ```
+
+**POST** `/commits/:sha/rollback` — roll this commit's files back to this point in time
+```json
+{
+  "author": { "name": "Valerian Saliou", "email": "valerian@example.com" },
+  "message": "optional commit message"
+}
+```
+
+Same body as the revert route — no paths are passed. Which files are in scope is read from `:sha` itself (the files that commit touched), and each of them is restored to the exact state it had **at** that commit, no matter how many commits changed them since. Files the commit never touched are left untouched. The `limits.allowed_extensions` whitelist is *not* applied, since the content comes from history under paths this server already committed.
 
 **POST** `/batch/files/read` — batch-read several files (no `author`: reads commit nothing)
 ```json
@@ -246,6 +257,27 @@ This requires an actual content diff against each commit's parent (renames are s
 }
 ```
 
+**POST** `/commits/:sha/rollback`
+```json
+{
+  "rolled_back_to_sha": "a3f9c1d",
+  "commit_sha": "b8d2e4a"
+}
+```
+
+For every path in `:sha`'s own change set, the rollback compares that path's state at `:sha` with its state in HEAD and commits the difference, so deletions travel in both directions:
+
+| at `:sha` | at HEAD | result |
+|-----------|---------|--------|
+| exists | exists, different content | file updated → `file.updated` hook |
+| exists | absent | file re-created → `file.created` hook (a since-deleted file comes back) |
+| absent (the commit deleted it) | exists | file deleted again → `file.deleted` hook |
+| exists | exists, identical content | that path is skipped entirely — no staging, no hook |
+
+A rename inside `:sha` rolls back as a rename — one `file.moved` hook, preserving downstream entity identity — whenever HEAD still holds the pre-rename path and nothing sits at the post-rename one; otherwise each side is settled on its own (a restore plus a delete). A folder at a path counts as "absent" on either side, same as everywhere else in the API.
+
+When no path needs to move (the repository already holds that state), the whole request is a no-op: no commit, no hook, and `commit_sha` is current HEAD. Rolling back *to* the initial commit is legal, unlike reverting it — with no parent, its change set is simply its whole tree.
+
 ## Configuration (`config.toml`)
 
 ```toml
@@ -305,6 +337,7 @@ Log verbosity priority: `RUST_LOG` env var → `log_level` in config → `"info"
 - **Unchanged writes are no-ops** — a PUT with content identical to HEAD's blob creates no commit and fires no hook; the response returns HEAD's sha. Detection hashes the incoming content and compares blob oids, so nothing is read from or written to the object database or disk. Clients that blindly re-write unchanged files cannot pollute history with empty commits.
 - **Rename = single hook** — a `POST .../move` produces one `file.moved` event with both `from` and `to` paths, preserving entity identity in downstream systems.
 - **Revert = new commit** — reverts never rewrite history; they produce a new inverse commit and fire the appropriate hooks for each changed file.
+- **Rollback is its own route, distinct from revert** — `POST /commits/:sha/rollback` restores the files `:sha` touched to the state they had *at* it; `POST /commits/:sha/revert` undoes what `:sha` did. Both derive their scope from the commit's own change set (so neither takes paths in its body) and differ only in which side of it is read — `:sha`'s tree vs `parent(:sha)`'s — but they are separate routes rather than one route with a mode flag, so each has one unambiguous meaning: revert undoes a change, rollback restores a point in time (discarding every later change to those same paths). Both are `POST`: like every write in this API they append a commit and never remove one. The rollback needs no parent commit, which is why rolling back *to* the initial commit is allowed where reverting it is not. Target states are staged onto current HEAD reusing existing blob oids — no rehash, no content read except the copy each hook payload needs — and, like an unchanged PUT, a path already holding its target state is skipped; when that leaves nothing to do, no commit is created, no hook fires, and maintenance is not armed.
 - **Author identity is caller-supplied** — every write request requires an `author` object with `name` and `email`. Both are stored in the git commit and validated as non-empty.
 - **Commit identifier is named `sha`** (not `sha1`) — future-proof against git's SHA-256 migration; matches the convention used by GitHub, GitLab, and Gitea.
 - **`:sha` parameters accept hexadecimal only** — a full or abbreviated commit SHA (4–64 hex chars). Revspecs (`HEAD~1`, `master@{1}`, `:/pattern`) are rejected with `400` so git semantics never leak through the API and history-search DoS is impossible.
