@@ -7,25 +7,35 @@
 //! Asynchronous, ordered, retried webhook delivery.
 //!
 //! Webhooks exist so a downstream system (typically a read-optimised SQL
-//! mirror of the content) can stay in sync with every commit. Three
+//! mirror of the content) can stay in sync with every commit. Four
 //! properties drive the whole design:
 //!
 //! 1. **Writes are never delayed by the receiver.** The HTTP handler only
 //!    *enqueues* a job and returns; actual delivery happens on a background
 //!    task. A slow or down receiver cannot slow down the write API.
-//! 2. **Per-tenant ordering is absolute.** Each tenant gets its own queue
-//!    with a single consumer task, and jobs are enqueued while the tenant
-//!    write lock is still held. Queue order therefore equals commit order,
-//!    and because one consumer processes jobs strictly one at a time, a
-//!    later commit's hooks can never overtake an earlier commit's — even if
-//!    the earlier one is stuck in retries. A receiver that applies events
-//!    as they arrive always converges to the correct state.
-//! 3. **Failures retry with exponential backoff, then give up loudly.**
+//! 2. **Per-repository ordering is absolute; repositories run concurrently.**
+//!    Each `"{collection_id}/{tenant_id}"` gets its own queue with a single
+//!    consumer task, and jobs are enqueued while the tenant write lock is
+//!    still held. Queue order therefore equals commit order, and because one
+//!    consumer processes jobs strictly one at a time — awaiting every file,
+//!    retry and backoff sleep of a job before taking the next — a later
+//!    commit's hooks can never overtake an earlier commit's, even if the
+//!    earlier one is stuck in retries. A receiver that applies events as
+//!    they arrive always converges to the correct state. Different
+//!    repositories are different tokio tasks, so one dead receiver never
+//!    holds up another repository. The cost is unbounded latency rather than
+//!    lost ordering: a recursive folder delete of N files occupies its
+//!    repository's queue for N sequential POSTs.
+//! 3. **One event per file, never batched.** A commit's change set becomes
+//!    one job, and the consumer sends one POST per change in it — so
+//!    multi-file operations (revert, rollback, recursive folder delete and
+//!    move) fan out to one event per file rather than one summary event.
+//! 4. **Failures retry with exponential backoff, then give up loudly.**
 //!    After the configured attempts are exhausted the event is dropped and
 //!    a CRITICAL log line is emitted — at that point the receiver may be
 //!    out of sync and needs reconciliation. Blocking the queue forever on
 //!    one poisoned event would be worse: it would silently stall every
-//!    subsequent event for the tenant.
+//!    subsequent event for the repository.
 //!
 //! The queue is deliberately unbounded and in-memory: payload volume is
 //! bounded by write traffic (which is itself serialised per tenant), and
@@ -48,9 +58,15 @@ use crate::git::FileChange;
 const MAX_BACKOFF_EXPONENT: u32 = 20;
 
 /// A single unit of hook work: all file changes produced by one commit.
-/// Single-file operations carry one change; a revert can carry many, and its
-/// changes are delivered one hook at a time, in order.
+/// Single-file operations carry one change; a revert, a rollback, or a
+/// recursive folder delete/move can carry many, and its changes are delivered
+/// one hook at a time, in order.
 pub struct HookJob {
+    /// Both halves of the repository's identity travel in every payload.
+    /// `tenant_id` alone is ambiguous — the same tenant id can exist under
+    /// several collections, and those are separate repositories with
+    /// separately-ordered queues, so a receiver needs both to key its rows.
+    pub collection_id: String,
     pub tenant_id: String,
     pub commit_sha: String,
     pub committed_at: DateTime<Utc>,
@@ -145,6 +161,12 @@ impl HookDelivery {
         // are never silently dropped because of a misconfiguration.
         let attempts = hooks.retry_attempts.max(1);
 
+        // Log lines name the repository, not just the tenant: a tenant id can
+        // repeat across collections, and an operator reading a CRITICAL
+        // permanent-failure line needs to know which repository is now out of
+        // sync. Same composite key the queue itself is keyed by.
+        let repository = format!("{}/{}", job.collection_id, job.tenant_id);
+
         for file_change in job.file_changes {
             let required_event = Self::event_for_change(&file_change);
 
@@ -153,6 +175,7 @@ impl HookDelivery {
             }
 
             let payload = Self::build_payload(
+                &job.collection_id,
                 &job.tenant_id,
                 &job.commit_sha,
                 &job.committed_at,
@@ -165,7 +188,7 @@ impl HookDelivery {
                 hooks,
                 attempts,
                 payload,
-                &job.tenant_id,
+                &repository,
                 &job.commit_sha,
                 &description,
             )
@@ -183,7 +206,7 @@ impl HookDelivery {
         hooks: &HooksConfig,
         attempts: u32,
         payload: Value,
-        tenant_id: &str,
+        repository: &str,
         commit_sha: &str,
         change_description: &str,
     ) {
@@ -191,7 +214,7 @@ impl HookDelivery {
             match Self::send(client, hooks, &payload).await {
                 Ok(()) => {
                     tracing::debug!(
-                        tenant_id,
+                        repository,
                         commit_sha,
                         change = change_description,
                         "hook delivered"
@@ -201,7 +224,7 @@ impl HookDelivery {
                 }
                 Err(delivery_err) => {
                     tracing::error!(
-                        tenant_id,
+                        repository,
                         commit_sha,
                         change = change_description,
                         attempt,
@@ -212,7 +235,7 @@ impl HookDelivery {
 
                     if attempt == attempts {
                         tracing::error!(
-                            tenant_id, commit_sha, change = change_description,
+                            repository, commit_sha, change = change_description,
                             "CRITICAL: hook permanently failed after {} attempts — the receiver may be out of sync",
                             attempts
                         );
@@ -290,19 +313,29 @@ impl HookDelivery {
     }
 
     /// Builds the JSON payload for one file change. The envelope fields
-    /// (`tenant_id`, `commit_sha`, `committed_at`) are identical across all
-    /// event kinds; the event-specific part is the `file` object — or, for
-    /// moves, a `from`/`to` pair so the receiver can carry entity identity
-    /// (and any attached metadata) across the rename instead of seeing an
-    /// unrelated delete + create.
+    /// (`collection_id`, `tenant_id`, `commit_sha`, `committed_at`) are
+    /// identical across all event kinds; the event-specific part is the `file`
+    /// object — or, for moves, a `from`/`to` pair so the receiver can carry
+    /// entity identity (and any attached metadata) across the rename instead
+    /// of seeing an unrelated delete + create.
+    ///
+    /// `collection_id` and `tenant_id` together are the repository's identity,
+    /// and together they are what a receiver must key on: hook order is
+    /// guaranteed per *repository*, so two collections sharing a tenant id
+    /// deliver on independent queues and would otherwise be indistinguishable.
     fn build_payload(
+        collection_id: &str,
         tenant_id: &str,
         commit_sha: &str,
         committed_at: &DateTime<Utc>,
         file_change: &FileChange,
     ) -> Value {
-        let mut payload = Map::with_capacity(5);
+        let mut payload = Map::with_capacity(6);
 
+        payload.insert(
+            "collection_id".to_string(),
+            Value::String(collection_id.to_string()),
+        );
         payload.insert(
             "tenant_id".to_string(),
             Value::String(tenant_id.to_string()),

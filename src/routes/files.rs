@@ -746,6 +746,7 @@ pub async fn write_file(
     state.hook_queue.enqueue(
         &lock_key,
         HookJob {
+            collection_id,
             tenant_id,
             commit_sha: commit_sha.clone(),
             committed_at: Utc::now(),
@@ -877,6 +878,7 @@ pub async fn delete_file(
     state.hook_queue.enqueue(
         &lock_key,
         HookJob {
+            collection_id,
             tenant_id,
             commit_sha: commit_sha.clone(),
             committed_at: Utc::now(),
@@ -1049,6 +1051,7 @@ pub async fn move_file(
     state.hook_queue.enqueue(
         &lock_key,
         HookJob {
+            collection_id,
             tenant_id,
             commit_sha: commit_sha.clone(),
             committed_at: Utc::now(),

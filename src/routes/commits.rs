@@ -209,6 +209,7 @@ pub async fn revert_commit(
     state.hook_queue.enqueue(
         &lock_key,
         HookJob {
+            collection_id,
             tenant_id,
             commit_sha: new_commit_sha.clone(),
             committed_at: Utc::now(),
@@ -302,6 +303,7 @@ pub async fn rollback_commit(
         state.hook_queue.enqueue(
             &lock_key,
             HookJob {
+                collection_id,
                 tenant_id,
                 commit_sha: new_commit_sha.clone(),
                 committed_at: Utc::now(),

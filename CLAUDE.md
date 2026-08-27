@@ -362,7 +362,8 @@ Log verbosity priority: `RUST_LOG` env var → `log_level` in config → `"info"
 - **Per-tenant in-memory mutex** (`DashMap<String, Arc<Mutex<()>>>`) serialises all write operations on the same repo; keyed as `"collection_id/tenant_id"`. Reads never acquire the lock.
 - **All git operations run in `spawn_blocking`** so they never stall the tokio executor.
 - **Hook delivery is asynchronous** — writes enqueue their hook job and return immediately, so they are never delayed by a slow hook receiver.
-- **Hook events are ordered per tenant** — each tenant has a dedicated in-memory queue with a single consumer task. Jobs are enqueued while the tenant write lock is still held, so hooks are delivered in exactly the order commits were accepted by this server; a later commit can never overtake an earlier one at the receiver (even one stuck in retries). Files within a single commit are delivered one hook at a time in order.
+- **Hook events are ordered per repository, and concurrent across repositories** — each `"{collection_id}/{tenant_id}"` gets a dedicated in-memory queue with exactly one consumer task, which awaits each job to full completion (every file, every retry, every backoff sleep) before taking the next. Jobs are enqueued while the tenant write lock is still held, so hooks are delivered in exactly the order commits were accepted by this server; a later commit can never overtake an earlier one at the receiver (even one stuck in retries). Files within a single commit are delivered one hook at a time in order. Different repositories are different tokio tasks, so a slow or down receiver for one never delays another — which is also why the payload carries `collection_id` alongside `tenant_id`: those two together are the ordering domain, and a receiver that keyed on `tenant_id` alone could interleave two collections' events for what looked like one tenant. The trade is unbounded latency, never lost ordering: a recursive delete of 10 000 files occupies its repository's queue for 10 000 sequential POSTs.
+- **One hook per file, never batched** — a commit's change set becomes one queue job, and the consumer sends one HTTP POST per change in it. Multi-file operations (revert, rollback, recursive folder delete/move) therefore fan out to one event per file rather than one summary event, so a receiver applies them file by file with no special-casing; a recursive move emits one `file.moved` per file, each with its own `from`/`to`, instead of a delete/create wave.
 - **Unchanged writes are no-ops** — a PUT with content identical to HEAD's blob creates no commit and fires no hook; the response returns HEAD's sha. Detection hashes the incoming content and compares blob oids, so nothing is read from or written to the object database or disk. Clients that blindly re-write unchanged files cannot pollute history with empty commits.
 - **Rename = single hook** — a `POST .../move` produces one `file.moved` event with both `from` and `to` paths, preserving entity identity in downstream systems.
 - **Folder operations are answered from git trees, never the filesystem** — a folder is a `Tree` entry in HEAD's tree exactly as a file is a `Blob` one, so "does this folder exist" and "which files are under it" are both plain tree lookups. Nothing in the prefix-path feature touches the working tree to *decide* anything (it is still mirrored afterwards, best-effort, so humans can inspect repos), which keeps the HEAD-is-authoritative rule intact: a stray on-disk folder cannot cause a commit, and a folder missing on disk cannot prevent one.
@@ -389,12 +390,15 @@ Log verbosity priority: `RUST_LOG` env var → `log_level` in config → `"info"
 
 ## Webhook payloads
 
-All payloads include `tenant_id`, `commit_sha`, and `committed_at`.
+All payloads include `collection_id`, `tenant_id`, `commit_sha`, and `committed_at`.
+
+`collection_id` and `tenant_id` together are the repository's identity, and together they are what a receiver must key its rows on. `tenant_id` alone is ambiguous — the same tenant id can exist under several collections, and those are separate repositories delivering on independent, separately-ordered queues.
 
 **file.created / file.updated**
 ```json
 {
   "event": "file.created",
+  "collection_id": "docs",
   "tenant_id": "acme",
   "commit_sha": "a3f9c1d",
   "committed_at": "2026-06-16T10:00:00Z",
@@ -406,6 +410,7 @@ All payloads include `tenant_id`, `commit_sha`, and `committed_at`.
 ```json
 {
   "event": "file.deleted",
+  "collection_id": "docs",
   "tenant_id": "acme",
   "commit_sha": "a3f9c1d",
   "committed_at": "2026-06-16T10:00:00Z",
@@ -417,6 +422,7 @@ All payloads include `tenant_id`, `commit_sha`, and `committed_at`.
 ```json
 {
   "event": "file.moved",
+  "collection_id": "docs",
   "tenant_id": "acme",
   "commit_sha": "b8d2e4a",
   "committed_at": "2026-06-16T10:01:00Z",
@@ -424,6 +430,25 @@ All payloads include `tenant_id`, `commit_sha`, and `committed_at`.
   "to": { "path": "docs/new.md", "content": "# Hello" }
 }
 ```
+
+### Delivery model
+
+**One event per file, always.** There is no batching or coalescing anywhere: a commit's change set becomes one `HookJob`, and the consumer sends one HTTP POST per file change in it. So a recursive folder delete of *N* files produces one commit and *N* `file.deleted` events; a recursive folder move produces one commit and *N* `file.moved` events, each carrying that file's own `from`/`to` so entity identity survives. The same holds for reverts and rollbacks, which have carried multi-file change sets since they were added.
+
+Per-file events are still subject to the `[hooks] events` subscription list — an event kind absent from that list is skipped, whether it came from a single-file or a recursive operation.
+
+**Delivery is strictly sequential per repository, and concurrent across repositories.** The chain that guarantees it:
+
+1. Jobs are enqueued *while the tenant write lock is still held*, so queue order equals commit order.
+2. Each queue key gets exactly one `mpsc` sender and exactly one consumer task (`DashMap<String, UnboundedSender<HookJob>>`, created on first use).
+3. That consumer `await`s each job to full completion — every file, every retry, every backoff sleep — before calling `recv()` again.
+4. Within a job, files are `await`ed one at a time in change-set order.
+
+Different keys are different tokio tasks, so they run concurrently — a slow or down receiver for one repository never delays another. The queue key is `"{collection_id}/{tenant_id}"`, the same composite key used for the write lock and maintenance slots, so all four subsystems agree on what "one repository" means.
+
+The cost of this ordering guarantee is that latency is not bounded: a recursive delete of 10 000 files occupies that repository's queue for 10 000 sequential POSTs, and a receiver stuck in retries holds up every later commit for that repository. That is the intended trade — ordering beats latency, and a receiver applying events as they arrive always converges — but it is why recursion is opt-in per request.
+
+Log lines from the delivery path name the repository as `repository="collection_id/tenant_id"` rather than by tenant alone, so the CRITICAL permanent-failure line identifies exactly which repository may now be out of sync.
 
 ## Running
 
