@@ -77,6 +77,21 @@ pub struct FileCounts {
     pub directories: usize,
 }
 
+/// What a path resolves to in HEAD's tree. Answered from tree objects alone
+/// — a tree entry already carries its kind, so no blob is opened and the
+/// working tree is never consulted (HEAD is authoritative everywhere in this
+/// API, and a folder is a `Tree` entry exactly like a file is a `Blob` one).
+///
+/// `Missing` covers both "no such entry" and "an entry of some other kind"
+/// (a submodule, a symlink target git records as a commit): neither a file
+/// nor a folder this API can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKind {
+    File,
+    Directory,
+    Missing,
+}
+
 /// Which git date a listing's date-range filter keys off. Both are derived
 /// from commit history (a tree object carries no timestamp), so any listing
 /// carrying a date bound pays for a history walk — see
@@ -403,6 +418,53 @@ impl GitUtils {
         };
 
         window
+    }
+
+    /// Resolves `dir_path` to a tree in `tree` and collects every blob
+    /// beneath it, recursively, as `(full path from the repo root, blob oid)`
+    /// pairs in git's own tree order.
+    ///
+    /// Drives the recursive delete and move: the oids are what let the new
+    /// commit reuse existing blobs verbatim (no content rehash), and the paths
+    /// are what the per-file hooks are built from. Blob *content* is never
+    /// read here — only entry names, kinds and oids, all already in the tree
+    /// objects. Non-blob leaves (submodules) are skipped: this API has no
+    /// representation for them, so a folder holding one moves or deletes its
+    /// files and leaves the submodule entry to be dropped with the subtree.
+    fn subtree_blob_paths(
+        repo: &Repository,
+        tree: &git2::Tree<'_>,
+        dir_path: &str,
+    ) -> Result<Vec<(String, Oid)>, AppError> {
+        let tree_entry =
+            tree.get_path(Path::new(dir_path))
+                .map_err(|_err| AppError::FileNotFound {
+                    path: dir_path.to_string(),
+                })?;
+
+        let subtree = repo
+            .find_tree(tree_entry.id())
+            .map_err(|_err| AppError::FileNotFound {
+                path: dir_path.to_string(),
+            })?;
+
+        let mut blobs: Vec<(String, Oid)> = Vec::new();
+
+        subtree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            if entry.kind() == Some(git2::ObjectType::Blob) {
+                if let Ok(name) = entry.name() {
+                    // `root` is the path relative to `subtree`, already
+                    // slash-terminated ("" at the top level, "sub/" below).
+                    blobs.push((format!("{}/{}{}", dir_path, root, name), entry.id()));
+                }
+            }
+
+            git2::TreeWalkResult::Ok
+        })?;
+
+        tracing::trace!(path = %dir_path, file_count = blobs.len(), "collected subtree blobs");
+
+        Ok(blobs)
     }
 
     fn path_string(path: Option<&Path>) -> String {
@@ -1756,32 +1818,38 @@ impl GitFiles {
             .collect()
     }
 
-    /// Checks that a file exists in HEAD's tree without reading its content.
-    /// Returns `FileNotFound` when the path is absent or resolves to a folder.
-    pub fn file_exists(repo_path: &Path, tenant_id: &str, file_path: &str) -> Result<(), AppError> {
-        tracing::debug!(tenant_id = %tenant_id, path = %file_path, "checking file existence");
+    /// Classifies what `path` resolves to in HEAD's tree — a file, a folder,
+    /// or nothing at all — without reading any content.
+    ///
+    /// This is the single primitive behind both the existence endpoint (which
+    /// decides from the kind whether to answer `200` or `404`) and the
+    /// recursion-enabled delete/move routes (which decide from it whether to
+    /// run the single-file or the whole-folder operation). A missing *tenant*
+    /// is still an error rather than `Missing`: the caller is asking about a
+    /// repository that does not exist, which is a different answer from "that
+    /// path is not in this repository".
+    pub fn path_kind(repo_path: &Path, tenant_id: &str, path: &str) -> Result<PathKind, AppError> {
+        tracing::debug!(tenant_id = %tenant_id, path = %path, "classifying path");
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
         let head_commit = repo.head()?.peel_to_commit()?;
 
-        tracing::trace!(tenant_id = %tenant_id, path = %file_path, head_sha = %head_commit.id(), "resolved HEAD for existence check");
+        tracing::trace!(tenant_id = %tenant_id, path = %path, head_sha = %head_commit.id(), "resolved HEAD for path classification");
 
         let head_tree = head_commit.tree()?;
 
-        let tree_entry =
-            head_tree
-                .get_path(Path::new(file_path))
-                .map_err(|_err| AppError::FileNotFound {
-                    path: file_path.to_string(),
-                })?;
+        let kind = match head_tree.get_path(Path::new(path)) {
+            Ok(entry) => match entry.kind() {
+                Some(git2::ObjectType::Blob) => PathKind::File,
+                Some(git2::ObjectType::Tree) => PathKind::Directory,
+                _ => PathKind::Missing,
+            },
+            Err(_absent) => PathKind::Missing,
+        };
 
-        if tree_entry.kind() != Some(git2::ObjectType::Blob) {
-            return Err(AppError::FileNotFound {
-                path: file_path.to_string(),
-            });
-        }
+        tracing::debug!(tenant_id = %tenant_id, path = %path, kind = ?kind, "path classified");
 
-        Ok(())
+        Ok(kind)
     }
 
     /// Writes a file to disk, stages it, and creates a commit.
@@ -1982,6 +2050,106 @@ impl GitFiles {
         ))
     }
 
+    /// Removes a whole folder — every file beneath it, recursively — in a
+    /// single commit, and returns one `FileChange::Deleted` per file so
+    /// downstream systems see each entity disappear individually.
+    ///
+    /// This is the recursive counterpart of [`Self::delete_file`], reached
+    /// only when the caller opted in with `allow_prefix_path_recurse: true`
+    /// *and* the path resolves to a folder. It is deliberately a separate
+    /// function rather than a mode flag on `delete_file`: the two have
+    /// different scopes (one path versus a whole subtree) and different blast
+    /// radii, so each keeps one unambiguous meaning.
+    ///
+    /// The commit tree is HEAD's tree minus the single directory entry —
+    /// libgit2's tree updater drops the whole subtree with it, and prunes any
+    /// parent directory the removal leaves empty. Cost is therefore
+    /// proportional to the path depth, not to the number of files removed;
+    /// only the hook list scales with the file count.
+    pub fn delete_directory(
+        repo_path: &Path,
+        tenant_id: &str,
+        dir_path: &str,
+        commit_message: Option<&str>,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<(String, Vec<FileChange>), AppError> {
+        tracing::debug!(tenant_id = %tenant_id, path = %dir_path, author_name = %author_name, author_email = %author_email, "deleting directory recursively");
+
+        let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
+
+        let parent_commit = repo.head()?.peel_to_commit()?;
+        let head_tree = parent_commit.tree()?;
+
+        // Existence and kind are decided from HEAD's tree, never from the
+        // working tree — a stray on-disk folder is not a reason to commit.
+        match head_tree.get_path(Path::new(dir_path)) {
+            Ok(entry) if entry.kind() == Some(git2::ObjectType::Tree) => {}
+            _ => {
+                tracing::debug!(tenant_id = %tenant_id, path = %dir_path, "directory not found for recursive deletion");
+
+                return Err(AppError::FileNotFound {
+                    path: dir_path.to_string(),
+                });
+            }
+        }
+
+        let blobs = GitUtils::subtree_blob_paths(&repo, &head_tree, dir_path)?;
+
+        // Git has no empty trees, so this only happens for a folder holding
+        // nothing but entries this API cannot represent. Nothing to report
+        // downstream means nothing worth committing — same contract as an
+        // unchanged PUT.
+        if blobs.is_empty() {
+            tracing::debug!(tenant_id = %tenant_id, path = %dir_path, "directory holds no files, skipping commit");
+
+            return Ok((parent_commit.id().to_string(), Vec::new()));
+        }
+
+        tracing::debug!(tenant_id = %tenant_id, path = %dir_path, file_count = blobs.len(), "staging recursive directory deletion");
+
+        // A folder already missing from the working tree just means the
+        // working tree had diverged from HEAD; HEAD is what counts.
+        match std::fs::remove_dir_all(repo_path.join(dir_path)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(AppError::Io(err)),
+        }
+
+        let tree_id = TreeUpdateBuilder::new()
+            .remove(dir_path)
+            .create_updated(&repo, &head_tree)?;
+
+        let tree = repo.find_tree(tree_id)?;
+        let signature = GitUtils::git_signature(author_name, author_email)?;
+
+        // The trailing slash marks this as a folder-wide deletion, so a
+        // reader of the history can tell it apart from a single-file one.
+        let auto_message = format!("delete: {}/", dir_path);
+        let message = commit_message.unwrap_or(&auto_message);
+
+        tracing::trace!(tenant_id = %tenant_id, path = %dir_path, message = %message, "committing recursive directory deletion");
+
+        let commit_oid = repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &[&parent_commit],
+        )?;
+
+        tracing::debug!(tenant_id = %tenant_id, path = %dir_path, sha = %commit_oid, file_count = blobs.len(), "recursive directory deletion committed");
+
+        Ok((
+            commit_oid.to_string(),
+            blobs
+                .into_iter()
+                .map(|(path, _oid)| FileChange::Deleted { path })
+                .collect(),
+        ))
+    }
+
     /// Renames a file on disk, stages both sides, and creates a single commit.
     /// This preserves rename semantics so hook receivers know an entity was moved.
     ///
@@ -2113,6 +2281,200 @@ impl GitFiles {
                 content,
             },
         ))
+    }
+
+    /// Relocates a whole folder — every file beneath it, recursively — in a
+    /// single commit, and returns one `FileChange::Moved` per file so
+    /// downstream systems keep each entity's identity across the rename
+    /// instead of seeing a wave of deletes followed by unrelated creates.
+    ///
+    /// This is the recursive counterpart of [`Self::move_file`], reached only
+    /// when the caller opted in with `allow_prefix_path_recurse: true` *and*
+    /// the source path resolves to a folder. Each file keeps its own leaf
+    /// name — only the ancestor prefix changes — so extensions are preserved
+    /// by construction and the `limits.allowed_extensions` whitelist has
+    /// nothing left to guard (the destination is a folder path, which carries
+    /// no extension of its own).
+    ///
+    /// The destination must not exist in any form, and must not sit *inside*
+    /// the source (which would ask the folder to be moved into itself).
+    /// Blob oids are reused verbatim, so no content is rehashed; content is
+    /// read once per file purely to fill that file's hook payload, exactly as
+    /// the single-file move does.
+    pub fn move_directory(
+        repo_path: &Path,
+        tenant_id: &str,
+        from_path: &str,
+        to_path: &str,
+        commit_message: Option<&str>,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<(String, Vec<FileChange>), AppError> {
+        tracing::debug!(
+            tenant_id = %tenant_id,
+            from_path = %from_path,
+            to_path = %to_path,
+            author_email = %author_email,
+            "moving directory recursively"
+        );
+
+        let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
+
+        if from_path == to_path {
+            tracing::debug!(tenant_id = %tenant_id, path = %from_path, "directory move rejected: source and destination are identical");
+
+            return Err(AppError::InvalidOperation {
+                reason: "destination must differ from source path".to_string(),
+            });
+        }
+
+        // Moving a folder under itself has no coherent result: the source
+        // subtree would have to contain its own relocated copy.
+        if to_path.starts_with(&format!("{}/", from_path)) {
+            tracing::debug!(tenant_id = %tenant_id, from_path = %from_path, to_path = %to_path, "directory move rejected: destination is inside the source");
+
+            return Err(AppError::InvalidOperation {
+                reason: format!(
+                    "destination must not be inside the source directory: {}",
+                    to_path
+                ),
+            });
+        }
+
+        let parent_commit = repo.head()?.peel_to_commit()?;
+        let head_tree = parent_commit.tree()?;
+
+        // Existence and kind are decided from HEAD's tree, never from the
+        // working tree.
+        match head_tree.get_path(Path::new(from_path)) {
+            Ok(entry) if entry.kind() == Some(git2::ObjectType::Tree) => {}
+            _ => {
+                tracing::debug!(tenant_id = %tenant_id, from_path = %from_path, "source directory not found for move");
+
+                return Err(AppError::FileNotFound {
+                    path: from_path.to_string(),
+                });
+            }
+        }
+
+        // Refuse to merge into an existing destination, whether it is a file
+        // or a folder — the caller must delete it first. This also rules out
+        // the mirror case of the check above (the source sitting inside the
+        // destination), since any ancestor of the source necessarily exists.
+        if head_tree.get_path(Path::new(to_path)).is_ok() {
+            tracing::debug!(tenant_id = %tenant_id, to_path = %to_path, "directory move rejected: destination already exists");
+
+            return Err(AppError::InvalidOperation {
+                reason: format!("destination already exists: {}", to_path),
+            });
+        }
+
+        let blobs = GitUtils::subtree_blob_paths(&repo, &head_tree, from_path)?;
+
+        // Nothing this API can represent lives under the folder, so there is
+        // nothing to report downstream and nothing worth committing.
+        if blobs.is_empty() {
+            tracing::debug!(tenant_id = %tenant_id, from_path = %from_path, "source directory holds no files, skipping commit");
+
+            return Ok((parent_commit.id().to_string(), Vec::new()));
+        }
+
+        tracing::debug!(
+            tenant_id = %tenant_id,
+            from_path = %from_path,
+            to_path = %to_path,
+            file_count = blobs.len(),
+            "staging recursive directory move"
+        );
+
+        // The commit tree is HEAD's tree with the source folder dropped and
+        // every one of its blobs re-attached under the destination prefix,
+        // reusing the existing oids — no content rehash, no index round-trip.
+        let mut tree_update = TreeUpdateBuilder::new();
+
+        tree_update.remove(from_path);
+
+        let mut file_changes: Vec<FileChange> = Vec::with_capacity(blobs.len());
+
+        for (source_path, blob_oid) in &blobs {
+            // Every collected path starts with `from_path/`, so swapping that
+            // prefix for `to_path` keeps each file's leaf name — and thus its
+            // extension and downstream identity — intact.
+            let relative_path = source_path
+                .strip_prefix(from_path)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .unwrap_or(source_path);
+
+            let destination_path = format!("{}/{}", to_path, relative_path);
+
+            // Content comes from HEAD's blob — the authoritative state —
+            // rather than whatever the working tree currently holds. It is
+            // needed for this file's hook payload either way.
+            let content = GitUtils::blob_content_from_tree(&repo, &head_tree, source_path)?;
+
+            let absolute_destination = repo_path.join(&destination_path);
+
+            if let Some(parent_dir) = absolute_destination.parent() {
+                std::fs::create_dir_all(parent_dir)?;
+            }
+
+            std::fs::write(&absolute_destination, &content)?;
+
+            tree_update.upsert(&destination_path, *blob_oid, FileMode::Blob);
+
+            file_changes.push(FileChange::Moved {
+                from_path: source_path.clone(),
+                to_path: destination_path,
+                content,
+            });
+        }
+
+        // The destination is never inside the source (rejected above), so the
+        // freshly written files cannot be swept away by this cleanup. A
+        // folder already missing on disk just means the working tree had
+        // diverged from HEAD.
+        match std::fs::remove_dir_all(repo_path.join(from_path)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(AppError::Io(err)),
+        }
+
+        let tree_id = tree_update.create_updated(&repo, &head_tree)?;
+        let tree = repo.find_tree(tree_id)?;
+        let signature = GitUtils::git_signature(author_name, author_email)?;
+
+        // Trailing slashes mark this as a folder-wide move, so a reader of the
+        // history can tell it apart from a single-file one.
+        let auto_message = format!("move: {}/ -> {}/", from_path, to_path);
+        let message = commit_message.unwrap_or(&auto_message);
+
+        tracing::trace!(
+            tenant_id = %tenant_id,
+            from_path = %from_path,
+            to_path = %to_path,
+            message = %message,
+            "committing recursive directory move"
+        );
+
+        let commit_oid = repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &[&parent_commit],
+        )?;
+
+        tracing::debug!(
+            tenant_id = %tenant_id,
+            from_path = %from_path,
+            to_path = %to_path,
+            sha = %commit_oid,
+            file_count = file_changes.len(),
+            "recursive directory move committed"
+        );
+
+        Ok((commit_oid.to_string(), file_changes))
     }
 }
 

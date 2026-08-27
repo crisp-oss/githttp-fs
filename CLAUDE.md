@@ -39,10 +39,10 @@ All routes are prefixed `/v1` and require `Authorization: Bearer <api_key>`.
 | `GET` | `/v1/:collection_id/:tenant_id/count/files?prefix_path=&maximum_depth=&include_hidden_files=&restrict_file_extensions=` | Count files and directories; `prefix_path`, `maximum_depth`, and `include_hidden_files` carry the same semantics as on the file listing route; optional `restrict_file_extensions` (a stringified JSON array, e.g. `["md", "mdx"]`) narrows the file count to files with one of those extensions |
 | `GET` | `/v1/:collection_id/:tenant_id/files/*path?seek_from_line_starts_with=&seek_to_line_starts_with=&seek_lines_maximum=` | Read file content; optional `seek_*` parameters narrow the response to a line window (see below) |
 | `POST` | `/v1/:collection_id/:tenant_id/batch/files/read` | Batch-read several files in one request, with an optional shared seek window (overridable per file); capped by `limits.batch_read_maximum_files` |
-| `HEAD` | `/v1/:collection_id/:tenant_id/files/*path` | Check that a file exists (`200` or `404`, no body) |
+| `HEAD` | `/v1/:collection_id/:tenant_id/files/*path?check_prefix_path=` | Check that a file exists (`200` or `404`, no body); optional `check_prefix_path` (default `false`) makes a folder at that path count as existing too |
 | `PUT` | `/v1/:collection_id/:tenant_id/files/*path` | Create or update a file |
-| `DELETE` | `/v1/:collection_id/:tenant_id/files/*path` | Delete a file |
-| `POST` | `/v1/:collection_id/:tenant_id/files/*path/move` | Move / rename a file |
+| `DELETE` | `/v1/:collection_id/:tenant_id/files/*path` | Delete a file; the optional body flag `allow_prefix_path_recurse` (default `false`) lets the path name a folder instead, deleting every file beneath it recursively in one commit |
+| `POST` | `/v1/:collection_id/:tenant_id/files/*path/move` | Move / rename a file; the optional body flag `allow_prefix_path_recurse` (default `false`) lets the source name a folder instead, relocating its whole subtree in one commit |
 | `GET` | `/v1/:collection_id/:tenant_id/commits?page=&per_page=&file_path=&include_statistics=` | List commits, paginated (default 100, max 500); optional `file_path` filters to commits touching that file, following renames backward; optional `include_statistics` adds per-commit insertion/deletion/files-changed counts |
 | `GET` | `/v1/:collection_id/:tenant_id/commits/:sha` | Commit detail with per-file diffs and snapshots |
 | `POST` | `/v1/:collection_id/:tenant_id/commits/:sha/revert` | Revert a commit |
@@ -65,7 +65,8 @@ All write requests share a required `author` object. `message` is optional every
 ```json
 {
   "author": { "name": "Valerian Saliou", "email": "valerian@example.com" },
-  "message": "optional commit message"
+  "message": "optional commit message",
+  "allow_prefix_path_recurse": false
 }
 ```
 
@@ -74,9 +75,12 @@ All write requests share a required `author` object. `message` is optional every
 {
   "author": { "name": "Valerian Saliou", "email": "valerian@example.com" },
   "destination": "new/path/to/file.md",
-  "message": "optional commit message"
+  "message": "optional commit message",
+  "allow_prefix_path_recurse": false
 }
 ```
+
+`allow_prefix_path_recurse` is optional on both and defaults to `false`. See [Prefix-path (folder) operations](#prefix-path-folder-operations) below for what it permits.
 
 **POST** `/commits/:sha/revert` — revert a commit
 ```json
@@ -196,12 +200,35 @@ The `files` array is index-aligned with the request's `files` array. Each slot i
 
 **HEAD** `/files/*path` — check file existence. Responds `200` with an empty body when the file exists in the last committed state, `404` when it doesn't (including when the path points to a folder or the tenant doesn't exist). Blob content is never loaded, so this is cheaper than a GET.
 
+The optional `check_prefix_path` query parameter (default `false`) widens the question from "is there a file here" to "is there anything here": with `check_prefix_path=true` a path resolving to a *folder* also answers `200`. This is the check a caller makes before recursing a delete or a move. Both kinds are read from the same HEAD tree entry — a folder is a tree entry exactly as a file is a blob entry — so the answer still costs one tree lookup and opens no blob; the filesystem is never consulted. With the parameter on, a trailing slash on the path is tolerated (`/docs/guides/` and `/docs/guides` are the same folder). The route cannot distinguish *which* kind matched: it is a bare `200`/`404`, so a caller that needs to know should read the parent's file listing.
+
+### Prefix-path (folder) operations
+
+The delete and move routes act on a single file by default. Setting `"allow_prefix_path_recurse": true` **in the request body** lets the same route act on a whole folder instead, and it is opt-in precisely because the operation is heavy and destructive — one request can rewrite or remove an unbounded number of files.
+
+It is a body field, not a query parameter, because it changes *what the write does* — it belongs with `author`, `message`, and `destination`. Query parameters on this API shape reads (scoping, filtering, windowing); no write takes one. The existence check is the exception that proves the rule: `check_prefix_path` is a query parameter because `HEAD` carries no body at all.
+
+The parameter does not *force* folder semantics; it only permits them. The route classifies the path against HEAD's tree under the tenant write lock and dispatches accordingly: a path resolving to a file runs the ordinary single-file operation, unchanged, and a path resolving to nothing answers `404` as usual. Only a path resolving to a folder enters the recursive operation. With the parameter absent or `false`, a folder path is simply "not a file" and answers `404` — so recursion can never be entered by accident. A trailing slash on the path (and, on the move route, on `destination`) is tolerated when the parameter is on.
+
+Both recursive operations produce **exactly one commit** and **one hook per file**, delivered in order, so a downstream receiver applies them file by file and converges to the right state:
+
+- **Recursive delete** — every file beneath the folder is removed. The commit tree is HEAD's tree minus the single directory entry (git's tree updater drops the subtree with it and prunes any parent directory left empty), so commit cost is proportional to path depth, not to the number of files removed; only the hook list scales with the file count. Auto-generated message: `"delete: docs/guides/"` — the trailing slash distinguishes a folder-wide deletion from a single-file one. One `file.deleted` hook fires per file.
+- **Recursive move** — the folder's whole subtree is relocated under `destination`. Every file keeps its own leaf name (only the ancestor prefix changes), so one `file.moved` hook fires per file and downstream entity identity survives the move. Blob oids are reused verbatim (no content rehash); content is read once per file purely to fill that file's hook payload, exactly as the single-file move does. Auto-generated message: `"move: docs/guides/ -> docs/handbook/"`. The `destination` must not exist in any form (file or folder — the caller must delete it first) and must not sit *inside* the source, which would ask the folder to be moved into itself; both are a `400`.
+
+The `limits.allowed_extensions` whitelist is not applied to a folder `destination` — it carries no extension of its own, and every file inside keeps its leaf name, so extensions are preserved by construction. It still applies normally when the source turns out to be a file, even with the parameter on (the check is simply deferred until the source kind is known).
+
+A folder holding nothing this API can represent (no blobs at all — only submodule entries) is a no-op on both routes: no commit, no hook, and `commit_sha` is current HEAD, same contract as an unchanged PUT.
+
+The repository root is not addressable: an empty path (`/` after sanitisation) is a `400` on both routes. Deleting everything remains the tenant route's job.
+
 **PUT / DELETE / POST move** — write result
 ```json
 { "commit_sha": "a3f9c1d" }
 ```
 
 A PUT whose `content` is byte-for-byte identical to what the file already holds is a no-op: no commit is created, no hook fires, and the response carries the current HEAD sha (the commit whose tree already contains that exact content).
+
+A recursive delete or move returns the same single `commit_sha` — the whole folder travels in one commit regardless of how many files it holds.
 
 **GET** `/commits` — commit list
 ```json
@@ -294,7 +321,9 @@ log_level = "debug"
 # Optional whitelist of file extensions (compared case-insensitively) accepted
 # on PUT paths and move destinations; other extensions are rejected with 400.
 # Unset means all extensions are accepted. Move sources are not checked, so
-# files written before the whitelist was configured remain movable.
+# files written before the whitelist was configured remain movable. A folder
+# move destination is not checked either — it carries no extension, and the
+# files inside keep their own leaf names.
 allowed_extensions = ["md", "mdx"]
 # Safety cap on how many files one batch read request may ask for; larger
 # requests are rejected with 400. Defaults to 100 if unset.
@@ -336,6 +365,10 @@ Log verbosity priority: `RUST_LOG` env var → `log_level` in config → `"info"
 - **Hook events are ordered per tenant** — each tenant has a dedicated in-memory queue with a single consumer task. Jobs are enqueued while the tenant write lock is still held, so hooks are delivered in exactly the order commits were accepted by this server; a later commit can never overtake an earlier one at the receiver (even one stuck in retries). Files within a single commit are delivered one hook at a time in order.
 - **Unchanged writes are no-ops** — a PUT with content identical to HEAD's blob creates no commit and fires no hook; the response returns HEAD's sha. Detection hashes the incoming content and compares blob oids, so nothing is read from or written to the object database or disk. Clients that blindly re-write unchanged files cannot pollute history with empty commits.
 - **Rename = single hook** — a `POST .../move` produces one `file.moved` event with both `from` and `to` paths, preserving entity identity in downstream systems.
+- **Folder operations are answered from git trees, never the filesystem** — a folder is a `Tree` entry in HEAD's tree exactly as a file is a `Blob` one, so "does this folder exist" and "which files are under it" are both plain tree lookups. Nothing in the prefix-path feature touches the working tree to *decide* anything (it is still mirrored afterwards, best-effort, so humans can inspect repos), which keeps the HEAD-is-authoritative rule intact: a stray on-disk folder cannot cause a commit, and a folder missing on disk cannot prevent one.
+- **Recursion is opt-in per request, and the flag only permits — never forces** — `allow_prefix_path_recurse` on delete/move (and `check_prefix_path` on the existence check) default to `false`, so a folder path keeps answering `404` for every caller that has not asked for the new behaviour. The delete/move flag travels in the **request body**, not the query string: it changes what the write does, so it belongs beside `author`/`message`/`destination`, and it keeps the rule that query parameters on this API only ever shape reads. `check_prefix_path` is a query parameter solely because `HEAD` carries no body. With the flag on, the route classifies the path against HEAD's tree *under the tenant write lock* (so the classification cannot go stale before the commit it drives) and dispatches to the single-file or the whole-folder operation; the classification lookup is only paid for when the flag is set. The two flag names differ deliberately: the existence check merely widens what counts as existing, whereas delete/move gain an unbounded, destructive mode, and the name should say so at the call site.
+- **Folder delete/move are their own git functions, not modes** — `delete_directory`/`move_directory` sit beside `delete_file`/`move_file` rather than behind a boolean on them, mirroring the revert/rollback split: each function has one unambiguous scope and blast radius. The recursive delete removes a *single* directory entry from HEAD's tree (libgit2's tree updater drops the subtree with it and prunes parents left empty), so commit cost stays proportional to path depth rather than to the number of files removed. The recursive move reuses every blob oid verbatim, so no content is rehashed. In both, only the hook list scales with the file count — which is also the feature's real cost ceiling, since a moved folder's hook payloads hold each file's content in memory (the same exposure `rollback_commit` already carries for a large commit).
+- **A folder rename stays a rename, file by file** — a recursive move emits one `file.moved` event per file rather than a delete/create wave, because each file keeps its leaf name and only its ancestor prefix changes. Downstream systems therefore keep whatever metadata they had attached to every file in the folder. The destination must not exist in any form and must not sit inside the source; the whitelist is skipped on a folder destination (it has no extension, and the leaf names it would guard are unchanged) but still enforced when the source turns out to be a file.
 - **Revert = new commit** — reverts never rewrite history; they produce a new inverse commit and fire the appropriate hooks for each changed file.
 - **Rollback is its own route, distinct from revert** — `POST /commits/:sha/rollback` restores the files `:sha` touched to the state they had *at* it; `POST /commits/:sha/revert` undoes what `:sha` did. Both derive their scope from the commit's own change set (so neither takes paths in its body) and differ only in which side of it is read — `:sha`'s tree vs `parent(:sha)`'s — but they are separate routes rather than one route with a mode flag, so each has one unambiguous meaning: revert undoes a change, rollback restores a point in time (discarding every later change to those same paths). Both are `POST`: like every write in this API they append a commit and never remove one. The rollback needs no parent commit, which is why rolling back *to* the initial commit is allowed where reverting it is not. Target states are staged onto current HEAD reusing existing blob oids — no rehash, no content read except the copy each hook payload needs — and, like an unchanged PUT, a path already holding its target state is skipped; when that leaves nothing to do, no commit is created, no hook fires, and maintenance is not armed.
 - **Author identity is caller-supplied** — every write request requires an `author` object with `name` and `email`. Both are stored in the git commit and validated as non-empty.

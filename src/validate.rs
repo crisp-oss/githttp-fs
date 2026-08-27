@@ -136,55 +136,18 @@ pub fn folder_path(raw: &str) -> Result<&str, AppError> {
         return Ok(path);
     }
 
-    // Component-wise inspection (rather than substring matching) is what
-    // makes this robust: `Path::components()` splits exactly the way the
-    // OS will interpret the path, so nothing can hide inside a segment.
-    for component in Path::new(path).components() {
-        match component {
-            Component::ParentDir => {
-                return Err(AppError::InvalidPath {
-                    reason: "path must not contain '..' components".to_string(),
-                });
-            }
-            Component::CurDir => {
-                return Err(AppError::InvalidPath {
-                    reason: "path must not contain '.' components".to_string(),
-                });
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(AppError::InvalidPath {
-                    reason: "path must be relative".to_string(),
-                });
-            }
-            Component::Normal(name) if name == ".git" => {
-                return Err(AppError::InvalidPath {
-                    reason: "path must not reference .git".to_string(),
-                });
-            }
-            _ => {}
-        }
-    }
+    reject_unsafe_components(path)?;
 
     Ok(path)
 }
 
-/// Strips a leading slash and rejects paths that try to escape the repo root
-/// or access git internals. Returns the sanitised relative path.
+/// Rejects any path component that would escape the repository root, reach
+/// git internals, or split one file's identity across two spellings.
 ///
-/// This runs on every `*path` URL segment and on move destinations. The
-/// sanitised path becomes the file's identity everywhere: on disk, in commit
-/// trees, in hook payloads, and in `file_path` history filters — which is
-/// why normalisation must be strict (two spellings of the same file would
-/// split its history and confuse downstream receivers).
-pub fn file_path(raw: &str) -> Result<&str, AppError> {
-    let path = raw.trim_start_matches('/');
-
-    if path.is_empty() {
-        return Err(AppError::InvalidPath {
-            reason: "path must not be empty".to_string(),
-        });
-    }
-
+/// Component-wise inspection (rather than substring matching) is what makes
+/// this robust: `Path::components()` splits exactly the way the OS will
+/// interpret the path, so nothing can hide inside a segment.
+fn reject_unsafe_components(path: &str) -> Result<(), AppError> {
     for component in Path::new(path).components() {
         match component {
             Component::ParentDir => {
@@ -213,6 +176,53 @@ pub fn file_path(raw: &str) -> Result<&str, AppError> {
             _ => {}
         }
     }
+
+    Ok(())
+}
+
+/// Strips a leading slash and rejects paths that try to escape the repo root
+/// or access git internals. Returns the sanitised relative path.
+///
+/// This runs on every `*path` URL segment and on move destinations. The
+/// sanitised path becomes the file's identity everywhere: on disk, in commit
+/// trees, in hook payloads, and in `file_path` history filters — which is
+/// why normalisation must be strict (two spellings of the same file would
+/// split its history and confuse downstream receivers).
+pub fn file_path(raw: &str) -> Result<&str, AppError> {
+    let path = raw.trim_start_matches('/');
+
+    if path.is_empty() {
+        return Err(AppError::InvalidPath {
+            reason: "path must not be empty".to_string(),
+        });
+    }
+
+    reject_unsafe_components(path)?;
+
+    Ok(path)
+}
+
+/// Same rules as [`file_path`], but trailing slashes are tolerated too, so the
+/// path may name either a file or a folder.
+///
+/// Used on the `*path` segment (and move destination) of the routes that
+/// accept a folder — the existence check with `check_prefix_path=true`, and
+/// the delete/move routes with `allow_prefix_path_recurse: true` — where
+/// callers naturally spell a folder as `docs/guides/`. The trailing slash is
+/// stripped rather than kept: `docs/guides` is the folder's identity in commit
+/// trees, and two spellings of the same folder must not diverge. An empty
+/// result is still rejected — the repository root is not a deletable or
+/// movable entry (that is what the tenant route is for).
+pub fn file_or_folder_path(raw: &str) -> Result<&str, AppError> {
+    let path = raw.trim_matches('/');
+
+    if path.is_empty() {
+        return Err(AppError::InvalidPath {
+            reason: "path must not be empty".to_string(),
+        });
+    }
+
+    reject_unsafe_components(path)?;
 
     Ok(path)
 }

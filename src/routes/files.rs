@@ -123,6 +123,15 @@ impl BatchReadFileRequest {
     }
 }
 
+/// Query parameters for the existence endpoint.
+#[derive(Deserialize)]
+pub struct FileExistsQuery {
+    /// When true, a path resolving to a folder counts as existing too, so the
+    /// endpoint answers "is there anything at this path" rather than "is there
+    /// a file at this path". Defaults to false — folders stay invisible.
+    pub check_prefix_path: Option<bool>,
+}
+
 #[derive(Deserialize)]
 pub struct WriteFileRequest {
     pub author: AuthorRequest,
@@ -134,6 +143,15 @@ pub struct WriteFileRequest {
 pub struct DeleteFileRequest {
     pub author: AuthorRequest,
     pub message: Option<String>,
+    /// When true and the path resolves to a folder, the deletion recurses over
+    /// every file beneath it, in one commit. Defaults to false, in which case
+    /// a folder path is simply "not a file" and answers `404` — so this heavy,
+    /// destructive mode can never be entered by accident.
+    ///
+    /// Lives in the body rather than the query string because it changes *what
+    /// the write does*, alongside `author` and `message`, instead of shaping a
+    /// read.
+    pub allow_prefix_path_recurse: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -141,6 +159,10 @@ pub struct MoveFileRequest {
     pub author: AuthorRequest,
     pub destination: String,
     pub message: Option<String>,
+    /// When true and the source path resolves to a folder, the whole subtree
+    /// is relocated under `destination`, in one commit. Same default and same
+    /// rationale for living in the body as its `DeleteFileRequest` namesake.
+    pub allow_prefix_path_recurse: Option<bool>,
 }
 
 /// Decodes the `file_name_starts_with` query value into its list of prefixes.
@@ -603,15 +625,31 @@ pub async fn batch_read_files(
 /// HEAD /:collection_id/:tenant_id/files/*path
 /// Returns 200 with no body when the file exists in HEAD, 404 otherwise.
 /// Cheaper than GET as the blob content is never loaded.
+///
+/// With `?check_prefix_path=true` a folder at that path counts as existing
+/// too — the answer becomes "is there anything here", which is what a caller
+/// about to recurse a delete or a move needs to know. Both kinds are read
+/// from HEAD's tree entry, so the check stays a single tree lookup either way.
 pub async fn file_exists(
     State(state): State<AppState>,
     Path((collection_id, tenant_id, file_path)): Path<(String, String, String)>,
+    Query(query): Query<FileExistsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let collection_id = validate::collection_id(&collection_id)?.to_string();
     let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
-    let file_path = validate::file_path(&file_path)?.to_string();
 
-    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %file_path, "handling file existence request");
+    let check_prefix_path = query.check_prefix_path.unwrap_or(false);
+
+    // Folders are naturally spelled with a trailing slash, so tolerate one
+    // once folders are in scope at all.
+    let file_path = if check_prefix_path {
+        validate::file_or_folder_path(&file_path)?
+    } else {
+        validate::file_path(&file_path)?
+    }
+    .to_string();
+
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %file_path, check_prefix_path = check_prefix_path, "handling file existence request");
 
     let repo_path = state
         .config
@@ -620,9 +658,17 @@ pub async fn file_exists(
         .join(&collection_id)
         .join(&tenant_id);
 
-    run_blocking(move || git::GitFiles::file_exists(&repo_path, &tenant_id, &file_path)).await?;
+    let file_path_for_task = file_path.clone();
 
-    Ok(StatusCode::OK)
+    let kind =
+        run_blocking(move || git::GitFiles::path_kind(&repo_path, &tenant_id, &file_path_for_task))
+            .await?;
+
+    match kind {
+        git::PathKind::File => Ok(StatusCode::OK),
+        git::PathKind::Directory if check_prefix_path => Ok(StatusCode::OK),
+        _ => Err(AppError::FileNotFound { path: file_path }),
+    }
 }
 
 /// PUT /:collection_id/:tenant_id/files/*path
@@ -716,6 +762,12 @@ pub async fn write_file(
 
 /// DELETE /:collection_id/:tenant_id/files/*path
 /// Deletes a file, commits the removal, and fires a hook.
+///
+/// With `allow_prefix_path_recurse: true` in the body the path may also name a
+/// folder, in which case every file beneath it is removed in one commit and
+/// one `file.deleted` hook fires per file. Without the opt-in a folder path is
+/// simply not a file and answers `404`, so this destructive mode is never
+/// entered by accident.
 pub async fn delete_file(
     State(state): State<AppState>,
     Path((collection_id, tenant_id, file_path)): Path<(String, String, String)>,
@@ -723,9 +775,19 @@ pub async fn delete_file(
 ) -> Result<impl IntoResponse, AppError> {
     let collection_id = validate::collection_id(&collection_id)?.to_string();
     let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
-    let file_path = validate::file_path(&file_path)?.to_string();
 
-    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %file_path, "handling delete file request");
+    let allow_prefix_path_recurse = body.allow_prefix_path_recurse.unwrap_or(false);
+
+    // Folders are naturally spelled with a trailing slash, so tolerate one
+    // once folders are in scope at all.
+    let file_path = if allow_prefix_path_recurse {
+        validate::file_or_folder_path(&file_path)?
+    } else {
+        validate::file_path(&file_path)?
+    }
+    .to_string();
+
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %file_path, allow_prefix_path_recurse = allow_prefix_path_recurse, "handling delete file request");
 
     let repo_path = state
         .config
@@ -738,24 +800,77 @@ pub async fn delete_file(
     let lock = state.get_repo_lock(&lock_key);
     let _lock_guard = lock.lock().await;
 
-    let DeleteFileRequest { author, message } = body;
+    let DeleteFileRequest {
+        author,
+        message,
+        allow_prefix_path_recurse: _,
+    } = body;
 
     let repo_path_for_maintenance = repo_path.clone();
+
+    // Which of the two operations to run is decided from HEAD's tree, under
+    // the write lock, so the classification cannot go stale before the commit
+    // it drives. The lookup is only paid for when the caller opted in — with
+    // recursion off the single-file path is unchanged, folder and all.
+    let recurse_directory = if allow_prefix_path_recurse {
+        let repo_path_for_kind = repo_path.clone();
+        let tenant_id_for_kind = tenant_id.clone();
+        let file_path_for_kind = file_path.clone();
+
+        let kind = run_blocking(move || {
+            git::GitFiles::path_kind(
+                &repo_path_for_kind,
+                &tenant_id_for_kind,
+                &file_path_for_kind,
+            )
+        })
+        .await?;
+
+        kind == git::PathKind::Directory
+    } else {
+        false
+    };
+
     let tenant_id_for_task = tenant_id.clone();
 
-    let (commit_sha, file_change) = run_blocking(move || {
-        git::GitFiles::delete_file(
-            &repo_path,
-            &tenant_id_for_task,
-            &file_path,
-            message.as_deref(),
-            &author.name,
-            &author.email,
-        )
-    })
-    .await?;
+    let (commit_sha, file_changes) = if recurse_directory {
+        run_blocking(move || {
+            git::GitFiles::delete_directory(
+                &repo_path,
+                &tenant_id_for_task,
+                &file_path,
+                message.as_deref(),
+                &author.name,
+                &author.email,
+            )
+        })
+        .await?
+    } else {
+        let (commit_sha, file_change) = run_blocking(move || {
+            git::GitFiles::delete_file(
+                &repo_path,
+                &tenant_id_for_task,
+                &file_path,
+                message.as_deref(),
+                &author.name,
+                &author.email,
+            )
+        })
+        .await?;
 
-    tracing::debug!(tenant_id = %tenant_id, sha = %commit_sha, "file deletion committed, enqueuing hook delivery");
+        (commit_sha, vec![file_change])
+    };
+
+    // An empty change list means no commit was created (only reachable on the
+    // recursive path, for a folder holding nothing this API represents), so
+    // there is nothing to sync and no new objects to consolidate.
+    if file_changes.is_empty() {
+        tracing::debug!(tenant_id = %tenant_id, sha = %commit_sha, "nothing to delete, no commit created");
+
+        return Ok((StatusCode::OK, Json(json!({ "commit_sha": commit_sha }))));
+    }
+
+    tracing::debug!(tenant_id = %tenant_id, sha = %commit_sha, file_count = file_changes.len(), "file deletion committed, enqueuing hook delivery");
 
     // Enqueued while the tenant write lock is still held, so per-tenant hook
     // order always matches commit order.
@@ -765,7 +880,7 @@ pub async fn delete_file(
             tenant_id,
             commit_sha: commit_sha.clone(),
             committed_at: Utc::now(),
-            file_changes: vec![file_change],
+            file_changes,
         },
     );
 
@@ -783,6 +898,12 @@ pub async fn delete_file(
 ///
 /// Axum cannot match a fixed suffix after a wildcard segment, so this handler
 /// is registered on POST `/*path` and enforces the `/move` suffix itself.
+///
+/// With `allow_prefix_path_recurse: true` in the body the source may also name
+/// a folder, in which case the whole folder is relocated in one commit and one
+/// `file.moved` hook fires per file — every file keeping its own leaf name, so
+/// downstream entity identity survives. Without the opt-in a folder source is
+/// simply not a file and answers `404`.
 pub async fn move_file(
     State(state): State<AppState>,
     Path((collection_id, tenant_id, raw_path)): Path<(String, String, String)>,
@@ -798,18 +919,37 @@ pub async fn move_file(
             reason: "POST on a file path must end with /move".to_string(),
         })?;
 
-    let from_path = validate::file_path(from_path_raw)?.to_string();
-    let to_path = validate::file_path(&body.destination)?.to_string();
+    let allow_prefix_path_recurse = body.allow_prefix_path_recurse.unwrap_or(false);
+
+    // Folders are naturally spelled with a trailing slash, so tolerate one on
+    // both sides once folders are in scope at all.
+    let (from_path, to_path) = if allow_prefix_path_recurse {
+        (
+            validate::file_or_folder_path(from_path_raw)?.to_string(),
+            validate::file_or_folder_path(&body.destination)?.to_string(),
+        )
+    } else {
+        (
+            validate::file_path(from_path_raw)?.to_string(),
+            validate::file_path(&body.destination)?.to_string(),
+        )
+    };
 
     // Only the destination is checked against the whitelist: files written
-    // before the whitelist was configured must remain movable.
-    validate::file_extension(&to_path, state.config.limits.allowed_extensions.as_deref())?;
+    // before the whitelist was configured must remain movable. With recursion
+    // enabled the check is deferred until the source kind is known — a folder
+    // destination carries no extension of its own, and the files inside keep
+    // their leaf names, so there is nothing there for the whitelist to guard.
+    if !allow_prefix_path_recurse {
+        validate::file_extension(&to_path, state.config.limits.allowed_extensions.as_deref())?;
+    }
 
     tracing::debug!(
         collection_id = %collection_id,
         tenant_id = %tenant_id,
         from_path = %from_path,
         to_path = %to_path,
+        allow_prefix_path_recurse = allow_prefix_path_recurse,
         "handling move file request"
     );
 
@@ -828,25 +968,81 @@ pub async fn move_file(
         author,
         destination: _,
         message,
+        allow_prefix_path_recurse: _,
     } = body;
 
     let repo_path_for_maintenance = repo_path.clone();
+
+    // Which of the two operations to run is decided from HEAD's tree, under
+    // the write lock, so the classification cannot go stale before the commit
+    // it drives. The lookup is only paid for when the caller opted in.
+    let recurse_directory = if allow_prefix_path_recurse {
+        let repo_path_for_kind = repo_path.clone();
+        let tenant_id_for_kind = tenant_id.clone();
+        let from_path_for_kind = from_path.clone();
+
+        let kind = run_blocking(move || {
+            git::GitFiles::path_kind(
+                &repo_path_for_kind,
+                &tenant_id_for_kind,
+                &from_path_for_kind,
+            )
+        })
+        .await?;
+
+        kind == git::PathKind::Directory
+    } else {
+        false
+    };
+
+    // The source turned out to be a file after all (or nothing at all), so
+    // the destination is a file path and the whitelist applies as usual.
+    if allow_prefix_path_recurse && !recurse_directory {
+        validate::file_extension(&to_path, state.config.limits.allowed_extensions.as_deref())?;
+    }
+
     let tenant_id_for_task = tenant_id.clone();
 
-    let (commit_sha, file_change) = run_blocking(move || {
-        git::GitFiles::move_file(
-            &repo_path,
-            &tenant_id_for_task,
-            &from_path,
-            &to_path,
-            message.as_deref(),
-            &author.name,
-            &author.email,
-        )
-    })
-    .await?;
+    let (commit_sha, file_changes) = if recurse_directory {
+        run_blocking(move || {
+            git::GitFiles::move_directory(
+                &repo_path,
+                &tenant_id_for_task,
+                &from_path,
+                &to_path,
+                message.as_deref(),
+                &author.name,
+                &author.email,
+            )
+        })
+        .await?
+    } else {
+        let (commit_sha, file_change) = run_blocking(move || {
+            git::GitFiles::move_file(
+                &repo_path,
+                &tenant_id_for_task,
+                &from_path,
+                &to_path,
+                message.as_deref(),
+                &author.name,
+                &author.email,
+            )
+        })
+        .await?;
 
-    tracing::debug!(tenant_id = %tenant_id, sha = %commit_sha, "file move committed, enqueuing hook delivery");
+        (commit_sha, vec![file_change])
+    };
+
+    // An empty change list means no commit was created (only reachable on the
+    // recursive path, for a folder holding nothing this API represents), so
+    // there is nothing to sync and no new objects to consolidate.
+    if file_changes.is_empty() {
+        tracing::debug!(tenant_id = %tenant_id, sha = %commit_sha, "nothing to move, no commit created");
+
+        return Ok((StatusCode::OK, Json(json!({ "commit_sha": commit_sha }))));
+    }
+
+    tracing::debug!(tenant_id = %tenant_id, sha = %commit_sha, file_count = file_changes.len(), "file move committed, enqueuing hook delivery");
 
     // Enqueued while the tenant write lock is still held, so per-tenant hook
     // order always matches commit order.
@@ -856,7 +1052,7 @@ pub async fn move_file(
             tenant_id,
             commit_sha: commit_sha.clone(),
             committed_at: Utc::now(),
-            file_changes: vec![file_change],
+            file_changes,
         },
     );
 
