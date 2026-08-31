@@ -25,6 +25,7 @@ src/
     mod.rs         — shared request types (AuthorRequest)
     files.rs       — GET/PUT/DELETE/POST on /:collection_id/:tenant_id/files and /:collection_id/:tenant_id/files/*path (POST dispatching on the /move and /reorder suffixes), plus POST /:collection_id/:tenant_id/batch/files/read and GET /:collection_id/:tenant_id/count/files
     order.rs       — GET/PUT/DELETE on /:collection_id/:tenant_id/order and /:collection_id/:tenant_id/order/*path
+    replay.rs      — POST /:collection_id/:tenant_id/batch/replay/hook (webhook replay for downstream reconciliation)
     commits.rs     — commit list, commit detail, revert / point-in-time rollback
     tenant.rs      — DELETE /:collection_id/:tenant_id
 ```
@@ -49,6 +50,7 @@ All routes are prefixed `/v1` and require `Authorization: Bearer <api_key>`.
 | `GET` | `/v1/:collection_id/:tenant_id/order` and `/v1/:collection_id/:tenant_id/order/*path` | Read the file order stored for a directory (`/order` being the repository root); `404` when it has none |
 | `PUT` | `/v1/:collection_id/:tenant_id/order` and `/v1/:collection_id/:tenant_id/order/*path` | Replace a directory's file order |
 | `DELETE` | `/v1/:collection_id/:tenant_id/order` and `/v1/:collection_id/:tenant_id/order/*path` | Drop a directory's file order, reverting it to the default listing order |
+| `POST` | `/v1/:collection_id/:tenant_id/batch/replay/hook` | Reconciliation: intersect the paths a downstream mirror holds with what this server holds, and replay one hook per file on the side `direction` selects — `delete` fires `file.deleted` for everything *outside* the intersection, `create` fires `file.created` for everything *inside* it. Optionally scoped and throttled. Commits nothing |
 | `GET` | `/v1/:collection_id/:tenant_id/commits?page=&per_page=&file_path=&include_statistics=` | List commits, paginated (default 100, max 500); optional `file_path` filters to commits touching that file, following renames backward; optional `include_statistics` adds per-commit insertion/deletion/files-changed counts |
 | `GET` | `/v1/:collection_id/:tenant_id/commits/:sha` | Commit detail with per-file diffs and snapshots |
 | `POST` | `/v1/:collection_id/:tenant_id/commits/:sha/revert` | Revert a commit |
@@ -148,6 +150,38 @@ Every entry must **exist in that directory** in the last committed state; an ent
 ```
 
 A directory with no stored order is a `404`: there is nothing to delete, and answering `200` would hide a caller mistake.
+
+**POST** `/batch/replay/hook` — replay file hooks to reconcile a downstream mirror (no `author`: nothing is committed)
+```json
+{
+  "direction": "delete",
+  "files": ["docs/intro.md", "docs/removed.md"],
+  "prefix_path": "/docs",
+  "include_hidden_files": false,
+  "delay_ms": 100
+}
+```
+
+One route, one set operation, two directions. `files` is the list of paths the **downstream mirror** currently holds — never a list of things to act on here. The server intersects it with what it actually holds, and `direction` picks which side of that intersection is replayed:
+
+| `direction` | Replays | Which files | Repairs |
+|-------------|---------|-------------|---------|
+| `delete` | `file.deleted` | Everything **outside** the intersection — the caller holds them, git does not | Orphaned rows the mirror kept after a missed deletion |
+| `create` | `file.created` | Everything **inside** it — git holds them, so the mirror should too | Rows the mirror is missing, or whose content went stale |
+
+`direction` is required and must be exactly `"delete"` or `"create"`; anything else is a `400`. Nothing on the git side is written in any way: no commit is created, no file is touched, and background maintenance is not armed. The response reports how many files the batch affected (see [Response shapes](#response-shapes)).
+
+`files` is **optional**, and omitting it defaults it to every file git holds in scope. The two directions then fall out very differently, and that asymmetry is inherent to the set operation rather than a special case: `create` covers the whole scope (the common "push everything you have at me" reconciliation), while `delete` produces nothing at all, since git cannot be missing what it just listed. Sending `"files": []` explicitly is a `400` — omit the field instead. Each path is sanitised with the same rules as the read route's `*path` and must be unique after sanitisation (duplicates are a `400`). A path naming an [order index](#file-order-index) is a `400` rather than being silently dropped: it cannot legitimately be in a mirror's list (the index is invisible to every `/files` route), and because hook events are classified by path, letting one through would reach the receiver as an `order.deleted` and wipe a directory's stored order on the strength of a caller mistake.
+
+`prefix_path` is optional and scopes the git-side snapshot to one folder, with the listing route's semantics (a non-existent folder scopes to nothing). Paths in `files` stay **repo-root-relative** — as they are everywhere else on this API and in every hook payload — so `prefix_path` acts as a guard rail rather than a join: an entry that does not sit under it is a `400`. Rejecting is what keeps both sides of the set operation on the same footing, since an out-of-scope entry would fall outside the intersection for a reason that has nothing to do with whether git holds it — and in the `delete` direction that reads as an orphan and drops a live row.
+
+`include_hidden_files` (default `false`) is only meaningful **when `files` is omitted**, where it shapes the default set exactly as on the listing route. When `files` *is* given, the git-side snapshot always includes hidden files no matter what the flag says, because the set operation needs git's set to be maximal: a file hidden from the snapshot would fall outside the intersection and replay a `file.deleted` for a file that is very much still there. Order indexes are excluded from the snapshot either way, exactly as they are from every `/files` route — `order.*` events are never replayed, and neither are `file.updated` or `file.moved`.
+
+`delay_ms` is optional. It pauses that many milliseconds *between* consecutive deliveries (never after the last one), capped at `60000`; a larger value is a `400`. It is a **throttle, not an ordering device** — hook delivery is already strictly sequential per repository — and it exists to spare a receiver from a sustained burst. Its cost is that a replay holds that repository's hook queue for `delay_ms × file_count`, so every commit accepted after the replay waits behind it. A caller wanting to go slower than the cap should replay in several `prefix_path`-scoped passes rather than raising the delay.
+
+The route answers `400` when no `[hooks]` receiver is configured at all: the job would deliver nothing, and answering `200` with a file count for a reconciliation that did nothing is worse than an error.
+
+One assumption the `create` direction makes about the receiver: since its replay set includes files the mirror already holds, the receiver must treat `file.created` as **insert-or-replace** rather than a bare `INSERT`. `created` rather than `updated` is deliberate — the case a replay is usually run for is a row the receiver never got, and an `UPDATE` handler would silently do nothing for exactly those.
 
 **POST** `/batch/files/read` — batch-read several files (no `author`: reads commit nothing)
 ```json
@@ -326,6 +360,22 @@ A PUT whose `content` is byte-for-byte identical to what the file already holds 
 
 A recursive delete or move returns the same single `commit_sha` — the whole folder travels in one commit regardless of how many files it holds.
 
+**POST** `/batch/replay/hook` — replay result
+```json
+{
+  "commit_sha": "a3f9c1d",
+  "files": 12
+}
+```
+
+`files` is the number of files the batch affected: how many `file.deleted` hooks will be replayed in the `delete` direction, or how many `file.created` ones in the `create` direction. `0` means the two sides already agreed on that side of the intersection, and nothing was enqueued.
+
+The affected paths themselves are not echoed: in the `create` direction the set is bounded by the repository rather than by the request, so a whole-tenant replay would answer with the entire file list for no benefit. A caller that wants to see it can ask `GET /files`.
+
+`commit_sha` is the HEAD the snapshot was taken from — no commit was created; it is the honest answer to "which state was this computed against".
+
+The response returns as soon as the job is enqueued — delivery happens on the repository's hook queue afterwards, so a `200` means "scheduled", not "delivered". Progress and completion are visible in the logs (`replay starting` / `replay finished`, with delivered and skipped counts).
+
 **GET** `/commits` — commit list
 ```json
 {
@@ -477,6 +527,13 @@ Log verbosity priority: `RUST_LOG` env var → `log_level` in config → `"info"
 - **An order change is a file change internally; the event kind is derived from the path** — every order operation returns an ordinary `FileChange` on the index's own path, and `HookJob::new` is the single place that recognises an order-index path and splits it out into an `OrderChange`. Classifying on the path rather than on the producing route is what makes every producer work with no special case: an explicit order write, a delete or move that rewrote an index alongside the file, a recursive folder operation carrying indexes inside its subtree, and a revert or rollback restoring an index out of history all arrive as plain file changes and leave correctly classified. Order events are delivered *after* every file event of the same commit, so an order snapshot never names a file the receiver has not been told about yet.
 - **Order upkeep is implicit and rides in the same commit** — deleting or moving a file or folder rewrites the affected directory's index in the very commit that moved the file, so a downstream order table can never hold a position for something that is gone. A rename inside one directory replaces the entry **in place** (demoting a file to the tail for changing its name would silently reorder content the caller only renamed); a cross-directory move appends to the destination index *only when one already exists* (creating one would pin a single file in a directory whose siblings are all implicitly ordered); an index left empty is removed rather than stored empty. Creating a file adds nothing — a new file is unlisted, which means "at the tail", so indexes stay sparse by default.
 - **Order events have no `moved` variant, deliberately** — a folder move relocates the indexes inside it, and `file.moved` exists precisely to preserve identity across a rename, yet a relocated index arrives as `order.deleted` at the old directory plus `order.updated` at the new one. The asymmetry is the point: a file is an entity a receiver hangs metadata off, whereas a directory's order list is just positions with no identity worth carrying, so a delete-plus-snapshot is both sufficient and one fewer event kind to support.
+- **Replay repairs a drifted mirror in place, never by wiping it** — hook delivery is durable only in memory, so a receiver that was down past its retry budget (or that mis-applied an event) ends up holding a state this server never agreed to. The obvious repair — wipe the mirror and replay everything — is lossy whenever the mirror holds metadata the repository does not, and it also breaks referential integrity and blanks the tenant for the duration. `POST /batch/replay/hook` therefore repairs in place, and covers both directions of drift with one set operation rather than two routes: the caller sends the paths it holds, the server intersects them with what git holds, and `direction` picks the side — `delete` replays a `file.deleted` for everything *outside* the intersection (the mirror's orphans), `create` a `file.created` for everything *inside* it (rows the mirror is missing, or whose content went stale). One route because the two take identical inputs and differ only in that single set operation; splitting them would duplicate the whole path-validation and snapshot topology to express a boolean. Omitting `files` defaults it to everything git holds, which makes `create` the whole-scope reconciliation and makes `delete` empty by construction — git cannot be missing what it just listed — an asymmetry that falls out of the set operation rather than needing a branch.
+- **The replay snapshot is maximal whenever the caller supplies a list** — `include_hidden_files` shapes only the *default* set used when `files` is omitted. When `files` is given, the git-side snapshot includes hidden files regardless of the flag, because the set operation needs git's side to be maximal: a file hidden from the snapshot would fall outside the intersection and, in the `delete` direction, replay a deletion for a file that is still there. `prefix_path` is a guard rail rather than a join for the same reason — paths stay repo-root-relative as they are everywhere else on this API, and an entry outside the prefix is a `400`, since it would otherwise fall outside the intersection for a reason having nothing to do with whether git holds it.
+- **The `create` direction replays `file.created`, not `file.updated`** — the case a replay is usually run for is a row the receiver never got, and an `UPDATE` handler would silently do nothing for exactly those. The trade is the one assumption the feature makes about the receiver: since the replay set includes files the mirror already holds, `file.created` must be treated as insert-or-replace rather than a bare `INSERT`. This is also why there is no `update` direction — it would repair strictly less than `create` does.
+- **A replay takes the tenant write lock even though it commits nothing** — reads on this API never lock, and a replay is a pure read, but it *enqueues*, and that is what changes the rule. Without the lock a PUT committing concurrently could have its `file.created` enqueued ahead of a replay whose snapshot predates it, and the receiver would apply a `file.deleted` for a path that had just been created — exactly the drift the feature exists to repair. Holding the lock across the snapshot and the enqueue makes the pair atomic with respect to commits, so queue order still equals the order this server accepted things. Nothing else about a write applies: no commit, no working-tree change, and maintenance is not armed.
+- **A replay carries paths, not content, and resolves each file at delivery** — every other `HookJob` materialises its payloads at commit time, which is correct when the change set is one commit's worth. A whole-repository replay would pin the entire corpus in memory until the job drained, and a `delay_ms` throttle can stretch that to hours, so `HookJob` splits into a `Commit` source and a `Replay` one: the replay job holds only paths plus the repository location, and the delivery task reads content in small chunks (64 files) just before those files' POSTs. Resident memory is bounded by the chunk rather than the repository, the repository is opened once per chunk rather than once per file, and the content delivered is fresh at delivery rather than hours stale. A file that vanished between the snapshot and its delivery is skipped, not an error — its real `file.deleted` is already queued behind the replay, so the receiver still converges. Unreadable content (invalid UTF-8) is likewise skipped with a warning, unlike the batch read route where it is a hard `422`: a batch read answers a caller who asked for exactly those files, whereas a replay runs unattended over thousands and must not abort on one.
+- **`delay_ms` throttles the receiver; it does not order anything** — delivery is already strictly sequential per repository (one consumer task awaiting every POST, retry and backoff before taking the next), so the parameter's only job is sparing a receiver from a sustained burst. It pauses *between* deliveries and never after the last one, and it is capped at 60 s per gap because a replay holds its repository's hook queue for `delay_ms × file_count` — an unbounded delay is an unbounded outage for every later commit's hooks. Going slower than the cap is a matter of several `prefix_path`-scoped passes, not a larger number.
+- **Replayed payloads are marked, not renamed** — a replayed event keeps its ordinary event name (`file.created`, `file.deleted`) and its ordinary `[hooks] events` subscription, so the receiver's existing handler runs again with no new code and no new config; it gains exactly one field, `"replayed": true`, so the receiver can still log, meter, or guard on it. The field is added *only* to replayed payloads, leaving every live payload byte-for-byte unchanged. A distinct event kind would have been a cleaner signal and defeated the entire purpose. An order-index path in a caller's `files` list is rejected with a `400` for the mirror image of this reasoning: events are classified by path, so a `file.deleted` on an index path would arrive as an `order.deleted` and wipe a directory's stored order.
 - **Revert = new commit** — reverts never rewrite history; they produce a new inverse commit and fire the appropriate hooks for each changed file.
 - **Rollback is its own route, distinct from revert** — `POST /commits/:sha/rollback` restores the files `:sha` touched to the state they had *at* it; `POST /commits/:sha/revert` undoes what `:sha` did. Both derive their scope from the commit's own change set (so neither takes paths in its body) and differ only in which side of it is read — `:sha`'s tree vs `parent(:sha)`'s — but they are separate routes rather than one route with a mode flag, so each has one unambiguous meaning: revert undoes a change, rollback restores a point in time (discarding every later change to those same paths). Both are `POST`: like every write in this API they append a commit and never remove one. The rollback needs no parent commit, which is why rolling back *to* the initial commit is allowed where reverting it is not. Target states are staged onto current HEAD reusing existing blob oids — no rehash, no content read except the copy each hook payload needs — and, like an unchanged PUT, a path already holding its target state is skipped; when that leaves nothing to do, no commit is created, no hook fires, and maintenance is not armed.
 - **Author identity is caller-supplied** — every write request requires an `author` object with `name` and `email`. Both are stored in the git commit and validated as non-empty.
@@ -564,6 +621,21 @@ All payloads include `collection_id`, `tenant_id`, `commit_sha`, and `committed_
   "directory": "docs/guides"
 }
 ```
+
+**Replayed events** carry one extra field, `"replayed": true`, and are otherwise identical to the live event of the same kind:
+```json
+{
+  "event": "file.deleted",
+  "collection_id": "docs",
+  "tenant_id": "acme",
+  "commit_sha": "a3f9c1d",
+  "committed_at": "2026-06-16T10:00:00Z",
+  "replayed": true,
+  "file": { "path": "docs/removed.md" }
+}
+```
+
+The field is present **only on replayed payloads** — a live event's payload stays byte-for-byte what it has always been, so nothing an existing receiver parses changes and its absence means "live". It is spelled as a past participle (`replayed`, not `replay`) because it states something about the event — "this event was replayed" — rather than instructing anything: the same distinction that makes request flags verb phrases (`include_hidden_files`, `apply_order_index`) and response state not (`has_more`). The event name is deliberately not varied: the whole point of a replay is that the receiver's existing handler runs again unmodified, with the flag there purely so it can log, meter, or guard on it. `commit_sha` is the HEAD the replay was snapshotted from rather than a commit that produced the change, and `committed_at` is when the replay was requested. Only `file.created` and `file.deleted` are ever replayed; there are no replayed `order.*`, `file.moved`, or `file.updated` events.
 
 `directory` is repo-root-relative, with the repository root spelled as the empty string. `order.updated` carries the directory's **complete resulting order**, not a diff, so applying it downstream is a replace (`UPDATE … SET position = index`) and repeated delivery is harmless. `order.deleted` means that directory has no stored order any more and falls back to the default listing order.
 

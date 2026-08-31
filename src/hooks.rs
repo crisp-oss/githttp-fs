@@ -46,17 +46,29 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use reqwest::Client;
 use serde_json::{json, Map, Value};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
 use crate::config::{Config, HookEvent, HooksConfig};
-use crate::git::FileChange;
+use crate::git::{FileChange, GitFiles};
 use crate::order;
 
 /// Cap on the exponential backoff exponent to avoid `1 << n` overflow when an
 /// operator configures a very high retry count.
 const MAX_BACKOFF_EXPONENT: u32 = 20;
+
+/// How many files a replay reads from the repository in one go.
+///
+/// A replay deliberately does *not* materialise every file's content when the
+/// job is built — a whole-repository replay would then hold the entire corpus
+/// in memory for as long as delivery takes, which an inter-hook delay can
+/// stretch to hours. Reading strictly one file at a time would fix that but
+/// re-open the repository per file, so content is fetched in small chunks
+/// instead: resident memory is bounded by the chunk, not by the repository,
+/// and the repository is opened once per chunk rather than once per file.
+const REPLAY_READ_CHUNK: usize = 64;
 
 /// A change to one directory's file-order index, as delivered to a receiver.
 ///
@@ -81,8 +93,68 @@ pub enum OrderChange {
     },
 }
 
-/// A single unit of hook work: all changes produced by one commit.
-/// Single-file operations carry one change; a revert, a rollback, or a
+/// Which kind of event a replay re-emits. Deliberately not a third event
+/// name: a replay exists so the receiver's *existing* handler runs again, so
+/// it re-uses the ordinary event kinds (and the ordinary `[hooks] events`
+/// subscription) and only marks itself with a `replay` flag in the payload.
+#[derive(Clone, Copy, Debug)]
+pub enum ReplayKind {
+    /// One `file.created` per path — the files git holds are pushed downstream
+    /// again, so a receiver missing rows re-inserts them. `created` rather
+    /// than `updated` because the case a replay is usually run for is a row
+    /// the receiver never got: an `UPDATE` handler would silently do nothing
+    /// for exactly those. The trade is that a receiver must treat
+    /// `file.created` as insert-or-replace, since the replay set includes
+    /// files it already holds.
+    Created,
+    /// One `file.deleted` per path — the paths a caller believes it holds that
+    /// git no longer has, so a receiver drops the rows git cannot account for.
+    Deleted,
+}
+
+/// A replay of past events, carrying **paths rather than content**.
+///
+/// This is the one job shape whose payloads are not fully known when it is
+/// enqueued. A whole-repository replay of `file.created` would otherwise pin
+/// every file's content in memory until the job drained, and with a
+/// `delay_ms` throttle that can be hours — so the content of each file is
+/// read from the repository just before its own POST (see
+/// [`REPLAY_READ_CHUNK`]). A file that disappeared between the snapshot and
+/// its delivery is simply skipped: its real `file.deleted` is already queued
+/// behind this job, so the receiver still converges.
+pub struct ReplayJob {
+    /// Where the repository lives, so the delivery task can re-open it to read
+    /// content. Only `Updated` replays ever use it — a deletion payload
+    /// carries no content at all.
+    pub repo_path: PathBuf,
+    pub kind: ReplayKind,
+    /// Repo-root-relative paths, in the order they should be delivered.
+    pub paths: Vec<String>,
+    /// Optional pause between consecutive deliveries. Delivery is already
+    /// strictly sequential per repository, so this is a *throttle* for the
+    /// receiver, not an ordering device — and it holds this repository's queue
+    /// for its whole duration, delaying the hooks of any commit accepted after
+    /// the replay was enqueued.
+    pub delay_ms: Option<u64>,
+}
+
+/// Where a job's payloads come from: a commit that already happened, or a
+/// replay that reconstructs events from the current state of the repository.
+pub enum HookSource {
+    /// All changes produced by one commit, materialised at commit time.
+    Commit {
+        file_changes: Vec<FileChange>,
+        /// Order-index changes, always delivered *after* every file change of
+        /// the same commit — so an order snapshot never references a file the
+        /// receiver has not been told about yet.
+        order_changes: Vec<OrderChange>,
+    },
+    /// A reconciliation replay, resolved lazily at delivery time.
+    Replay(ReplayJob),
+}
+
+/// A single unit of hook work: all changes produced by one commit, or one
+/// replay. Single-file operations carry one change; a revert, a rollback, or a
 /// recursive folder delete/move can carry many, and its changes are delivered
 /// one hook at a time, in order.
 pub struct HookJob {
@@ -94,14 +166,29 @@ pub struct HookJob {
     pub tenant_id: String,
     pub commit_sha: String,
     pub committed_at: DateTime<Utc>,
-    pub file_changes: Vec<FileChange>,
-    /// Order-index changes, always delivered *after* every file change of the
-    /// same commit — so an order snapshot never references a file the receiver
-    /// has not been told about yet.
-    pub order_changes: Vec<OrderChange>,
+    pub source: HookSource,
 }
 
 impl HookJob {
+    /// Builds a replay job. Unlike [`HookJob::new`] no commit produced this —
+    /// `commit_sha` is the repository's current HEAD, which is the honest
+    /// answer to "what state is being replayed", and `committed_at` is the
+    /// moment the replay was requested.
+    pub fn replay(
+        collection_id: String,
+        tenant_id: String,
+        commit_sha: String,
+        committed_at: DateTime<Utc>,
+        replay: ReplayJob,
+    ) -> Self {
+        Self {
+            collection_id,
+            tenant_id,
+            commit_sha,
+            committed_at,
+            source: HookSource::Replay(replay),
+        }
+    }
     /// Builds a job from a commit's raw change set, splitting the changes that
     /// landed on an order index out of the file changes.
     ///
@@ -173,8 +260,10 @@ impl HookJob {
             tenant_id,
             commit_sha,
             committed_at,
-            file_changes,
-            order_changes,
+            source: HookSource::Commit {
+                file_changes,
+                order_changes,
+            },
         }
     }
 
@@ -293,7 +382,33 @@ impl HookDelivery {
         // sync. Same composite key the queue itself is keyed by.
         let repository = format!("{}/{}", job.collection_id, job.tenant_id);
 
-        for file_change in job.file_changes {
+        let (file_changes, order_changes) = match job.source {
+            HookSource::Commit {
+                file_changes,
+                order_changes,
+            } => (file_changes, order_changes),
+
+            // A replay resolves its own payloads as it goes, so it never
+            // reaches the commit-shaped loops below.
+            HookSource::Replay(replay) => {
+                Self::deliver_replay(
+                    client,
+                    hooks,
+                    attempts,
+                    &job.collection_id,
+                    &job.tenant_id,
+                    &job.commit_sha,
+                    &job.committed_at,
+                    &repository,
+                    replay,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        for file_change in file_changes {
             let required_event = Self::event_for_change(&file_change);
 
             if !hooks.events.contains(&required_event) {
@@ -306,6 +421,7 @@ impl HookDelivery {
                 &job.commit_sha,
                 &job.committed_at,
                 &file_change,
+                false,
             );
             let description = Self::change_description(&file_change);
 
@@ -323,7 +439,7 @@ impl HookDelivery {
 
         // Order events come after every file event of the same commit, so an
         // order snapshot never names a file the receiver has not seen yet.
-        for order_change in job.order_changes {
+        for order_change in order_changes {
             let required_event = Self::event_for_order_change(&order_change);
 
             if !hooks.events.contains(&required_event) {
@@ -350,6 +466,205 @@ impl HookDelivery {
             )
             .await;
         }
+    }
+
+    /// Delivers one replay: a `file.updated` or `file.deleted` per path, in
+    /// order, optionally throttled by `delay_ms`.
+    ///
+    /// Two things make this different from a commit-shaped job:
+    ///
+    /// - **Content is resolved here, not at enqueue time.** Paths are read in
+    ///   chunks of [`REPLAY_READ_CHUNK`], so a whole-repository replay holds a
+    ///   chunk in memory rather than the whole corpus — which matters because
+    ///   a throttled replay can occupy this repository's queue for hours. A
+    ///   deletion replay needs no content at all and reads nothing.
+    /// - **A path can vanish mid-replay.** The snapshot was taken under the
+    ///   write lock, but delivery outlives it, so a file deleted in the
+    ///   meantime is skipped rather than treated as an error: its real
+    ///   `file.deleted` is already queued behind this job, so the receiver
+    ///   still converges.
+    #[allow(clippy::too_many_arguments)]
+    async fn deliver_replay(
+        client: &Client,
+        hooks: &HooksConfig,
+        attempts: u32,
+        collection_id: &str,
+        tenant_id: &str,
+        commit_sha: &str,
+        committed_at: &DateTime<Utc>,
+        repository: &str,
+        replay: ReplayJob,
+    ) {
+        let required_event = match replay.kind {
+            ReplayKind::Created => HookEvent::FileCreated,
+            ReplayKind::Deleted => HookEvent::FileDeleted,
+        };
+
+        // Subscriptions apply to a replay exactly as to a live event. An
+        // unsubscribed replay delivers nothing, which is correct but silent
+        // enough to look like a bug from the outside — so it is logged at warn
+        // rather than skipped quietly.
+        if !hooks.events.contains(&required_event) {
+            tracing::warn!(
+                repository,
+                event = ?replay.kind,
+                path_count = replay.paths.len(),
+                "replay requested but its event kind is not listed in [hooks] events, delivering nothing"
+            );
+
+            return;
+        }
+
+        let total = replay.paths.len();
+        let delay = replay
+            .delay_ms
+            .filter(|milliseconds| *milliseconds > 0)
+            .map(Duration::from_millis);
+
+        tracing::info!(
+            repository,
+            event = ?replay.kind,
+            path_count = total,
+            delay_ms = ?replay.delay_ms,
+            "replay starting"
+        );
+
+        let mut delivered: usize = 0;
+        let mut skipped: usize = 0;
+
+        for chunk in replay.paths.chunks(REPLAY_READ_CHUNK) {
+            let changes =
+                match Self::replay_chunk_changes(&replay.repo_path, tenant_id, replay.kind, chunk)
+                    .await
+                {
+                    Some(changes) => changes,
+
+                    // The repository could not be read at all (deleted mid-replay,
+                    // or a git failure). Continuing would emit nothing useful for
+                    // every remaining chunk, so the replay stops here.
+                    None => {
+                        tracing::error!(
+                            repository,
+                            delivered,
+                            remaining = total - delivered - skipped,
+                            "replay aborted: repository could not be read"
+                        );
+
+                        return;
+                    }
+                };
+
+            for change in changes {
+                let Some(change) = change else {
+                    skipped += 1;
+
+                    continue;
+                };
+
+                // Sleeping *before* each delivery but the first is what keeps
+                // the throttle strictly between deliveries — no trailing pause
+                // holding the queue after the final POST.
+                if delivered > 0 {
+                    if let Some(delay) = delay {
+                        sleep(delay).await;
+                    }
+                }
+
+                let payload = Self::build_payload(
+                    collection_id,
+                    tenant_id,
+                    commit_sha,
+                    committed_at,
+                    &change,
+                    true,
+                );
+                let description = Self::change_description(&change);
+
+                Self::deliver_with_retries(
+                    client,
+                    hooks,
+                    attempts,
+                    payload,
+                    repository,
+                    commit_sha,
+                    &description,
+                )
+                .await;
+
+                delivered += 1;
+            }
+        }
+
+        tracing::info!(
+            repository,
+            event = ?replay.kind,
+            delivered,
+            skipped,
+            "replay finished"
+        );
+    }
+
+    /// Resolves one chunk of replay paths into the changes to deliver.
+    ///
+    /// `None` means the repository itself could not be read (the caller aborts
+    /// the whole replay); an inner `None` means that single path is no longer
+    /// deliverable — absent from HEAD, or holding content JSON cannot carry —
+    /// and is skipped. A deletion replay needs no repository access at all, so
+    /// it never leaves the async context.
+    async fn replay_chunk_changes(
+        repo_path: &std::path::Path,
+        tenant_id: &str,
+        kind: ReplayKind,
+        chunk: &[String],
+    ) -> Option<Vec<Option<FileChange>>> {
+        if let ReplayKind::Deleted = kind {
+            return Some(
+                chunk
+                    .iter()
+                    .map(|path| Some(FileChange::Deleted { path: path.clone() }))
+                    .collect(),
+            );
+        }
+
+        let repo_path = repo_path.to_path_buf();
+        let tenant_id = tenant_id.to_string();
+        let paths = chunk.to_vec();
+
+        // libgit2 is synchronous, so the read goes to the blocking pool for the
+        // same reason every other git call in this codebase does.
+        let read = tokio::task::spawn_blocking(move || {
+            GitFiles::replay_read_files(&repo_path, &tenant_id, &paths)
+        })
+        .await;
+
+        let contents = match read {
+            Ok(Ok(contents)) => contents,
+
+            Ok(Err(read_err)) => {
+                tracing::error!("replay chunk read failed: {}", read_err);
+
+                return None;
+            }
+
+            Err(join_err) => {
+                tracing::error!("replay chunk read task failed: {}", join_err);
+
+                return None;
+            }
+        };
+
+        Some(
+            chunk
+                .iter()
+                .zip(contents)
+                .map(|(path, content)| {
+                    content.map(|content| FileChange::Created {
+                        path: path.clone(),
+                        content,
+                    })
+                })
+                .collect(),
+        )
     }
 
     /// The retry loop for one payload: attempt, and on failure sleep
@@ -559,14 +874,25 @@ impl HookDelivery {
     /// and together they are what a receiver must key on: hook order is
     /// guaranteed per *repository*, so two collections sharing a tenant id
     /// deliver on independent queues and would otherwise be indistinguishable.
+    ///
+    /// `replay` adds a single `"replayed": true` field, and *only* when true —
+    /// spelled as a past participle because it states something about the
+    /// event ("this event was replayed") rather than instructing anything,
+    /// the same way `has_more` reads on a listing response —
+    /// a live event's payload stays byte-for-byte what it has always been, so
+    /// nothing an existing receiver parses changes. The event name is
+    /// deliberately not varied: the whole point of a replay is that the
+    /// receiver's existing handler runs again unmodified, with the flag there
+    /// purely so it can log, meter, or guard on it.
     fn build_payload(
         collection_id: &str,
         tenant_id: &str,
         commit_sha: &str,
         committed_at: &DateTime<Utc>,
         file_change: &FileChange,
+        replay: bool,
     ) -> Value {
-        let mut payload = Map::with_capacity(6);
+        let mut payload = Map::with_capacity(7);
 
         payload.insert(
             "collection_id".to_string(),
@@ -584,6 +910,10 @@ impl HookDelivery {
             "committed_at".to_string(),
             Value::String(committed_at.to_rfc3339()),
         );
+
+        if replay {
+            payload.insert("replayed".to_string(), Value::Bool(true));
+        }
 
         match file_change {
             FileChange::Created { path, content } => {

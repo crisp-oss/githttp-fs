@@ -26,6 +26,7 @@
 pub mod commits;
 pub mod files;
 pub mod order;
+pub mod replay;
 pub mod root;
 pub mod tenant;
 

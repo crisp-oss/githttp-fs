@@ -2090,6 +2090,113 @@ impl GitFiles {
             .collect()
     }
 
+    /// Every file HEAD holds, as a flat list of repo-root-relative paths, plus
+    /// the sha of the HEAD commit the list was read from.
+    ///
+    /// This is the snapshot both replay routes are built on. It opens no blob
+    /// — only tree objects — so its cost is the tree walk alone, and order
+    /// indexes are excluded exactly as they are from every `/files` route
+    /// (`collect_flat_files` drops them), because they are a separate resource
+    /// and a receiver mirroring content must never be told one is a file.
+    ///
+    /// `path_prefix` scopes the walk to a sub-directory with the listing
+    /// route's semantics (an absent or non-directory prefix yields an empty
+    /// list rather than an error), and `include_hidden_files` follows the
+    /// listing's dot-prefix rule. The returned paths are always relative to
+    /// the repository root, not to the prefix, so they are the same identities
+    /// that travel in hook payloads.
+    pub fn list_all_file_paths(
+        repo_path: &Path,
+        tenant_id: &str,
+        path_prefix: Option<&str>,
+        include_hidden_files: bool,
+    ) -> Result<(String, Vec<String>), AppError> {
+        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, include_hidden_files = include_hidden_files, "listing all file paths");
+
+        let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
+        let head_commit = repo.head()?.peel_to_commit()?;
+        let head_sha = head_commit.id().to_string();
+        let head_tree = head_commit.tree()?;
+
+        // Same prefix resolution as `list_files`: resolve the subtree directly
+        // so unrelated directories are never visited.
+        let prefix = path_prefix.filter(|prefix| !prefix.is_empty());
+
+        let walk_tree: git2::Tree<'_> = match prefix {
+            Some(prefix) => match head_tree.get_path(Path::new(prefix)) {
+                Ok(entry) => match repo.find_tree(entry.id()) {
+                    Ok(tree) => tree,
+                    Err(_not_a_directory) => return Ok((head_sha, Vec::new())),
+                },
+                Err(_absent) => return Ok((head_sha, Vec::new())),
+            },
+            None => head_tree,
+        };
+
+        let flat = Self::collect_flat_files(&walk_tree, None, include_hidden_files)?;
+
+        let paths = match prefix {
+            Some(prefix) => flat
+                .into_iter()
+                .map(|leaf| format!("{}/{}", prefix, leaf))
+                .collect(),
+            None => flat,
+        };
+
+        tracing::debug!(tenant_id = %tenant_id, file_count = paths.len(), head_sha = %head_sha, "collected file paths");
+
+        Ok((head_sha, paths))
+    }
+
+    /// Reads whole file contents for one chunk of a replay, in one repository
+    /// pass, index-aligned with `paths`.
+    ///
+    /// `None` marks a path that cannot be delivered, and the distinction from
+    /// [`Self::batch_read_files`] is deliberate: a batch read answers a
+    /// caller who asked for exactly these files, so unreadable content is a
+    /// hard `422`. A replay is reconciliation running unattended over a
+    /// snapshot that may already have moved on, and one undeliverable file
+    /// must not abort the other thousands — so a path that is absent, is a
+    /// folder, is an order index, or holds content JSON cannot carry is logged
+    /// and skipped. Only a failure to read the *repository* is an error.
+    pub fn replay_read_files(
+        repo_path: &Path,
+        tenant_id: &str,
+        paths: &[String],
+    ) -> Result<Vec<Option<String>>, AppError> {
+        tracing::trace!(tenant_id = %tenant_id, count = paths.len(), "reading replay chunk");
+
+        let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
+        let head_tree = repo.head()?.peel_to_commit()?.tree()?;
+
+        let contents = paths
+            .iter()
+            .map(|file_path| {
+                if order::is_order_file(file_path) {
+                    return None;
+                }
+
+                // Absent from HEAD: the file was deleted between the snapshot
+                // and now. Its real `file.deleted` is queued behind this
+                // replay, so skipping keeps the receiver converging.
+                let blob_oid = GitUtils::blob_oid_in_tree(&head_tree, file_path)?;
+                let blob = repo.find_blob(blob_oid).ok()?;
+
+                match std::str::from_utf8(blob.content()) {
+                    Ok(text) => Some(text.to_string()),
+
+                    Err(_not_utf8) => {
+                        tracing::warn!(path = %file_path, "replay skipping file: content is not valid UTF-8");
+
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        Ok(contents)
+    }
+
     /// Classifies what `path` resolves to in HEAD's tree — a file, a folder,
     /// or nothing at all — without reading any content.
     ///

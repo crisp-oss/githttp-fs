@@ -35,6 +35,7 @@
 //! - [`middleware`] — Bearer API-key guard
 //! - [`order`] — the per-directory file-order index format and its rules
 //! - [`routes`] — axum HTTP handlers (thin orchestration over `git`)
+//!   (including [`routes::replay`] — webhook replay for downstream repair)
 //! - [`seek`] — line-based content windowing shared by file read endpoints
 //! - [`util`] — `spawn_blocking` wrapper and constant-time comparison
 //! - [`validate`] — sanitisation of all user-supplied identifiers and paths
@@ -192,6 +193,18 @@ fn build_router(app_state: AppState) -> Router {
                 .put(routes::files::write_file)
                 .delete(routes::files::delete_file)
                 .post(routes::files::post_file),
+        )
+        // Webhook replay, for repairing a downstream mirror that drifted out
+        // of sync. Lives under literal `/batch/replay/hook` segments —
+        // distinct from `/files`, so it can never collide with the `{*path}`
+        // wildcard above, and sharing the `/batch` prefix with the batch read
+        // since both take a caller-supplied file list in one request. It
+        // commits nothing (it only enqueues hook work) but still takes the
+        // tenant write lock, since it enqueues and queue order must keep
+        // matching commit order.
+        .route(
+            "/{collection_id}/{tenant_id}/batch/replay/hook",
+            post(routes::replay::replay_hook),
         )
         // File-order index. A separate resource from the files it orders, so
         // it is a separate route rather than a flag on `/files` — that is what
