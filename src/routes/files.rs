@@ -62,6 +62,12 @@ pub struct ListFilesQuery {
     /// Its value is always validated, but the filter is only active — and the
     /// history walk only paid for — when at least one bound is set.
     pub include_date_type: Option<String>,
+    /// When true, every level of the listing is ordered by the stored order
+    /// index of the directory it belongs to; unlisted entries follow in the
+    /// ordinary order. Defaults to false, so no existing caller's results
+    /// change — and so the per-directory index reads it costs are only paid
+    /// for by callers that want them.
+    pub apply_order_index: Option<bool>,
     pub page: Option<usize>,
     pub per_page: Option<usize>,
 }
@@ -321,13 +327,15 @@ pub async fn list_files(
         query.include_date_type.as_deref(),
     )?;
 
+    let apply_order_index = query.apply_order_index.unwrap_or(false);
+
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query
         .per_page
         .unwrap_or(DEFAULT_PER_PAGE)
         .clamp(1, MAX_PER_PAGE);
 
-    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, file_name_starts_with = ?file_name_starts_with, date_filter = ?date_filter, page = page, per_page = per_page, "handling list files request");
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, file_name_starts_with = ?file_name_starts_with, date_filter = ?date_filter, apply_order_index = apply_order_index, page = page, per_page = per_page, "handling list files request");
 
     let repo_path = state
         .config
@@ -347,6 +355,7 @@ pub async fn list_files(
             include_hidden_files,
             file_name_starts_with.as_deref(),
             date_filter,
+            apply_order_index,
             page,
             per_page,
         )
@@ -745,13 +754,13 @@ pub async fn write_file(
     // order always matches commit order.
     state.hook_queue.enqueue(
         &lock_key,
-        HookJob {
+        HookJob::new(
             collection_id,
             tenant_id,
-            commit_sha: commit_sha.clone(),
-            committed_at: Utc::now(),
-            file_changes: vec![file_change],
-        },
+            commit_sha.clone(),
+            Utc::now(),
+            vec![file_change],
+        ),
     );
 
     state
@@ -847,7 +856,7 @@ pub async fn delete_file(
         })
         .await?
     } else {
-        let (commit_sha, file_change) = run_blocking(move || {
+        run_blocking(move || {
             git::GitFiles::delete_file(
                 &repo_path,
                 &tenant_id_for_task,
@@ -857,9 +866,7 @@ pub async fn delete_file(
                 &author.email,
             )
         })
-        .await?;
-
-        (commit_sha, vec![file_change])
+        .await?
     };
 
     // An empty change list means no commit was created (only reachable on the
@@ -877,13 +884,13 @@ pub async fn delete_file(
     // order always matches commit order.
     state.hook_queue.enqueue(
         &lock_key,
-        HookJob {
+        HookJob::new(
             collection_id,
             tenant_id,
-            commit_sha: commit_sha.clone(),
-            committed_at: Utc::now(),
+            commit_sha.clone(),
+            Utc::now(),
             file_changes,
-        },
+        ),
     );
 
     state
@@ -1019,7 +1026,7 @@ pub async fn move_file(
         })
         .await?
     } else {
-        let (commit_sha, file_change) = run_blocking(move || {
+        run_blocking(move || {
             git::GitFiles::move_file(
                 &repo_path,
                 &tenant_id_for_task,
@@ -1030,9 +1037,7 @@ pub async fn move_file(
                 &author.email,
             )
         })
-        .await?;
-
-        (commit_sha, vec![file_change])
+        .await?
     };
 
     // An empty change list means no commit was created (only reachable on the
@@ -1050,13 +1055,13 @@ pub async fn move_file(
     // order always matches commit order.
     state.hook_queue.enqueue(
         &lock_key,
-        HookJob {
+        HookJob::new(
             collection_id,
             tenant_id,
-            commit_sha: commit_sha.clone(),
-            committed_at: Utc::now(),
+            commit_sha.clone(),
+            Utc::now(),
             file_changes,
-        },
+        ),
     );
 
     state

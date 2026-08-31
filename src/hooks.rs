@@ -52,12 +52,36 @@ use tokio::time::{sleep, Duration};
 
 use crate::config::{Config, HookEvent, HooksConfig};
 use crate::git::FileChange;
+use crate::order;
 
 /// Cap on the exponential backoff exponent to avoid `1 << n` overflow when an
 /// operator configures a very high retry count.
 const MAX_BACKOFF_EXPONENT: u32 = 20;
 
-/// A single unit of hook work: all file changes produced by one commit.
+/// A change to one directory's file-order index, as delivered to a receiver.
+///
+/// `Updated` carries the whole resulting order rather than a diff: a snapshot
+/// is idempotent, so a receiver replaces that directory's positions and is
+/// done. There is deliberately **no `Moved` variant**, even though a folder
+/// move relocates the indexes inside it and `file.moved` exists for exactly
+/// that identity-preserving reason: a file is an entity a receiver hangs
+/// metadata off, whereas a directory's order list is just positions, with no
+/// identity worth carrying across a rename. A relocated index therefore
+/// arrives as `Deleted` at the old directory plus `Updated` at the new one,
+/// and the receiver re-keys by replacing.
+pub enum OrderChange {
+    Updated {
+        /// Repo-root-relative directory the order applies to; `""` is the
+        /// repository root.
+        directory: String,
+        order: Vec<String>,
+    },
+    Deleted {
+        directory: String,
+    },
+}
+
+/// A single unit of hook work: all changes produced by one commit.
 /// Single-file operations carry one change; a revert, a rollback, or a
 /// recursive folder delete/move can carry many, and its changes are delivered
 /// one hook at a time, in order.
@@ -71,6 +95,108 @@ pub struct HookJob {
     pub commit_sha: String,
     pub committed_at: DateTime<Utc>,
     pub file_changes: Vec<FileChange>,
+    /// Order-index changes, always delivered *after* every file change of the
+    /// same commit — so an order snapshot never references a file the receiver
+    /// has not been told about yet.
+    pub order_changes: Vec<OrderChange>,
+}
+
+impl HookJob {
+    /// Builds a job from a commit's raw change set, splitting the changes that
+    /// landed on an order index out of the file changes.
+    ///
+    /// This is the single place where an order event is recognised, and it
+    /// classifies on the **path**, not on the route that produced the change.
+    /// That is what makes every producer work without a special case: an
+    /// explicit order write, a delete or move that rewrote an index alongside
+    /// the file, a recursive folder operation carrying indexes inside its
+    /// subtree, and a revert or rollback restoring an index out of history all
+    /// arrive here as plain file changes and leave correctly classified.
+    pub fn new(
+        collection_id: String,
+        tenant_id: String,
+        commit_sha: String,
+        committed_at: DateTime<Utc>,
+        changes: Vec<FileChange>,
+    ) -> Self {
+        let mut file_changes: Vec<FileChange> = Vec::with_capacity(changes.len());
+        let mut order_changes: Vec<OrderChange> = Vec::new();
+
+        for change in changes {
+            // A move is classified by its destination: leaf names are
+            // preserved by every move this API performs, so an index can only
+            // ever move to another index path.
+            let touches_index = match &change {
+                FileChange::Created { path, .. }
+                | FileChange::Updated { path, .. }
+                | FileChange::Deleted { path } => order::is_order_file(path),
+                FileChange::Moved { to_path, .. } => order::is_order_file(to_path),
+            };
+
+            if !touches_index {
+                file_changes.push(change);
+
+                continue;
+            }
+
+            match change {
+                FileChange::Created { path, content } | FileChange::Updated { path, content } => {
+                    Self::push_order_updated(&mut order_changes, &path, &content);
+                }
+
+                FileChange::Deleted { path } => {
+                    if let Some(directory) = order::directory_of_order_file(&path) {
+                        order_changes.push(OrderChange::Deleted {
+                            directory: directory.to_string(),
+                        });
+                    }
+                }
+
+                FileChange::Moved {
+                    from_path,
+                    to_path,
+                    content,
+                } => {
+                    if let Some(directory) = order::directory_of_order_file(&from_path) {
+                        order_changes.push(OrderChange::Deleted {
+                            directory: directory.to_string(),
+                        });
+                    }
+
+                    Self::push_order_updated(&mut order_changes, &to_path, &content);
+                }
+            }
+        }
+
+        Self {
+            collection_id,
+            tenant_id,
+            commit_sha,
+            committed_at,
+            file_changes,
+            order_changes,
+        }
+    }
+
+    /// Records the order an index now holds, parsed out of the content the
+    /// commit wrote. An index that cannot be parsed yields no event at all
+    /// (with a warning): it is treated as no index, exactly as on the read
+    /// side, rather than leaking to the receiver as a file event on a path the
+    /// `/files` routes do not even acknowledge.
+    fn push_order_updated(order_changes: &mut Vec<OrderChange>, path: &str, content: &str) {
+        let Some(directory) = order::directory_of_order_file(path) else {
+            return;
+        };
+
+        match order::parse(content) {
+            Some(parsed) => order_changes.push(OrderChange::Updated {
+                directory: directory.to_string(),
+                order: parsed,
+            }),
+
+            None => tracing::warn!(path, "order index is malformed, skipping its hook"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +320,36 @@ impl HookDelivery {
             )
             .await;
         }
+
+        // Order events come after every file event of the same commit, so an
+        // order snapshot never names a file the receiver has not seen yet.
+        for order_change in job.order_changes {
+            let required_event = Self::event_for_order_change(&order_change);
+
+            if !hooks.events.contains(&required_event) {
+                continue;
+            }
+
+            let payload = Self::build_order_payload(
+                &job.collection_id,
+                &job.tenant_id,
+                &job.commit_sha,
+                &job.committed_at,
+                &order_change,
+            );
+            let description = Self::order_change_description(&order_change);
+
+            Self::deliver_with_retries(
+                client,
+                hooks,
+                attempts,
+                payload,
+                &repository,
+                &job.commit_sha,
+                &description,
+            )
+            .await;
+        }
     }
 
     /// The retry loop for one payload: attempt, and on failure sleep
@@ -297,6 +453,16 @@ impl HookDelivery {
         }
     }
 
+    /// Maps an order-index change to its wire-level event kind, so it is
+    /// filtered against the configured `events` list exactly like a file
+    /// change.
+    fn event_for_order_change(order_change: &OrderChange) -> HookEvent {
+        match order_change {
+            OrderChange::Updated { .. } => HookEvent::OrderUpdated,
+            OrderChange::Deleted { .. } => HookEvent::OrderDeleted,
+        }
+    }
+
     /// Compact human-readable summary of a change (`"updated:docs/intro.md"`)
     /// used purely for log lines — never sent to the receiver.
     fn change_description(file_change: &FileChange) -> String {
@@ -310,6 +476,76 @@ impl HookDelivery {
                 format!("moved:{}→{}", from_path, to_path)
             }
         }
+    }
+
+    /// Same, for an order-index change. The directory is spelled `/` here (and
+    /// only here, in logs) so a root-level order does not read as a blank.
+    fn order_change_description(order_change: &OrderChange) -> String {
+        match order_change {
+            OrderChange::Updated { directory, order } => format!(
+                "order updated:{} ({} entries)",
+                order::display_directory(directory),
+                order.len()
+            ),
+            OrderChange::Deleted { directory } => {
+                format!("order deleted:{}", order::display_directory(directory))
+            }
+        }
+    }
+
+    /// Builds the JSON payload for one order-index change, on the same
+    /// envelope as every file event.
+    ///
+    /// `order.updated` carries the directory's complete resulting order rather
+    /// than a diff, so applying it downstream is a replace and repeated
+    /// delivery is harmless. The `directory` is repo-root-relative, with the
+    /// repository root spelled as the empty string — unlike the log line, the
+    /// wire value stays a plain path a receiver can key on directly.
+    fn build_order_payload(
+        collection_id: &str,
+        tenant_id: &str,
+        commit_sha: &str,
+        committed_at: &DateTime<Utc>,
+        order_change: &OrderChange,
+    ) -> Value {
+        let mut payload = Map::with_capacity(7);
+
+        payload.insert(
+            "collection_id".to_string(),
+            Value::String(collection_id.to_string()),
+        );
+        payload.insert(
+            "tenant_id".to_string(),
+            Value::String(tenant_id.to_string()),
+        );
+        payload.insert(
+            "commit_sha".to_string(),
+            Value::String(commit_sha.to_string()),
+        );
+        payload.insert(
+            "committed_at".to_string(),
+            Value::String(committed_at.to_rfc3339()),
+        );
+
+        match order_change {
+            OrderChange::Updated { directory, order } => {
+                payload.insert(
+                    "event".to_string(),
+                    Value::String("order.updated".to_string()),
+                );
+                payload.insert("directory".to_string(), Value::String(directory.clone()));
+                payload.insert("order".to_string(), json!(order));
+            }
+            OrderChange::Deleted { directory } => {
+                payload.insert(
+                    "event".to_string(),
+                    Value::String("order.deleted".to_string()),
+                );
+                payload.insert("directory".to_string(), Value::String(directory.clone()));
+            }
+        }
+
+        Value::Object(payload)
     }
 
     /// Builds the JSON payload for one file change. The envelope fields

@@ -33,6 +33,7 @@
 //! - [`hooks`] — ordered, retried webhook delivery
 //! - [`maintenance`] — background loose-object packing
 //! - [`middleware`] — Bearer API-key guard
+//! - [`order`] — the per-directory file-order index format and its rules
 //! - [`routes`] — axum HTTP handlers (thin orchestration over `git`)
 //! - [`seek`] — line-based content windowing shared by file read endpoints
 //! - [`util`] — `spawn_blocking` wrapper and constant-time comparison
@@ -44,6 +45,7 @@ mod git;
 mod hooks;
 mod maintenance;
 mod middleware;
+mod order;
 mod routes;
 mod seek;
 mod state;
@@ -189,6 +191,23 @@ fn build_router(app_state: AppState) -> Router {
                 .put(routes::files::write_file)
                 .delete(routes::files::delete_file)
                 .post(routes::files::move_file),
+        )
+        // File-order index. A separate resource from the files it orders, so
+        // it is a separate route rather than a flag on `/files` — that is what
+        // makes its format impossible to bypass. Two registrations because
+        // axum's `{*path}` wildcard needs at least one segment, and the
+        // repository root's own order must be addressable too.
+        .route(
+            "/{collection_id}/{tenant_id}/order",
+            get(routes::order::read_order_root)
+                .put(routes::order::write_order_root)
+                .delete(routes::order::delete_order_root),
+        )
+        .route(
+            "/{collection_id}/{tenant_id}/order/{*path}",
+            get(routes::order::read_order)
+                .put(routes::order::write_order)
+                .delete(routes::order::delete_order),
         )
         // Commit history
         .route(

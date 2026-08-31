@@ -22,7 +22,9 @@ events = [
   "file.created",
   "file.updated",
   "file.deleted",
-  "file.moved"
+  "file.moved",
+  "order.updated",
+  "order.deleted"
 ]
 
 retry_attempts = 5

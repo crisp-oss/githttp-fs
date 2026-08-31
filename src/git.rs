@@ -19,6 +19,9 @@
 //! - `GitMaintenance` — consolidating repack, optional prune, reflog
 //!   expiry, index refresh
 //! - `GitFiles` — file CRUD (list / read / exists / write / delete / move)
+//! - `GitOrder` — the per-directory file-order index (read / write / delete,
+//!   plus the implicit upkeep that keeps an index honest across file
+//!   deletes and moves)
 //! - `GitCommits` — history listing, commit detail, revert
 //! - `GitTenant` — tenant repository deletion
 //!
@@ -51,6 +54,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::error::AppError;
+use crate::order;
 use crate::seek::SeekFilter;
 
 /// A node in the repository file tree returned by the list endpoint.
@@ -66,6 +70,16 @@ pub enum TreeNode {
         name: String,
         children: Vec<TreeNode>,
     },
+}
+
+impl TreeNode {
+    /// The node's leaf name, whichever kind it is. Used to rank a node against
+    /// a directory's stored order.
+    fn name(&self) -> &str {
+        match self {
+            Self::File { name } | Self::Directory { name, .. } => name,
+        }
+    }
 }
 
 /// File and directory totals returned by the count endpoint. Directories
@@ -1075,11 +1089,21 @@ impl GitFiles {
     /// pagination — and it additionally walks commit history (still no blob
     /// opened, but cost scales with history length rather than page size).
     ///
-    /// The performance contract (search and date-filter modes aside): **no
-    /// blob is ever opened**. Names and entry kinds come entirely from git
-    /// tree objects, so listing cost scales with the number of tree entries
-    /// actually visited — and the pagination below is designed to keep that
-    /// number small even on huge repositories.
+    /// When `apply_order_index` is set, each level of the result is reordered by the
+    /// stored order index of the directory it belongs to (see
+    /// [`Self::apply_order`]). This is the one mode that opens blobs — one
+    /// small index per directory actually rendered.
+    ///
+    /// The performance contract (search, date-filter and order modes aside):
+    /// **no blob is ever opened**. Names and entry kinds come entirely from
+    /// git tree objects, so listing cost scales with the number of tree
+    /// entries actually visited — and the pagination below is designed to keep
+    /// that number small even on huge repositories.
+    ///
+    /// Order indexes themselves are never listed, whatever
+    /// `include_hidden_files` says: they are a separate resource with their own
+    /// route, not content.
+    #[allow(clippy::too_many_arguments)]
     pub fn list_files(
         repo_path: &Path,
         tenant_id: &str,
@@ -1088,10 +1112,11 @@ impl GitFiles {
         include_hidden_files: bool,
         file_name_starts_with: Option<&[String]>,
         date_filter: Option<DateFilter>,
+        apply_order_index: bool,
         page: usize,
         per_page: usize,
     ) -> Result<(Vec<TreeNode>, bool), AppError> {
-        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, file_name_starts_with = ?file_name_starts_with, date_filter = ?date_filter, page = page, per_page = per_page, "listing files");
+        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, file_name_starts_with = ?file_name_starts_with, date_filter = ?date_filter, apply_order_index = apply_order_index, page = page, per_page = per_page, "listing files");
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
         let head_commit = repo.head()?.peel_to_commit()?;
@@ -1126,6 +1151,7 @@ impl GitFiles {
                 maximum_depth,
                 include_hidden_files,
                 date_filter,
+                apply_order_index,
                 page,
                 per_page,
             );
@@ -1142,6 +1168,7 @@ impl GitFiles {
                 maximum_depth,
                 include_hidden_files,
                 date_filter,
+                apply_order_index,
                 page,
                 per_page,
             );
@@ -1171,7 +1198,14 @@ impl GitFiles {
 
             match entry.kind() {
                 Some(git2::ObjectType::Tree) => root_dirs.push((name.to_string(), entry.id())),
-                Some(git2::ObjectType::Blob) => root_files.push(name.to_string()),
+
+                // The order index is a separate resource, not content: it is
+                // dropped unconditionally, even when hidden entries are asked
+                // for, so it can only ever be reached through `/order`.
+                Some(git2::ObjectType::Blob) if name != order::ORDER_FILE_NAME => {
+                    root_files.push(name.to_string())
+                }
+
                 _ => {}
             }
         }
@@ -1191,10 +1225,33 @@ impl GitFiles {
             File(String),
         }
 
-        let page_entries: Vec<RootEntry> = root_dirs
+        let mut root_entries: Vec<RootEntry> = root_dirs
             .into_iter()
             .map(|(name, oid)| RootEntry::Directory(name, oid))
             .chain(root_files.into_iter().map(RootEntry::File))
+            .collect();
+
+        // The listing root's own order is applied *before* the page window is
+        // sliced — pagination is over root-level entries, so ordering them
+        // afterwards would page over the wrong sequence. Only one index is
+        // read here; off-page directories are still never opened.
+        if apply_order_index {
+            if let Some(order) = GitOrder::stored_order(&repo, &walk_tree, "") {
+                let ranks = Self::order_ranks(&order);
+
+                root_entries.sort_by_key(|root_entry| {
+                    let name = match root_entry {
+                        RootEntry::Directory(name, _oid) => name.as_str(),
+                        RootEntry::File(name) => name.as_str(),
+                    };
+
+                    ranks.get(name).copied().unwrap_or(usize::MAX)
+                });
+            }
+        }
+
+        let page_entries: Vec<RootEntry> = root_entries
+            .into_iter()
             .skip(offset)
             .take(per_page)
             .collect();
@@ -1230,9 +1287,80 @@ impl GitFiles {
             }
         }
 
+        // The root level was ordered before pagination; every level *below* it
+        // is ordered here, walking only the subtrees that made the page.
+        if apply_order_index {
+            for node in nodes.iter_mut() {
+                if let TreeNode::Directory { name, children } = node {
+                    Self::apply_order(&repo, &walk_tree, name, children);
+                }
+            }
+        }
+
         tracing::debug!(tenant_id = %tenant_id, page = page, returned = nodes.len(), has_more = has_more, "file listing complete");
 
         Ok((nodes, has_more))
+    }
+
+    /// Position of each name in a stored order, so a *stable* sort by rank
+    /// puts listed entries first in index order and leaves everything else
+    /// (rank `usize::MAX`) in the order it already had — which is what makes a
+    /// sparse index pin only what it names.
+    ///
+    /// Names are compared with any directory-marking trailing slash stripped.
+    /// A duplicate keeps its first position; writes reject duplicates, but a
+    /// hand-edited index must still rank deterministically.
+    fn order_ranks(order: &[String]) -> HashMap<&str, usize> {
+        let mut ranks: HashMap<&str, usize> = HashMap::with_capacity(order.len());
+
+        for (position, entry) in order.iter().enumerate() {
+            ranks.entry(order::entry_name(entry)).or_insert(position);
+        }
+
+        ranks
+    }
+
+    /// Reorders `nodes` — the rendered children of `directory`, itself
+    /// relative to `base_tree` — by that directory's stored order index, then
+    /// recurses into every directory child.
+    ///
+    /// Best-effort by design: a directory with no index, or with one that
+    /// cannot be parsed, is left in its ordinary order, and an index entry
+    /// naming something absent from `nodes` simply ranks nothing. That is what
+    /// makes a stale index harmless — a revert can restore an index older than
+    /// the files it names, and no listing should fail because of it.
+    ///
+    /// This is the only place in the listing path that opens a blob: one index
+    /// per directory actually rendered.
+    fn apply_order(
+        repo: &Repository,
+        base_tree: &git2::Tree<'_>,
+        directory: &str,
+        nodes: &mut [TreeNode],
+    ) {
+        // Nothing rendered at this level, so no index is worth reading — a
+        // depth-limited stub costs no blob read.
+        if nodes.is_empty() {
+            return;
+        }
+
+        if let Some(order) = GitOrder::stored_order(repo, base_tree, directory) {
+            let ranks = Self::order_ranks(&order);
+
+            nodes.sort_by_key(|node| ranks.get(node.name()).copied().unwrap_or(usize::MAX));
+        }
+
+        for node in nodes.iter_mut() {
+            if let TreeNode::Directory { name, children } = node {
+                let child_directory = if directory.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}/{}", directory, name)
+                };
+
+                Self::apply_order(repo, base_tree, &child_directory, children);
+            }
+        }
     }
 
     /// Recursively walks one paged root directory and builds its child nodes.
@@ -1279,6 +1407,12 @@ impl GitFiles {
             }
 
             let name = entry.name().unwrap_or("");
+
+            // Order indexes are a separate resource, never listed as content.
+            if name == order::ORDER_FILE_NAME {
+                return git2::TreeWalkResult::Ok;
+            }
+
             flat.push(format!("{}{}", root, name));
 
             git2::TreeWalkResult::Ok
@@ -1313,6 +1447,7 @@ impl GitFiles {
     /// everywhere else: `page`/`per_page` window over the matched tree's
     /// root-level entries. Same performance contract otherwise — **no blob is
     /// ever opened**, matching is on names alone.
+    #[allow(clippy::too_many_arguments)]
     fn search_by_file_name(
         repo: &Repository,
         walk_tree: &git2::Tree<'_>,
@@ -1321,6 +1456,7 @@ impl GitFiles {
         maximum_depth: Option<usize>,
         include_hidden_files: bool,
         date_filter: Option<DateFilter>,
+        apply_order_index: bool,
         page: usize,
         per_page: usize,
     ) -> Result<(Vec<TreeNode>, bool), AppError> {
@@ -1393,10 +1529,12 @@ impl GitFiles {
                         dir_stubs.push(full_path);
                     }
                 }
-                Some(git2::ObjectType::Blob) => {
-                    if in_matched || self_matches {
-                        flat.push(full_path);
-                    }
+                // Order indexes are a separate resource, never listed as
+                // content — and so never searchable by name either.
+                Some(git2::ObjectType::Blob)
+                    if name != order::ORDER_FILE_NAME && (in_matched || self_matches) =>
+                {
+                    flat.push(full_path);
                 }
                 _ => {}
             }
@@ -1423,7 +1561,14 @@ impl GitFiles {
         // the stubs it receives are matched directories that were not (or
         // could not be) expanded. The matched tree is then paginated over its
         // root-level entries, exactly like the plain listing.
-        let tree = GitUtils::build_tree(flat, dir_stubs, None);
+        let mut tree = GitUtils::build_tree(flat, dir_stubs, None);
+
+        // The whole matched tree is in hand before pagination here, so
+        // ordering is applied to it in full and the page window is sliced from
+        // the ordered result.
+        if apply_order_index {
+            Self::apply_order(repo, walk_tree, "", &mut tree);
+        }
 
         let total = tree.len();
         let offset = ((page - 1) * per_page).min(total);
@@ -1442,6 +1587,7 @@ impl GitFiles {
     /// structure leading to a surviving file, so an emptied directory is
     /// pruned. `maximum_depth` and `include_hidden_files` bound the walk
     /// exactly as elsewhere; files below the depth limit are never candidates.
+    #[allow(clippy::too_many_arguments)]
     fn list_with_date_filter(
         repo: &Repository,
         walk_tree: &git2::Tree<'_>,
@@ -1449,6 +1595,7 @@ impl GitFiles {
         maximum_depth: Option<usize>,
         include_hidden_files: bool,
         date_filter: DateFilter,
+        apply_order_index: bool,
         page: usize,
         per_page: usize,
     ) -> Result<(Vec<TreeNode>, bool), AppError> {
@@ -1458,7 +1605,14 @@ impl GitFiles {
         // Depth was already applied during collection, so `build_tree` needs
         // no depth handling of its own, and there are no stubs (a directory we
         // could not descend into cannot be date-classified, so it is dropped).
-        let tree = GitUtils::build_tree(matched, Vec::new(), None);
+        let mut tree = GitUtils::build_tree(matched, Vec::new(), None);
+
+        // The whole surviving tree is in hand before pagination here, so
+        // ordering is applied to it in full and the page window is sliced from
+        // the ordered result.
+        if apply_order_index {
+            Self::apply_order(repo, walk_tree, "", &mut tree);
+        }
 
         let total = tree.len();
         let offset = ((page - 1) * per_page).min(total);
@@ -1505,7 +1659,12 @@ impl GitFiles {
 
             if entry.kind() == Some(git2::ObjectType::Blob) {
                 let name = entry.name().unwrap_or("");
-                flat.push(format!("{}{}", root, name));
+
+                // Order indexes are a separate resource, never listed as
+                // content — so they are never date-filtered either.
+                if name != order::ORDER_FILE_NAME {
+                    flat.push(format!("{}{}", root, name));
+                }
             }
 
             git2::TreeWalkResult::Ok
@@ -1723,6 +1882,14 @@ impl GitFiles {
                         }
                     }
                 }
+                // Order indexes are a separate resource, not content: they are
+                // excluded from the count exactly as from the listing, whatever
+                // `include_hidden_files` says.
+                Some(git2::ObjectType::Blob)
+                    if entry
+                        .name()
+                        .is_ok_and(|name| name == order::ORDER_FILE_NAME) => {}
+
                 Some(git2::ObjectType::Blob) => {
                     let counted = match restrict_file_extensions {
                         None => true,
@@ -1757,7 +1924,8 @@ impl GitFiles {
     /// tree) so the response always reflects the last successfully committed state.
     ///
     /// A path resolving to a folder answers the same 404 as a missing file —
-    /// consistent with the HEAD existence endpoint. See
+    /// consistent with the HEAD existence endpoint, and so does a path naming
+    /// an order index, which is reachable only through `/order`. See
     /// `GitUtils::windowed_blob_content` for how seek windows are read.
     pub fn read_file(
         repo_path: &Path,
@@ -1766,6 +1934,12 @@ impl GitFiles {
         seek: &SeekFilter,
     ) -> Result<String, AppError> {
         tracing::debug!(tenant_id = %tenant_id, path = %file_path, "reading file");
+
+        if order::is_order_file(file_path) {
+            return Err(AppError::FileNotFound {
+                path: file_path.to_string(),
+            });
+        }
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
         let head_commit = repo.head()?.peel_to_commit()?;
@@ -1806,15 +1980,22 @@ impl GitFiles {
 
         file_reads
             .iter()
-            .map(
-                |(file_path, seek)| match GitUtils::blob_oid_in_tree(&head_tree, file_path) {
+            .map(|(file_path, seek)| {
+                // An order index is invisible here for the same reason it is
+                // on the single read route, and `None` already means "not
+                // found" — no special slot is needed for it.
+                if order::is_order_file(file_path) {
+                    return Ok(None);
+                }
+
+                match GitUtils::blob_oid_in_tree(&head_tree, file_path) {
                     None => Ok(None),
 
                     Some(blob_oid) => {
                         GitUtils::windowed_blob_content(&repo, blob_oid, file_path, seek).map(Some)
                     }
-                },
-            )
+                }
+            })
             .collect()
     }
 
@@ -1828,8 +2009,16 @@ impl GitFiles {
     /// is still an error rather than `Missing`: the caller is asking about a
     /// repository that does not exist, which is a different answer from "that
     /// path is not in this repository".
+    ///
+    /// An order index classifies as `Missing` whatever HEAD holds: it is a
+    /// separate resource with its own route, so it is neither a file the
+    /// existence endpoint should confirm nor a path delete/move may act on.
     pub fn path_kind(repo_path: &Path, tenant_id: &str, path: &str) -> Result<PathKind, AppError> {
         tracing::debug!(tenant_id = %tenant_id, path = %path, "classifying path");
+
+        if order::is_order_file(path) {
+            return Ok(PathKind::Missing);
+        }
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
         let head_commit = repo.head()?.peel_to_commit()?;
@@ -1876,6 +2065,20 @@ impl GitFiles {
         author_email: &str,
     ) -> Result<(String, Option<FileChange>), AppError> {
         tracing::debug!(path = %file_path, author_name = %author_name, author_email = %author_email, "writing file");
+
+        // The order index has its own route, which owns its format and
+        // validates it. Letting a client PUT it as an ordinary file would
+        // bypass that validation entirely, so the path is refused outright —
+        // and with a message that says where to go, since unlike a read there
+        // is no sense in which a write "is not found".
+        if order::is_order_file(file_path) {
+            return Err(AppError::InvalidOperation {
+                reason: format!(
+                    "path is reserved for the file order index, write it through /order instead: {}",
+                    file_path
+                ),
+            });
+        }
 
         let repo = GitUtils::open_or_init_repo(repo_path, author_name, author_email)?;
 
@@ -1978,6 +2181,13 @@ impl GitFiles {
     /// Unlike `write_file`, this opens the repo with `open_tenant_repo` (no
     /// auto-init): deleting a file from a tenant that never existed is a
     /// 404, not a reason to create an empty repository.
+    ///
+    /// The parent directory's order index, when it lists this file, is
+    /// rewritten without it **in the same commit** — so a downstream order
+    /// table never holds a position for a file that is gone. That upkeep is
+    /// what makes the returned change list plural: the file's own deletion
+    /// plus, at most, the index's change (which the hook layer turns into an
+    /// `order.*` event from its path alone).
     pub fn delete_file(
         repo_path: &Path,
         tenant_id: &str,
@@ -1985,8 +2195,16 @@ impl GitFiles {
         commit_message: Option<&str>,
         author_name: &str,
         author_email: &str,
-    ) -> Result<(String, FileChange), AppError> {
+    ) -> Result<(String, Vec<FileChange>), AppError> {
         tracing::debug!(tenant_id = %tenant_id, path = %file_path, author_name = %author_name, author_email = %author_email, "deleting file");
+
+        // The order index is not addressable through the file routes, so it is
+        // "not a file" here exactly as a folder is.
+        if order::is_order_file(file_path) {
+            return Err(AppError::FileNotFound {
+                path: file_path.to_string(),
+            });
+        }
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
 
@@ -2019,9 +2237,28 @@ impl GitFiles {
 
         // The commit tree is HEAD's tree minus this single entry — O(path
         // depth) instead of the O(repository size) an index round-trip costs.
-        let tree_id = TreeUpdateBuilder::new()
-            .remove(file_path)
-            .create_updated(&repo, &head_tree)?;
+        let mut tree_update = TreeUpdateBuilder::new();
+
+        tree_update.remove(file_path);
+
+        let mut file_changes = vec![FileChange::Deleted {
+            path: file_path.to_string(),
+        }];
+
+        // Same commit, so the order index can never be left naming a file this
+        // commit removed.
+        let (parent_directory, leaf_name) = order::split_parent(file_path);
+
+        file_changes.extend(GitOrder::stage_entry_removed(
+            &repo,
+            repo_path,
+            &head_tree,
+            &mut tree_update,
+            parent_directory,
+            leaf_name,
+        )?);
+
+        let tree_id = tree_update.create_updated(&repo, &head_tree)?;
 
         let tree = repo.find_tree(tree_id)?;
         let signature = GitUtils::git_signature(author_name, author_email)?;
@@ -2040,14 +2277,9 @@ impl GitFiles {
             &[&parent_commit],
         )?;
 
-        tracing::debug!(tenant_id = %tenant_id, path = %file_path, sha = %commit_oid, "file deletion committed");
+        tracing::debug!(tenant_id = %tenant_id, path = %file_path, sha = %commit_oid, change_count = file_changes.len(), "file deletion committed");
 
-        Ok((
-            commit_oid.to_string(),
-            FileChange::Deleted {
-                path: file_path.to_string(),
-            },
-        ))
+        Ok((commit_oid.to_string(), file_changes))
     }
 
     /// Removes a whole folder — every file beneath it, recursively — in a
@@ -2066,6 +2298,12 @@ impl GitFiles {
     /// parent directory the removal leaves empty. Cost is therefore
     /// proportional to the path depth, not to the number of files removed;
     /// only the hook list scales with the file count.
+    ///
+    /// Order indexes travel with the subtree: each one inside it is a blob
+    /// like any other, so it is collected and reported as a deletion, which
+    /// the hook layer turns into an `order.deleted` event from its path alone.
+    /// The *parent* directory's index — which sits outside the subtree — is
+    /// rewritten without this folder in the same commit.
     pub fn delete_directory(
         repo_path: &Path,
         tenant_id: &str,
@@ -2116,9 +2354,29 @@ impl GitFiles {
             Err(err) => return Err(AppError::Io(err)),
         }
 
-        let tree_id = TreeUpdateBuilder::new()
-            .remove(dir_path)
-            .create_updated(&repo, &head_tree)?;
+        let mut tree_update = TreeUpdateBuilder::new();
+
+        tree_update.remove(dir_path);
+
+        let mut file_changes: Vec<FileChange> = blobs
+            .iter()
+            .map(|(path, _oid)| FileChange::Deleted { path: path.clone() })
+            .collect();
+
+        // The parent's index, if it pins this folder, loses that entry in the
+        // same commit.
+        let (parent_directory, dir_name) = order::split_parent(dir_path);
+
+        file_changes.extend(GitOrder::stage_entry_removed(
+            &repo,
+            repo_path,
+            &head_tree,
+            &mut tree_update,
+            parent_directory,
+            dir_name,
+        )?);
+
+        let tree_id = tree_update.create_updated(&repo, &head_tree)?;
 
         let tree = repo.find_tree(tree_id)?;
         let signature = GitUtils::git_signature(author_name, author_email)?;
@@ -2139,15 +2397,9 @@ impl GitFiles {
             &[&parent_commit],
         )?;
 
-        tracing::debug!(tenant_id = %tenant_id, path = %dir_path, sha = %commit_oid, file_count = blobs.len(), "recursive directory deletion committed");
+        tracing::debug!(tenant_id = %tenant_id, path = %dir_path, sha = %commit_oid, change_count = file_changes.len(), "recursive directory deletion committed");
 
-        Ok((
-            commit_oid.to_string(),
-            blobs
-                .into_iter()
-                .map(|(path, _oid)| FileChange::Deleted { path })
-                .collect(),
-        ))
+        Ok((commit_oid.to_string(), file_changes))
     }
 
     /// Renames a file on disk, stages both sides, and creates a single commit.
@@ -2157,6 +2409,17 @@ impl GitFiles {
     /// two separate commits (delete + create) would fire two hooks and make
     /// the downstream receiver treat the file as a brand-new entity, losing
     /// whatever metadata it had attached to the old path.
+    ///
+    /// Order indexes are kept honest in the same commit, and the two shapes of
+    /// move are treated differently on purpose:
+    ///
+    /// - **A rename inside one directory keeps the file's position** in that
+    ///   directory's index. Demoting a file to the tail because its name
+    ///   changed would silently reorder content the caller only renamed.
+    /// - **A move across directories** drops the file from the source index
+    ///   and appends it to the destination index *only when one already
+    ///   exists* — creating an index would pin one file in a directory whose
+    ///   siblings are all implicitly ordered, which the caller did not ask for.
     pub fn move_file(
         repo_path: &Path,
         tenant_id: &str,
@@ -2165,7 +2428,7 @@ impl GitFiles {
         commit_message: Option<&str>,
         author_name: &str,
         author_email: &str,
-    ) -> Result<(String, FileChange), AppError> {
+    ) -> Result<(String, Vec<FileChange>), AppError> {
         tracing::debug!(
             tenant_id = %tenant_id,
             from_path = %from_path,
@@ -2173,6 +2436,24 @@ impl GitFiles {
             author_email = %author_email,
             "moving file"
         );
+
+        // The order index is not addressable through the file routes: as a
+        // source it is "not a file", and as a destination it is a path the
+        // caller may not write (the order route owns its format).
+        if order::is_order_file(from_path) {
+            return Err(AppError::FileNotFound {
+                path: from_path.to_string(),
+            });
+        }
+
+        if order::is_order_file(to_path) {
+            return Err(AppError::InvalidOperation {
+                reason: format!(
+                    "destination is reserved for the file order index, write it through /order instead: {}",
+                    to_path
+                ),
+            });
+        }
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
 
@@ -2237,10 +2518,52 @@ impl GitFiles {
 
         // The commit tree is HEAD's tree with the entry relocated, reusing the
         // existing blob — no content rehash, no index round-trip.
-        let tree_id = TreeUpdateBuilder::new()
-            .remove(from_path)
-            .upsert(to_path, source_blob_oid, FileMode::Blob)
-            .create_updated(&repo, &head_tree)?;
+        let mut tree_update = TreeUpdateBuilder::new();
+
+        tree_update.remove(from_path);
+        tree_update.upsert(to_path, source_blob_oid, FileMode::Blob);
+
+        let mut file_changes = vec![FileChange::Moved {
+            from_path: from_path.to_string(),
+            to_path: to_path.to_string(),
+            content,
+        }];
+
+        let (from_directory, from_name) = order::split_parent(from_path);
+        let (to_directory, to_name) = order::split_parent(to_path);
+
+        if from_directory == to_directory {
+            // A pure rename: the file keeps whatever position it held.
+            file_changes.extend(GitOrder::stage_entry_renamed(
+                &repo,
+                repo_path,
+                &head_tree,
+                &mut tree_update,
+                from_directory,
+                from_name,
+                to_name,
+            )?);
+        } else {
+            file_changes.extend(GitOrder::stage_entry_removed(
+                &repo,
+                repo_path,
+                &head_tree,
+                &mut tree_update,
+                from_directory,
+                from_name,
+            )?);
+
+            file_changes.extend(GitOrder::stage_entry_appended(
+                &repo,
+                repo_path,
+                &head_tree,
+                &mut tree_update,
+                to_directory,
+                to_name,
+            )?);
+        }
+
+        let tree_id = tree_update.create_updated(&repo, &head_tree)?;
 
         let tree = repo.find_tree(tree_id)?;
         let signature = GitUtils::git_signature(author_name, author_email)?;
@@ -2270,17 +2593,11 @@ impl GitFiles {
             from_path = %from_path,
             to_path = %to_path,
             sha = %commit_oid,
+            change_count = file_changes.len(),
             "file move committed"
         );
 
-        Ok((
-            commit_oid.to_string(),
-            FileChange::Moved {
-                from_path: from_path.to_string(),
-                to_path: to_path.to_string(),
-                content,
-            },
-        ))
+        Ok((commit_oid.to_string(), file_changes))
     }
 
     /// Relocates a whole folder — every file beneath it, recursively — in a
@@ -2301,6 +2618,14 @@ impl GitFiles {
     /// Blob oids are reused verbatim, so no content is rehashed; content is
     /// read once per file purely to fill that file's hook payload, exactly as
     /// the single-file move does.
+    ///
+    /// Order indexes need no rewriting: their entries are leaf names, so every
+    /// index inside the subtree is still correct at its new location. Each one
+    /// travels as a moved blob like any other file, which the hook layer turns
+    /// into `order.deleted` at the old directory plus `order.updated` at the
+    /// new one. The two *parent* indexes — outside the subtree — are updated
+    /// in the same commit, with the same rename-keeps-its-position rule as
+    /// [`Self::move_file`].
     pub fn move_directory(
         repo_path: &Path,
         tenant_id: &str,
@@ -2439,6 +2764,42 @@ impl GitFiles {
             Err(err) => return Err(AppError::Io(err)),
         }
 
+        // The parent indexes are settled last, once every file is staged: the
+        // folder loses its entry where it came from and gains one where it
+        // landed, or keeps its position outright when both are the same parent.
+        let (from_parent, from_name) = order::split_parent(from_path);
+        let (to_parent, to_name) = order::split_parent(to_path);
+
+        if from_parent == to_parent {
+            file_changes.extend(GitOrder::stage_entry_renamed(
+                &repo,
+                repo_path,
+                &head_tree,
+                &mut tree_update,
+                from_parent,
+                from_name,
+                &order::directory_entry(to_name),
+            )?);
+        } else {
+            file_changes.extend(GitOrder::stage_entry_removed(
+                &repo,
+                repo_path,
+                &head_tree,
+                &mut tree_update,
+                from_parent,
+                from_name,
+            )?);
+
+            file_changes.extend(GitOrder::stage_entry_appended(
+                &repo,
+                repo_path,
+                &head_tree,
+                &mut tree_update,
+                to_parent,
+                &order::directory_entry(to_name),
+            )?);
+        }
+
         let tree_id = tree_update.create_updated(&repo, &head_tree)?;
         let tree = repo.find_tree(tree_id)?;
         let signature = GitUtils::git_signature(author_name, author_email)?;
@@ -2475,6 +2836,406 @@ impl GitFiles {
         );
 
         Ok((commit_oid.to_string(), file_changes))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GitOrder — the per-directory file-order index
+// ---------------------------------------------------------------------------
+
+/// Reads and writes the per-directory order index, and keeps existing indexes
+/// honest as files move and disappear.
+///
+/// The index is stored as a `.order.json` blob in the directory it orders (see
+/// `order.rs` for the format and the reasoning), and every operation here goes
+/// through the ordinary write machinery: HEAD is authoritative, the commit tree
+/// is built with `TreeUpdateBuilder`, and the working tree is mirrored as a
+/// courtesy. Two properties follow from that and are worth stating outright:
+///
+/// - **An index change is a file change internally.** Every function returns a
+///   `FileChange` on the index's own path; the hook layer derives the
+///   `order.*` event kind from that path. Nothing here knows about hooks, and
+///   nothing else in the system needs a special case for order events —
+///   reverts, rollbacks and recursive folder operations classify for free.
+/// - **Upkeep rides along in the same commit** as the file operation that
+///   triggered it, so a receiver never sees a window in which the order table
+///   references a file that no longer exists.
+pub struct GitOrder;
+
+impl GitOrder {
+    /// Returns the stored order for `directory`, or a 404 when that directory
+    /// has no index.
+    pub fn read_order(
+        repo_path: &Path,
+        tenant_id: &str,
+        directory: &str,
+    ) -> Result<Vec<String>, AppError> {
+        tracing::debug!(tenant_id = %tenant_id, directory = %order::display_directory(directory), "reading order index");
+
+        let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
+        let head_tree = repo.head()?.peel_to_commit()?.tree()?;
+
+        Self::stored_order(&repo, &head_tree, directory).ok_or_else(|| AppError::OrderNotFound {
+            directory: order::display_directory(directory).to_string(),
+        })
+    }
+
+    /// Replaces `directory`'s order index with `order`.
+    ///
+    /// Every entry is resolved against HEAD's tree and canonicalised from what
+    /// it resolved to (a directory gains a trailing slash, a file does not), so
+    /// an entry naming something absent is a `400`. That strictness is safe
+    /// because the check runs under the tenant write lock, the same lock every
+    /// write takes: the classification cannot go stale before the commit it
+    /// drives. The order may still be *sparse* — entries must exist, but not
+    /// every existing sibling need be listed.
+    ///
+    /// Writing the order the index already holds is a no-op, exactly as
+    /// re-PUTting unchanged file content is: no commit, no hook, and the
+    /// returned sha is HEAD's.
+    pub fn write_order(
+        repo_path: &Path,
+        tenant_id: &str,
+        directory: &str,
+        order_entries: &[String],
+        commit_message: Option<&str>,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<(String, Option<FileChange>), AppError> {
+        let display_directory = order::display_directory(directory);
+
+        tracing::debug!(tenant_id = %tenant_id, directory = %display_directory, entry_count = order_entries.len(), author_name = %author_name, author_email = %author_email, "writing order index");
+
+        // No auto-init here, unlike a file write: an order can only name
+        // entries that exist, so there is nothing a brand-new repository could
+        // accept — and an order route has no business creating a tenant.
+        let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
+
+        let parent_commit = repo.head()?.peel_to_commit()?;
+        let head_tree = parent_commit.tree()?;
+
+        // The repository root is always there; any other directory must be.
+        if !directory.is_empty() {
+            match head_tree.get_path(Path::new(directory)) {
+                Ok(entry) if entry.kind() == Some(git2::ObjectType::Tree) => {}
+                _ => {
+                    tracing::debug!(tenant_id = %tenant_id, directory = %display_directory, "directory not found for order write");
+
+                    return Err(AppError::FileNotFound {
+                        path: directory.to_string(),
+                    });
+                }
+            }
+        }
+
+        let mut canonical: Vec<String> = Vec::with_capacity(order_entries.len());
+
+        for entry in order_entries {
+            let name = order::entry_name(entry);
+
+            let entry_path = if directory.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}/{}", directory, name)
+            };
+
+            match head_tree.get_path(Path::new(&entry_path)) {
+                Ok(tree_entry) if tree_entry.kind() == Some(git2::ObjectType::Blob) => {
+                    canonical.push(name.to_string())
+                }
+                Ok(tree_entry) if tree_entry.kind() == Some(git2::ObjectType::Tree) => {
+                    canonical.push(order::directory_entry(name))
+                }
+                _ => {
+                    tracing::debug!(tenant_id = %tenant_id, directory = %display_directory, entry = %name, "order write rejected: entry does not exist");
+
+                    return Err(AppError::InvalidOperation {
+                        reason: format!(
+                            "order entry does not exist in '{}': {}",
+                            display_directory, name
+                        ),
+                    });
+                }
+            }
+        }
+
+        let index_path = order::order_file_path(directory);
+        let existing_oid = GitUtils::blob_oid_in_tree(&head_tree, &index_path);
+
+        // Hashing the serialised document yields the oid the blob *would* get;
+        // matching HEAD's entry means this write changes nothing.
+        let incoming_oid = git2::Oid::hash_object(
+            git2::ObjectType::Blob,
+            order::serialize(&canonical).as_bytes(),
+        )?;
+
+        if existing_oid == Some(incoming_oid) {
+            tracing::debug!(tenant_id = %tenant_id, directory = %display_directory, "order unchanged, skipping commit");
+
+            return Ok((parent_commit.id().to_string(), None));
+        }
+
+        let mut tree_update = TreeUpdateBuilder::new();
+
+        let change = Self::stage_index(
+            &repo,
+            repo_path,
+            &mut tree_update,
+            directory,
+            &canonical,
+            existing_oid.is_some(),
+        )?;
+
+        let tree_id = tree_update.create_updated(&repo, &head_tree)?;
+        let tree = repo.find_tree(tree_id)?;
+        let signature = GitUtils::git_signature(author_name, author_email)?;
+
+        let auto_message = format!("order update: {}", display_directory);
+        let message = commit_message.unwrap_or(&auto_message);
+
+        let commit_oid = repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &[&parent_commit],
+        )?;
+
+        tracing::debug!(tenant_id = %tenant_id, directory = %display_directory, sha = %commit_oid, "order write committed");
+
+        Ok((commit_oid.to_string(), Some(change)))
+    }
+
+    /// Drops `directory`'s order index, so the directory falls back to the
+    /// ordinary listing order. A directory with no index is a 404 — there is
+    /// nothing to delete, and reporting success would hide a caller mistake.
+    pub fn delete_order(
+        repo_path: &Path,
+        tenant_id: &str,
+        directory: &str,
+        commit_message: Option<&str>,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<(String, FileChange), AppError> {
+        let display_directory = order::display_directory(directory);
+
+        tracing::debug!(tenant_id = %tenant_id, directory = %display_directory, author_name = %author_name, author_email = %author_email, "deleting order index");
+
+        let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
+
+        let parent_commit = repo.head()?.peel_to_commit()?;
+        let head_tree = parent_commit.tree()?;
+
+        let index_path = order::order_file_path(directory);
+
+        if GitUtils::blob_oid_in_tree(&head_tree, &index_path).is_none() {
+            tracing::debug!(tenant_id = %tenant_id, directory = %display_directory, "order index not found for deletion");
+
+            return Err(AppError::OrderNotFound {
+                directory: display_directory.to_string(),
+            });
+        }
+
+        let mut tree_update = TreeUpdateBuilder::new();
+
+        // An empty order stages a removal — an index holding nothing and no
+        // index at all are the same state.
+        let change = Self::stage_index(&repo, repo_path, &mut tree_update, directory, &[], true)?;
+
+        let tree_id = tree_update.create_updated(&repo, &head_tree)?;
+        let tree = repo.find_tree(tree_id)?;
+        let signature = GitUtils::git_signature(author_name, author_email)?;
+
+        let auto_message = format!("order delete: {}", display_directory);
+        let message = commit_message.unwrap_or(&auto_message);
+
+        let commit_oid = repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &[&parent_commit],
+        )?;
+
+        tracing::debug!(tenant_id = %tenant_id, directory = %display_directory, sha = %commit_oid, "order deletion committed");
+
+        Ok((commit_oid.to_string(), change))
+    }
+
+    /// The order stored for `directory` (relative to `tree`), or `None` when
+    /// there is no index or it cannot be read as one.
+    ///
+    /// A malformed index degrades to "no index" rather than to an error: only
+    /// this server's order route writes the file, so a broken one can only
+    /// come from a hand-edited commit, and that must not be able to fail every
+    /// listing of the directory.
+    fn stored_order(
+        repo: &Repository,
+        tree: &git2::Tree<'_>,
+        directory: &str,
+    ) -> Option<Vec<String>> {
+        let index_path = order::order_file_path(directory);
+        let index_oid = GitUtils::blob_oid_in_tree(tree, &index_path)?;
+        let blob = repo.find_blob(index_oid).ok()?;
+
+        let parsed = order::parse(std::str::from_utf8(blob.content()).ok()?);
+
+        if parsed.is_none() {
+            tracing::warn!(path = %index_path, "order index is malformed, ignoring it");
+        }
+
+        parsed
+    }
+
+    /// Stages `directory`'s index to hold `order_entries` — or removes the
+    /// index when they are empty — mirroring the change onto the working tree,
+    /// and returns the change recorded for the index blob itself.
+    ///
+    /// `index_existed` only picks between a created and an updated change; both
+    /// become the same `order.updated` event, but the distinction keeps the
+    /// change list honest for anything else reading it.
+    fn stage_index(
+        repo: &Repository,
+        repo_path: &Path,
+        tree_update: &mut TreeUpdateBuilder,
+        directory: &str,
+        order_entries: &[String],
+        index_existed: bool,
+    ) -> Result<FileChange, AppError> {
+        let index_path = order::order_file_path(directory);
+        let absolute_path = repo_path.join(&index_path);
+
+        if order_entries.is_empty() {
+            tracing::trace!(path = %index_path, "staging order index removal");
+
+            // An index already missing from the working tree just means the
+            // working tree had diverged from HEAD; HEAD is what counts.
+            match std::fs::remove_file(&absolute_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(AppError::Io(err)),
+            }
+
+            tree_update.remove(&index_path);
+
+            return Ok(FileChange::Deleted { path: index_path });
+        }
+
+        tracing::trace!(path = %index_path, entry_count = order_entries.len(), "staging order index write");
+
+        let content = order::serialize(order_entries);
+
+        if let Some(parent_dir) = absolute_path.parent() {
+            std::fs::create_dir_all(parent_dir)?;
+        }
+
+        std::fs::write(&absolute_path, &content)?;
+
+        let blob_oid = repo.blob(content.as_bytes())?;
+
+        tree_update.upsert(&index_path, blob_oid, FileMode::Blob);
+
+        Ok(if index_existed {
+            FileChange::Updated {
+                path: index_path,
+                content,
+            }
+        } else {
+            FileChange::Created {
+                path: index_path,
+                content,
+            }
+        })
+    }
+
+    /// Drops `name` from `directory`'s index. `None` when there is no index
+    /// there, or when it does not list `name` — upkeep never creates an index
+    /// and never rewrites one it has nothing to say about.
+    fn stage_entry_removed(
+        repo: &Repository,
+        repo_path: &Path,
+        head_tree: &git2::Tree<'_>,
+        tree_update: &mut TreeUpdateBuilder,
+        directory: &str,
+        name: &str,
+    ) -> Result<Option<FileChange>, AppError> {
+        let Some(stored) = Self::stored_order(repo, head_tree, directory) else {
+            return Ok(None);
+        };
+
+        let entry_count = stored.len();
+
+        let retained: Vec<String> = stored
+            .into_iter()
+            .filter(|entry| order::entry_name(entry) != name)
+            .collect();
+
+        if retained.len() == entry_count {
+            return Ok(None);
+        }
+
+        Self::stage_index(repo, repo_path, tree_update, directory, &retained, true).map(Some)
+    }
+
+    /// Appends `canonical_entry` to `directory`'s index, at the tail.
+    ///
+    /// `None` when there is no index there — an index is only ever *edited* by
+    /// upkeep, never created: pinning one file in a directory whose siblings
+    /// are all implicitly ordered would be a surprise the caller did not ask
+    /// for. Also `None` when the entry is already listed (which a stale entry
+    /// left by a revert can make true), so upkeep never duplicates a name.
+    fn stage_entry_appended(
+        repo: &Repository,
+        repo_path: &Path,
+        head_tree: &git2::Tree<'_>,
+        tree_update: &mut TreeUpdateBuilder,
+        directory: &str,
+        canonical_entry: &str,
+    ) -> Result<Option<FileChange>, AppError> {
+        let Some(mut stored) = Self::stored_order(repo, head_tree, directory) else {
+            return Ok(None);
+        };
+
+        let name = order::entry_name(canonical_entry);
+
+        if stored.iter().any(|entry| order::entry_name(entry) == name) {
+            return Ok(None);
+        }
+
+        stored.push(canonical_entry.to_string());
+
+        Self::stage_index(repo, repo_path, tree_update, directory, &stored, true).map(Some)
+    }
+
+    /// Replaces `from_name` with `canonical_entry` **in place**, keeping the
+    /// entry's position. `None` when there is no index there, or when it does
+    /// not list `from_name` — an unlisted entry stays unlisted, since a rename
+    /// changes a name and should not change an ordering.
+    fn stage_entry_renamed(
+        repo: &Repository,
+        repo_path: &Path,
+        head_tree: &git2::Tree<'_>,
+        tree_update: &mut TreeUpdateBuilder,
+        directory: &str,
+        from_name: &str,
+        canonical_entry: &str,
+    ) -> Result<Option<FileChange>, AppError> {
+        let Some(mut stored) = Self::stored_order(repo, head_tree, directory) else {
+            return Ok(None);
+        };
+
+        let Some(position) = stored
+            .iter()
+            .position(|entry| order::entry_name(entry) == from_name)
+        else {
+            return Ok(None);
+        };
+
+        stored[position] = canonical_entry.to_string();
+
+        Self::stage_index(repo, repo_path, tree_update, directory, &stored, true).map(Some)
     }
 }
 

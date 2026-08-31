@@ -84,7 +84,7 @@ Use the sample [config.toml](https://github.com/crisp-oss/githttp-fs/blob/master
 **[hooks]**
 
 * `url` (type: _string_, allowed: URL, default: no default) — URL of the hook receiver, eg. HTTP URL (if any)
-* `events` (type: _array[string]_, allowed: `file.created`, `file.updated`, `file.deleted` or `file.moved`, Default: no default) — List of events to send hooks for
+* `events` (type: _array[string]_, allowed: `file.created`, `file.updated`, `file.deleted`, `file.moved`, `order.updated` or `order.deleted`, Default: no default) — List of events to send hooks for (the `order.*` events cover changes to a directory's file order index)
 * `retry_attempts` (type: _number_, allowed: any number, Default: no default) — Number of re-delivery attempts to run for a Web Hook that failed delivery
 * `retry_backoff_ms` (type: _number_, allowed: time in milliseconds, Default: no default) — How long to back-off between re-delivery attempts
 

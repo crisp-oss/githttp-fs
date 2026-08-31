@@ -42,6 +42,12 @@ pub enum AppError {
     #[error("commit not found: {sha}")]
     CommitNotFound { sha: String },
 
+    /// No order index is stored for that directory. Named after the resource
+    /// the caller asked for (the directory's order), not after the file it is
+    /// stored in — the storage path is not part of the API surface.
+    #[error("order index not found for directory: {directory}")]
+    OrderNotFound { directory: String },
+
     #[error("tenant not found: {tenant_id}")]
     TenantNotFound { tenant_id: String },
 
@@ -74,6 +80,7 @@ impl IntoResponse for AppError {
         let status = match &self {
             AppError::FileNotFound { .. }
             | AppError::CommitNotFound { .. }
+            | AppError::OrderNotFound { .. }
             | AppError::TenantNotFound { .. } => StatusCode::NOT_FOUND,
 
             AppError::InvalidTenant { .. }

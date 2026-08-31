@@ -208,13 +208,13 @@ pub async fn revert_commit(
     // order always matches commit order.
     state.hook_queue.enqueue(
         &lock_key,
-        HookJob {
+        HookJob::new(
             collection_id,
             tenant_id,
-            commit_sha: new_commit_sha.clone(),
-            committed_at: Utc::now(),
+            new_commit_sha.clone(),
+            Utc::now(),
             file_changes,
-        },
+        ),
     );
 
     state
@@ -302,13 +302,13 @@ pub async fn rollback_commit(
         // hook order always matches commit order.
         state.hook_queue.enqueue(
             &lock_key,
-            HookJob {
+            HookJob::new(
                 collection_id,
                 tenant_id,
-                commit_sha: new_commit_sha.clone(),
-                committed_at: Utc::now(),
+                new_commit_sha.clone(),
+                Utc::now(),
                 file_changes,
-            },
+            ),
         );
 
         state

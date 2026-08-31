@@ -4,7 +4,7 @@ Git-based Content Management System served over HTTP.
 
 ## What it is
 
-githttp-fs is a single Rust binary that wraps git repositories and exposes them as a file-system-over-HTTP API. Each tenant gets its own git repository on disk. Clients can create, read, update, delete, and move `.md`/`.mdx` files via REST. Every effective write produces a git commit (re-writing a file with unchanged content is a no-op). A configurable webhook fires after each commit so downstream systems (e.g. a read-only SQL database) can stay in sync.
+githttp-fs is a single Rust binary that wraps git repositories and exposes them as a file-system-over-HTTP API. Each tenant gets its own git repository on disk. Clients can create, read, update, delete, and move `.md`/`.mdx` files via REST, and optionally pin the presentation order of any directory's entries. Every effective write produces a git commit (re-writing a file with unchanged content is a no-op). A configurable webhook fires after each commit so downstream systems (e.g. a read-only SQL database) can stay in sync.
 
 Git is never exposed in the API surface — no git terminology appears in requests or responses.
 
@@ -20,9 +20,11 @@ src/
   hooks.rs         — async hook delivery with exponential backoff retry
   middleware.rs    — Bearer API key guard (axum middleware)
   seek.rs          — SeekOptions: line-based content windowing for file reads
+  order.rs         — per-directory file order index: format, path rules, validation
   routes/
     mod.rs         — shared request types (AuthorRequest)
     files.rs       — GET/PUT/DELETE/POST on /:collection_id/:tenant_id/files and /:collection_id/:tenant_id/files/*path, plus POST /:collection_id/:tenant_id/batch/files/read and GET /:collection_id/:tenant_id/count/files
+    order.rs       — GET/PUT/DELETE on /:collection_id/:tenant_id/order and /:collection_id/:tenant_id/order/*path
     commits.rs     — commit list, commit detail, revert / point-in-time rollback
     tenant.rs      — DELETE /:collection_id/:tenant_id
 ```
@@ -35,7 +37,7 @@ All routes are prefixed `/v1` and require `Authorization: Bearer <api_key>`.
 |--------|------|-------------|
 | `GET` | `/v1` | Check that the API key is valid (`200` with body `{ "pong": true }`, or `401`) |
 | `DELETE` | `/v1/:collection_id/:tenant_id` | Delete entire tenant repository |
-| `GET` | `/v1/:collection_id/:tenant_id/files?prefix_path=&maximum_depth=&include_hidden_files=&file_name_starts_with=&include_date_from=&include_date_to=&include_date_type=&page=&per_page=` | List tracked files as a tree; optional `prefix_path` scopes the listing to a sub-directory (e.g. `?prefix_path=/docs`); optional `maximum_depth` limits how many directory levels deep the listing goes; optional `include_hidden_files` (default `false`) includes dot-prefixed entries; optional `file_name_starts_with` narrows the listing to files *and directories* whose leaf name begins with the given prefix, case-insensitively (a matched directory brings its contents along); it accepts either a bare string or a JSON-array string of prefixes (e.g. `?file_name_starts_with=["intro", "readme"]`), matching an entry whose name begins with *any* of them; optional `include_date_from`/`include_date_to` (RFC 3339 date-times) narrow the listing to files whose git date falls in the half-open window `[from, to)`, and `include_date_type` (`updated` default, or `created`) selects which date is compared; `page`/`per_page` paginate over the root-level entries of the listing (default 100, max 500) |
+| `GET` | `/v1/:collection_id/:tenant_id/files?prefix_path=&maximum_depth=&include_hidden_files=&file_name_starts_with=&include_date_from=&include_date_to=&include_date_type=&apply_order_index=&page=&per_page=` | List tracked files as a tree; optional `apply_order_index` (default `false`) orders every level by that directory's stored file order index; optional `prefix_path` scopes the listing to a sub-directory (e.g. `?prefix_path=/docs`); optional `maximum_depth` limits how many directory levels deep the listing goes; optional `include_hidden_files` (default `false`) includes dot-prefixed entries; optional `file_name_starts_with` narrows the listing to files *and directories* whose leaf name begins with the given prefix, case-insensitively (a matched directory brings its contents along); it accepts either a bare string or a JSON-array string of prefixes (e.g. `?file_name_starts_with=["intro", "readme"]`), matching an entry whose name begins with *any* of them; optional `include_date_from`/`include_date_to` (RFC 3339 date-times) narrow the listing to files whose git date falls in the half-open window `[from, to)`, and `include_date_type` (`updated` default, or `created`) selects which date is compared; `page`/`per_page` paginate over the root-level entries of the listing (default 100, max 500) |
 | `GET` | `/v1/:collection_id/:tenant_id/count/files?prefix_path=&maximum_depth=&include_hidden_files=&restrict_file_extensions=` | Count files and directories; `prefix_path`, `maximum_depth`, and `include_hidden_files` carry the same semantics as on the file listing route; optional `restrict_file_extensions` (a stringified JSON array, e.g. `["md", "mdx"]`) narrows the file count to files with one of those extensions |
 | `GET` | `/v1/:collection_id/:tenant_id/files/*path?seek_from_line_starts_with=&seek_to_line_starts_with=&seek_lines_maximum=` | Read file content; optional `seek_*` parameters narrow the response to a line window (see below) |
 | `POST` | `/v1/:collection_id/:tenant_id/batch/files/read` | Batch-read several files in one request, with an optional shared seek window (overridable per file); capped by `limits.batch_read_maximum_files` |
@@ -43,6 +45,9 @@ All routes are prefixed `/v1` and require `Authorization: Bearer <api_key>`.
 | `PUT` | `/v1/:collection_id/:tenant_id/files/*path` | Create or update a file |
 | `DELETE` | `/v1/:collection_id/:tenant_id/files/*path` | Delete a file; the optional body flag `allow_prefix_path_recurse` (default `false`) lets the path name a folder instead, deleting every file beneath it recursively in one commit |
 | `POST` | `/v1/:collection_id/:tenant_id/files/*path/move` | Move / rename a file; the optional body flag `allow_prefix_path_recurse` (default `false`) lets the source name a folder instead, relocating its whole subtree in one commit |
+| `GET` | `/v1/:collection_id/:tenant_id/order` and `/v1/:collection_id/:tenant_id/order/*path` | Read the file order stored for a directory (`/order` being the repository root); `404` when it has none |
+| `PUT` | `/v1/:collection_id/:tenant_id/order` and `/v1/:collection_id/:tenant_id/order/*path` | Replace a directory's file order |
+| `DELETE` | `/v1/:collection_id/:tenant_id/order` and `/v1/:collection_id/:tenant_id/order/*path` | Drop a directory's file order, reverting it to the default listing order |
 | `GET` | `/v1/:collection_id/:tenant_id/commits?page=&per_page=&file_path=&include_statistics=` | List commits, paginated (default 100, max 500); optional `file_path` filters to commits touching that file, following renames backward; optional `include_statistics` adds per-commit insertion/deletion/files-changed counts |
 | `GET` | `/v1/:collection_id/:tenant_id/commits/:sha` | Commit detail with per-file diffs and snapshots |
 | `POST` | `/v1/:collection_id/:tenant_id/commits/:sha/revert` | Revert a commit |
@@ -99,6 +104,29 @@ All write requests share a required `author` object. `message` is optional every
 ```
 
 Same body as the revert route — no paths are passed. Which files are in scope is read from `:sha` itself (the files that commit touched), and each of them is restored to the exact state it had **at** that commit, no matter how many commits changed them since. Files the commit never touched are left untouched. The `limits.allowed_extensions` whitelist is *not* applied, since the content comes from history under paths this server already committed.
+
+**PUT** `/order` and `/order/*path` — replace a directory's file order
+```json
+{
+  "author": { "name": "Valerian Saliou", "email": "valerian@example.com" },
+  "order": ["intro.md", "getting-started/", "advanced.mdx"],
+  "message": "optional commit message"
+}
+```
+
+`order` is required and must hold at least one entry (an empty order is a `400` — that is what `DELETE` is for). Entries are **leaf names**, not paths: a nested path, `.`, `..`, `.git`, an empty name, a duplicate (after any trailing slash is stripped), or a reference to the index file itself are all `400`. A trailing slash marking a directory is accepted and normalised — the server stores directories with one and files without, whichever spelling the caller used.
+
+Every entry must **exist in that directory** in the last committed state; an entry naming something absent is a `400`. The check runs against HEAD's tree under the tenant write lock, so it cannot go stale before the commit it drives. The order may still be *sparse*: entries must exist, but not every existing sibling need be listed. Writing the order the directory already holds is a no-op — no commit, no hook, HEAD's sha in the response — exactly as re-PUTting unchanged file content is. A directory that does not exist is a `404`; `limits.allowed_extensions` does not apply (the server, not the caller, decides this path).
+
+**DELETE** `/order` and `/order/*path` — drop a directory's file order
+```json
+{
+  "author": { "name": "Valerian Saliou", "email": "valerian@example.com" },
+  "message": "optional commit message"
+}
+```
+
+A directory with no stored order is a `404`: there is nothing to delete, and answering `200` would hide a caller mistake.
 
 **POST** `/batch/files/read` — batch-read several files (no `author`: reads commit nothing)
 ```json
@@ -157,6 +185,18 @@ Hidden entries — files *and* directories whose name starts with a dot, per the
 The optional `file_name_starts_with` query parameter narrows the listing to entries whose *leaf name* (not full path) begins with the given prefix, compared case-insensitively (Unicode lower-casing, so `?file_name_starts_with=Intro` matches `intro.md`). It accepts two spellings: a bare string (a single prefix), or — mirroring `seek_from_line_starts_with`, since query parameters are strings — a JSON-array string of prefixes (e.g. `?file_name_starts_with=["intro", "readme"]`, URL-encoded), in which case an entry matches if its leaf name begins with *any* of the prefixes. A value whose first non-whitespace character is `[` is parsed as the array spelling and must be a valid JSON array of strings (else `400`); anything else is taken verbatim as a single prefix. An empty value, an empty array, or an empty prefix all return `400`. Both files and directories are matched: a matched file is returned as a leaf (its ancestor directories present purely as structure), and a matched directory is returned with its whole subtree expanded — every descendant file, whether or not its own name matches — so the caller sees inside the folder they found. A directory that neither matches nor contains a match is pruned, so a search result never contains a dead-end empty directory (a matched directory whose visible content is entirely filtered out still shows, as a childless node — it is itself the match). It composes with the other parameters: `prefix_path` scopes where the search runs, `maximum_depth` bounds how deep it descends uniformly (a match below the limit is never found, and a directory sitting *at* the limit renders as a childless stub even when it matched), and hidden entries stay excluded unless `include_hidden_files=true`. Because matches can be nested anywhere, this is the one listing mode that walks the whole in-scope tree before paginating (the off-page-directories-never-walked optimisation does not apply); pagination is still parent-based, windowing over the root-level entries of the *matched* tree. Like the plain listing, matching is on names alone — no blob is ever opened.
 
 The optional `include_date_from` / `include_date_to` query parameters narrow the listing to files whose git date falls inside the half-open window `[from, to)` — `include_date_from` inclusive, `include_date_to` exclusive — each an RFC 3339 date-time (e.g. `2026-06-16T10:00:00Z`), strictly validated (any other spelling returns `400`). Each bound is independently optional (an open-ended range); when both are given, `from` must be strictly before `to` (equal bounds select nothing, so it is a `400`). The optional `include_date_type` selects which date is compared: `updated` (the default) is the most recent commit that touched the file, `created` is the oldest commit that introduced it under its current path (renames are *not* followed). `include_date_type` is always validated against those two values, but the date filter is only active — and its cost only paid — when at least one bound is present; passing `include_date_type` alone changes nothing and keeps the cheap tree-only fast path. This is the crucial caveat: unlike every other listing mode, a date filter cannot be answered from tree objects (a tree entry carries no timestamp), so it walks commit history. The walk is still blob-free (it compares tree/oid deltas per commit, with no patch, stats, or rename detection) but its cost scales with history length, not page size — `updated` stops as soon as every in-scope file has been dated, whereas `created` must reach the root of history. It composes with the other parameters: `prefix_path`/`maximum_depth`/`include_hidden_files` scope which files are candidates (a file below the depth limit is never a candidate, and a directory whose contents were not walked is dropped rather than shown as a date-unclassifiable stub), and `file_name_starts_with` intersects with it (a file must match both the name prefix and the date window). Directories are kept only as the structure leading to a surviving file, so an emptied directory is pruned. The response shape is unchanged — the filter only removes entries; per-file dates are not reported.
+
+The optional `apply_order_index` query parameter (default `false`) orders every level of the listing by the file order index stored for the directory that level belongs to (see [File order index](#file-order-index) below). Listed entries come first, in index order, files and directories interleaved freely; everything the index does not name follows in the ordinary order (directories first, then alphabetical), and an index entry naming something that is not present simply ranks nothing. The listing root's own order is applied *before* the page window is sliced — pagination is over root-level entries, so ordering them afterwards would page over the wrong sequence — and only the subtrees that made the page are descended, so the off-page optimisation survives. It composes with every other parameter: a search or date-filtered result is ordered in full before being paginated, and a depth-limited stub costs no index read. This is the one listing mode that opens blobs: one small index per directory actually rendered. It defaults to `false` so no existing caller's results change.
+
+**GET** `/order` and `/order/*path` — a directory's stored file order
+```json
+{
+  "directory": "docs/guides",
+  "order": ["intro.md", "getting-started/", "advanced.mdx"]
+}
+```
+
+`directory` is the sanitised path (`""` for the repository root). Entries come back in the canonical spelling the server stores: directories with a trailing slash, files without. A directory with no stored order is a `404` — not an empty `order` array — so "unordered" and "ordered as nothing" cannot be confused.
 
 **GET** `/count/files` — file and directory count statistics
 ```json
@@ -221,7 +261,30 @@ A folder holding nothing this API can represent (no blobs at all — only submod
 
 The repository root is not addressable: an empty path (`/` after sanitisation) is a `400` on both routes. Deleting everything remains the tenant route's job.
 
-**PUT / DELETE / POST move** — write result
+### File order index
+
+Git has no ordering of its own — tree entries are name-sorted by definition and carry no metadata slot — so a presentation order has to be stored as data. githttp-fs stores it **per directory**: one index holding the leaf names of that directory's entries, in the order they should be presented. Ordering is a sibling-level concern, and scoping the storage the same way keeps two costs bounded: a reorder touches one small file (so its commit and its hook payload are proportional to one directory, not to the repository), and a folder move needs no index rewriting at all (entries are leaf names, so every index inside a relocated subtree is still correct once it travels with it).
+
+The whole feature is optional. A repository with no index anywhere behaves exactly as before, and a caller that never passes `apply_order_index=true` and never subscribes to the `order.*` hook events cannot tell the feature exists.
+
+**The index is a separate resource, never a file.** It is stored as a `.order.json` blob in the directory it orders, but that is an implementation detail on the same footing as git itself: the index is **invisible to every `/files` route** — listing, count, read, `HEAD`, and batch (where it comes back as `null`) — regardless of `include_hidden_files`, and the write routes refuse the path outright (`PUT`, and a move destination, answer `400` pointing at `/order`; a move source or a `DELETE` answers `404`, since to those it is simply not a file). That invisibility is what makes the format impossible to bypass: were the index an ordinary file, a client could `PUT` it directly and store anything, and a receiver would see a `file.updated` on a magic path it had to sniff, parse and diff instead of a real event.
+
+**Sparse and stale-tolerant.** An index need not list every sibling — unlisted entries follow in the ordinary order. And an entry naming something that is no longer there is silently ignored on read. Writes are validated strictly against HEAD, so staleness should not arise from normal use, but a revert or a rollback can restore an index older than the files it names, and no listing may fail because of it.
+
+**Upkeep rides in the same commit** as the file operation that triggers it, so a downstream order table never references a file that is gone:
+
+| Operation | Effect on the index |
+|-----------|---------------------|
+| Delete a file or folder | Dropped from its parent's index, if listed |
+| Rename inside one directory | Replaced **in place**, keeping its position |
+| Move across directories | Dropped from the source index; appended to the destination index *only if one already exists* |
+| Recursive folder delete | Parent's entry dropped; each index inside the subtree disappears with it |
+| Recursive folder move | Parent entries updated; each index inside the subtree travels untouched (leaf names are unchanged) |
+| Create a file (`PUT`) | Nothing — a new file is unlisted, so it sorts to the tail |
+
+Two rules in that table are deliberate rather than incidental. A rename keeps its position because demoting a file to the tail for changing its name would silently reorder content the caller only renamed. And upkeep only ever *edits* an index, never creates one: appending to a directory that had no index would pin one file while all its siblings stayed implicitly ordered — a surprise the caller did not ask for. An index left with no entries is removed rather than stored empty, since an empty index and no index are the same state.
+
+**PUT / DELETE / POST move / PUT order / DELETE order** — write result
 ```json
 { "commit_sha": "a3f9c1d" }
 ```
@@ -331,7 +394,12 @@ batch_read_maximum_files = 100
 
 [hooks]
 url = "https://your-receiver.example.com/hook"
-events = ["file.created", "file.updated", "file.deleted", "file.moved"]
+# The four file events plus, optionally, the two file-order-index events.
+# A receiver that does not list the order.* events gets none of them.
+events = [
+  "file.created", "file.updated", "file.deleted", "file.moved",
+  "order.updated", "order.deleted"
+]
 retry_attempts = 5
 retry_backoff_ms = 2000
 
@@ -370,6 +438,11 @@ Log verbosity priority: `RUST_LOG` env var → `log_level` in config → `"info"
 - **Recursion is opt-in per request, and the flag only permits — never forces** — `allow_prefix_path_recurse` on delete/move (and `check_prefix_path` on the existence check) default to `false`, so a folder path keeps answering `404` for every caller that has not asked for the new behaviour. The delete/move flag travels in the **request body**, not the query string: it changes what the write does, so it belongs beside `author`/`message`/`destination`, and it keeps the rule that query parameters on this API only ever shape reads. `check_prefix_path` is a query parameter solely because `HEAD` carries no body. With the flag on, the route classifies the path against HEAD's tree *under the tenant write lock* (so the classification cannot go stale before the commit it drives) and dispatches to the single-file or the whole-folder operation; the classification lookup is only paid for when the flag is set. The two flag names differ deliberately: the existence check merely widens what counts as existing, whereas delete/move gain an unbounded, destructive mode, and the name should say so at the call site.
 - **Folder delete/move are their own git functions, not modes** — `delete_directory`/`move_directory` sit beside `delete_file`/`move_file` rather than behind a boolean on them, mirroring the revert/rollback split: each function has one unambiguous scope and blast radius. The recursive delete removes a *single* directory entry from HEAD's tree (libgit2's tree updater drops the subtree with it and prunes parents left empty), so commit cost stays proportional to path depth rather than to the number of files removed. The recursive move reuses every blob oid verbatim, so no content is rehashed. In both, only the hook list scales with the file count — which is also the feature's real cost ceiling, since a moved folder's hook payloads hold each file's content in memory (the same exposure `rollback_commit` already carries for a large commit).
 - **A folder rename stays a rename, file by file** — a recursive move emits one `file.moved` event per file rather than a delete/create wave, because each file keeps its leaf name and only its ancestor prefix changes. Downstream systems therefore keep whatever metadata they had attached to every file in the folder. The destination must not exist in any form and must not sit inside the source; the whitelist is skipped on a folder destination (it has no extension, and the leaf names it would guard are unchanged) but still enforced when the source turns out to be a file.
+- **File order is data, stored per directory, and it is its own resource** — git offers nothing to hang an order off (trees are name-sorted, entries carry no metadata), so the order of a directory's entries is stored as a `.order.json` blob *in that directory*, holding leaf names only. Per-directory rather than one index at the repository root because ordering is inherently a sibling-level concern, and scoping the storage the same way bounds two costs: a reorder rewrites one small file instead of an O(all files) one on every change, and a recursive folder move needs zero index rewriting (leaf-name entries stay correct wherever the subtree lands, where full-path entries would all need their prefix swapped). It is exposed as `GET`/`PUT`/`DELETE /order[/*path]` rather than as a flag on the file routes — the same "separate routes, not mode flags" split as revert/rollback and `delete_file`/`delete_directory` — for three reasons that a flag cannot deliver: the format cannot be bypassed (the server owns the path, so there is no unvalidated way in), the stored spelling stays private (callers exchange a JSON array of names, not a blob), and a change delivers as a real `order.updated`/`order.deleted` event carrying a snapshot instead of a `file.updated` on a magic path the receiver would have to sniff and diff. Enforcing that split is why the index is **invisible to every `/files` route** — list, count, read, `HEAD`, batch — regardless of `include_hidden_files`; the dot prefix is Unix convention for metadata, not the mechanism.
+- **Order writes are validated strictly, reads tolerate staleness** — every entry of a `PUT /order` must resolve inside that directory in HEAD's tree, canonicalised from what it resolved to (a directory gains a trailing slash, a file does not); an entry naming something absent is a `400`. Strictness is safe here precisely because the resolution happens under the tenant write lock that every write takes, so the classification cannot go stale before the commit it drives — the same reasoning as the `allow_prefix_path_recurse` path classification. The cost is that reorder-before-create is impossible (create the files, then order them). Reads take the opposite stance and ignore entries naming anything absent, because revert and rollback restore indexes out of history *without* validation (content coming from paths this server already committed, the same exemption `allowed_extensions` has there) and a stale index must never turn a listing into an error. A malformed index — only reachable by hand-editing a commit — degrades to "no index" for the same reason, and emits no hook rather than leaking as a file event.
+- **An order change is a file change internally; the event kind is derived from the path** — every order operation returns an ordinary `FileChange` on the index's own path, and `HookJob::new` is the single place that recognises an order-index path and splits it out into an `OrderChange`. Classifying on the path rather than on the producing route is what makes every producer work with no special case: an explicit order write, a delete or move that rewrote an index alongside the file, a recursive folder operation carrying indexes inside its subtree, and a revert or rollback restoring an index out of history all arrive as plain file changes and leave correctly classified. Order events are delivered *after* every file event of the same commit, so an order snapshot never names a file the receiver has not been told about yet.
+- **Order upkeep is implicit and rides in the same commit** — deleting or moving a file or folder rewrites the affected directory's index in the very commit that moved the file, so a downstream order table can never hold a position for something that is gone. A rename inside one directory replaces the entry **in place** (demoting a file to the tail for changing its name would silently reorder content the caller only renamed); a cross-directory move appends to the destination index *only when one already exists* (creating one would pin a single file in a directory whose siblings are all implicitly ordered); an index left empty is removed rather than stored empty. Creating a file adds nothing — a new file is unlisted, which means "at the tail", so indexes stay sparse by default.
+- **Order events have no `moved` variant, deliberately** — a folder move relocates the indexes inside it, and `file.moved` exists precisely to preserve identity across a rename, yet a relocated index arrives as `order.deleted` at the old directory plus `order.updated` at the new one. The asymmetry is the point: a file is an entity a receiver hangs metadata off, whereas a directory's order list is just positions with no identity worth carrying, so a delete-plus-snapshot is both sufficient and one fewer event kind to support.
 - **Revert = new commit** — reverts never rewrite history; they produce a new inverse commit and fire the appropriate hooks for each changed file.
 - **Rollback is its own route, distinct from revert** — `POST /commits/:sha/rollback` restores the files `:sha` touched to the state they had *at* it; `POST /commits/:sha/revert` undoes what `:sha` did. Both derive their scope from the commit's own change set (so neither takes paths in its body) and differ only in which side of it is read — `:sha`'s tree vs `parent(:sha)`'s — but they are separate routes rather than one route with a mode flag, so each has one unambiguous meaning: revert undoes a change, rollback restores a point in time (discarding every later change to those same paths). Both are `POST`: like every write in this API they append a commit and never remove one. The rollback needs no parent commit, which is why rolling back *to* the initial commit is allowed where reverting it is not. Target states are staged onto current HEAD reusing existing blob oids — no rehash, no content read except the copy each hook payload needs — and, like an unchanged PUT, a path already holding its target state is skipped; when that leaves nothing to do, no commit is created, no hook fires, and maintenance is not armed.
 - **Author identity is caller-supplied** — every write request requires an `author` object with `name` and `email`. Both are stored in the git commit and validated as non-empty.
@@ -378,6 +451,7 @@ Log verbosity priority: `RUST_LOG` env var → `log_level` in config → `"info"
 - **HEAD is authoritative, not the working tree** — existence checks for writes, deletes, and moves are answered from HEAD's tree, and every commit tree is derived from HEAD's tree plus the intended change. Leftover working-tree state from a previously failed operation can never change an operation's outcome or be silently swept into a later commit. Moved content is read from HEAD's blob, not from disk.
 - **Commits are built with `TreeUpdateBuilder`, not the git index** — cost per write is proportional to the touched path depth, not the repository size, so large repos write as fast as small ones. Moves and reverts reuse existing blob oids (no content rehash). The working tree is still kept in sync with single-file fs operations so humans can inspect repos, and the on-disk index is refreshed to HEAD during maintenance so `git status` stays meaningful.
 - **Background maintenance repacks and expires (pruning is opt-in)** — the first write to a repository arms a one-shot timer (`[maintenance] delay_secs`, default 24 h; `enabled = false` turns it off). When it fires, the pass takes the tenant write lock and, via libgit2 (no `git` binary needed): expires reflogs, writes one consolidated packfile, deletes all loose objects and superseded packs, refreshes the index, and clears the slot so the next write re-arms it. By default every object is carried over into the new pack, so maintenance can never destroy data; with `destructive_prune = true` only objects reachable from a ref are kept, permanently dropping orphaned garbage (e.g. blobs from writes that failed mid-operation). Commit history is safe in both modes — history is append-only, so every past file version (including versions of since-deleted files) stays reachable through its commit. Pruning needs no grace period because objects are only ever created under the same write lock the pass holds. The repack is skipped when the repo is already consolidated (no loose objects, ≤ 1 pack). Repos receiving no writes are never touched; the schedule is in-memory only and does not survive restarts. Deleting a tenant disarms its pending timer.
+- **Ordered listing is opt-in, and the only listing mode that opens blobs** — `apply_order_index=true` orders every level of the listing by the stored index of the directory it belongs to, reading one small index per directory actually rendered; the default `false` keeps the blob-free contract and leaves every existing caller's results unchanged. Ordering is applied to the listing root *before* the page window is sliced, since pagination is over root-level entries, and only in-page subtrees are descended — so the off-page-directories-never-walked optimisation survives, unlike in name-search and date-filter mode. A depth-limited stub costs no index read. Listed entries come first in index order (files and directories interleaved freely, unlike the default directories-first rule), and unlisted entries keep their ordinary relative position, which is what makes a sparse index pin only what it names.
 - **File listing never opens blobs** — the tree endpoint is served from git tree objects alone (no sizes are reported), and pagination over root-level entries is decided before any subtree is opened, so off-page directories are never walked. Two modes forgo the off-page optimisation because their matches can be nested anywhere, so they walk the whole in-scope tree before paginating over the *matched* tree's root-level entries: `file_name_starts_with` search (a case-insensitive prefix test on each entry's leaf name — files *and* directories, a matched directory carrying its whole subtree — with directories holding no match pruned), and the `include_date_from`/`include_date_to` date-range filter. Both still open no blob. The date filter, however, is the sole listing mode whose cost is *not* bounded by tree size: a tree entry carries no timestamp, so per-file created/updated dates come from a walk of commit history (blob-free — tree/oid deltas per commit, no patch, stats, or rename detection), whose cost scales with history length rather than page size. It is opt-in (inactive unless a bound is set), `updated` stops once every in-scope file is dated while `created` walks to the root, and it composes with the scoping parameters (files below a `maximum_depth` limit are not candidates; directories are kept only as structure leading to a surviving file). The count endpoint (`GET .../count/files`) keeps the pure tree-only contract: it walks tree objects only, honouring the listing's `prefix_path`/`maximum_depth`/`include_hidden_files` semantics, with an optional `restrict_file_extensions` filter matched against entry names (no date filtering).
 - **Seek windowing lives in its own module (`seek.rs`) and scans, never decodes whole** — `SeekOptions` (query wire type, JSON-array strings since query parameters are strings) and `SeekBody` (JSON-body wire type for the batch route: native arrays, no `seek_` prefix) both parse into the validated `SeekFilter` the git layer consumes, through one shared funnel that turns every malformed value into a `400` naming the parameter as the caller spelled it. One canonical spelling per wire format — the only polymorphism, in both formats, is that the `to` filter accepts the bare `$seek_from_line_starts_with` operator unwrapped. The scan is a single forward pass over any `BufRead` that stops reading the moment the window is complete. The git layer feeds it a streaming ODB read (`git_odb_open_rstream`) when the blob is a loose object — every blob written since the last maintenance repack — so inflation halts early; packed objects cannot be streamed by libgit2 and fall back to a `Cursor` over the in-memory blob. Either way only the selected window is allocated (and only the window must be valid UTF-8 — prefix matching is byte-level). Seeked reads answer `404` when the path resolves to a folder, same as the HEAD existence endpoint.
 - **Batch read is one repository pass** — the batch endpoint opens the repo and resolves HEAD's tree once, then reads every requested blob through the same windowed-read helper as the single route (streaming ODB read where possible). Results are index-aligned with the request; `null` strictly means "not found" (invalid-UTF-8 content fails the whole batch with 422 instead of masquerading as missing). All request-level validation — path sanitisation, uniqueness after sanitisation, the `limits.batch_read_maximum_files` cap (default 100), per-file seek resolution (an entry's own `seek` replaces the request-level one; validation errors name the offending entry as `files[i]: …`) — happens before the repository is touched. Reads never take the tenant write lock, so a large batch cannot stall writers.
@@ -431,11 +505,42 @@ All payloads include `collection_id`, `tenant_id`, `commit_sha`, and `committed_
 }
 ```
 
+**order.updated**
+```json
+{
+  "event": "order.updated",
+  "collection_id": "docs",
+  "tenant_id": "acme",
+  "commit_sha": "c4e1f7b",
+  "committed_at": "2026-06-16T10:02:00Z",
+  "directory": "docs/guides",
+  "order": ["intro.md", "getting-started/", "advanced.mdx"]
+}
+```
+
+**order.deleted**
+```json
+{
+  "event": "order.deleted",
+  "collection_id": "docs",
+  "tenant_id": "acme",
+  "commit_sha": "c4e1f7b",
+  "committed_at": "2026-06-16T10:02:00Z",
+  "directory": "docs/guides"
+}
+```
+
+`directory` is repo-root-relative, with the repository root spelled as the empty string. `order.updated` carries the directory's **complete resulting order**, not a diff, so applying it downstream is a replace (`UPDATE … SET position = index`) and repeated delivery is harmless. `order.deleted` means that directory has no stored order any more and falls back to the default listing order.
+
+Both are ordinary subscription entries in `[hooks] events`, so a receiver that does not list them gets no order events at all — which is what keeps the feature invisible to existing deployments.
+
 ### Delivery model
 
 **One event per file, always.** There is no batching or coalescing anywhere: a commit's change set becomes one `HookJob`, and the consumer sends one HTTP POST per file change in it. So a recursive folder delete of *N* files produces one commit and *N* `file.deleted` events; a recursive folder move produces one commit and *N* `file.moved` events, each carrying that file's own `from`/`to` so entity identity survives. The same holds for reverts and rollbacks, which have carried multi-file change sets since they were added.
 
 Per-file events are still subject to the `[hooks] events` subscription list — an event kind absent from that list is skipped, whether it came from a single-file or a recursive operation.
+
+**Order events are delivered after every file event of the same commit.** A commit can carry both: deleting a file that its directory's index pins produces one `file.deleted` followed by one `order.updated` holding the index without it. Sending the file changes first means an order snapshot never references a file the receiver has not been told about yet. Recursive operations follow the same rule — a folder delete of *N* files whose subtree holds *M* indexes delivers *N* `file.deleted` events, then *M* `order.deleted` ones.
 
 **Delivery is strictly sequential per repository, and concurrent across repositories.** The chain that guarantees it:
 

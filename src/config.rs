@@ -256,11 +256,11 @@ impl HooksConfig {
     }
 }
 
-/// The four webhook event kinds, matching the `FileChange` variants in
-/// `git.rs` one-to-one. Serialised with dotted names (`"file.created"`)
-/// because that is the wire format used both in `config.toml` and in the
-/// delivered JSON payloads.
-#[allow(clippy::enum_variant_names)]
+/// The webhook event kinds: four for file changes, matching the `FileChange`
+/// variants in `git.rs` one-to-one, and two for changes to a directory's file
+/// order index, matching the `OrderChange` variants in `hooks.rs`. Serialised
+/// with dotted names (`"file.created"`) because that is the wire format used
+/// both in `config.toml` and in the delivered JSON payloads.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {
     #[serde(rename = "file.created")]
@@ -271,6 +271,10 @@ pub enum HookEvent {
     FileDeleted,
     #[serde(rename = "file.moved")]
     FileMoved,
+    #[serde(rename = "order.updated")]
+    OrderUpdated,
+    #[serde(rename = "order.deleted")]
+    OrderDeleted,
 }
 
 #[derive(Debug, Deserialize, Clone)]
