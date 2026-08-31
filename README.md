@@ -111,12 +111,12 @@ githttp-fs stores one file of its own inside a tenant repository, holding data G
 }
 ```
 
-* **Entirely opt-in:** no `.order.json` is ever written unless you call `PUT /v1/:collection_id/:tenant_id/order[/*path]`. Never use those routes and no reserved file exists anywhere.
-* **A separate resource, not an addressable file:** read and write it through `GET` / `PUT` / `DELETE` on `/order[/*path]`, exchanging a plain JSON array of names.
+* **Entirely opt-in:** no `.order.json` is ever written unless you call `PUT /v1/:collection_id/:tenant_id/order[/*path]` or `POST /v1/:collection_id/:tenant_id/files/*path/reorder`. Never use those routes and no reserved file exists anywhere.
+* **A separate resource, not an addressable file:** read and write it through `GET` / `PUT` / `DELETE` on `/order[/*path]`, exchanging a plain JSON array of names. To move a single entry instead of replacing the whole list, `POST /files/*path/reorder` with a numerical `position` shifts that one entry into place (files only, unless you pass `allow_prefix_path: true` to position a folder too).
 * **Invisible to every `/files` route** — list, count, read, `HEAD`, batch (where it is `null`) — regardless of `include_hidden_files`. `PUT` and move destinations refuse the path with `400`; move sources and `DELETE` answer `404`.
 * **Delivers `order.updated` / `order.deleted` webhooks, never `file.*` ones.** `order.updated` carries the directory's complete resulting order, so downstream it is a replace, not a diff. Both are ordinary `[hooks] events` subscriptions, so a receiver that does not list them gets none.
 * **Kept up to date automatically:** deleting or moving a file rewrites the affected index in the same commit. Renames keep their position, cross-directory moves append only to an index that already exists, and an emptied index is removed.
-* **Applied on read only if asked:** pass `apply_order_index=true` on the file listing route (default `false`); unlisted entries follow in the ordinary order.
+* **Applied on read only if asked:** pass `apply_order_index=true` on the file listing route (default `false`); unlisted entries follow in the ordinary order, or pass `implicit_order_default_index` (e.g. `0` or `-1`) to lift them above the ordered ones instead.
 
 ## :fire: Report A Vulnerability
 

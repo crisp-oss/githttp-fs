@@ -180,17 +180,18 @@ fn build_router(app_state: AppState) -> Router {
             "/{collection_id}/{tenant_id}/batch/files/read",
             post(routes::files::batch_read_files),
         )
-        // Individual file operations. Note that POST here is the *move*
-        // operation: axum's `{*path}` wildcard cannot match a fixed `/move`
-        // suffix after the wildcard, so the handler receives the full path
-        // (including `/move`) and strips/enforces the suffix itself.
+        // Individual file operations. Note that POST here is the *move* and
+        // *reorder* operations: axum's `{*path}` wildcard cannot match a fixed
+        // `/move` or `/reorder` suffix after the wildcard, so the handler
+        // receives the full path (including the suffix) and strips/enforces it
+        // itself, dispatching on which one it found.
         .route(
             "/{collection_id}/{tenant_id}/files/{*path}",
             get(routes::files::read_file)
                 .head(routes::files::file_exists)
                 .put(routes::files::write_file)
                 .delete(routes::files::delete_file)
-                .post(routes::files::move_file),
+                .post(routes::files::post_file),
         )
         // File-order index. A separate resource from the files it orders, so
         // it is a separate route rather than a flag on `/files` — that is what

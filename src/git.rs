@@ -19,9 +19,9 @@
 //! - `GitMaintenance` — consolidating repack, optional prune, reflog
 //!   expiry, index refresh
 //! - `GitFiles` — file CRUD (list / read / exists / write / delete / move)
-//! - `GitOrder` — the per-directory file-order index (read / write / delete,
-//!   plus the implicit upkeep that keeps an index honest across file
-//!   deletes and moves)
+//! - `GitOrder` — the per-directory file-order index (read / write / reorder
+//!   one entry / delete, plus the implicit upkeep that keeps an index honest
+//!   across file deletes and moves)
 //! - `GitCommits` — history listing, commit detail, revert
 //! - `GitTenant` — tenant repository deletion
 //!
@@ -150,6 +150,30 @@ impl DateFilter {
         true
     }
 }
+
+/// How a listing applies the per-directory file-order index. Its presence is
+/// the opt-in itself — `None` means "do not order at all", which is what keeps
+/// the blob-free listing contract for every caller that never asks.
+///
+/// `implicit_default_index` decides where the entries an index does *not* name
+/// land. Left unset they rank behind every listed entry, which is the original
+/// (and default) behaviour: a sparse index pins what it names and everything
+/// else follows. Set, it is the index unlisted entries are treated as holding —
+/// so `0` (or any negative value) lifts everything unordered *above* the
+/// ordered entries, and `2` slots them between the index's second and third
+/// entries. An unlisted entry always sorts before a listed entry holding the
+/// same index, which is what makes `0` mean "on top" rather than "tied with the
+/// first".
+#[derive(Debug, Clone, Copy)]
+pub struct OrderOptions {
+    pub implicit_default_index: Option<i64>,
+}
+
+/// Sort key of one entry against a directory's stored order: its index, plus
+/// whether the index actually names it. The `bool` is the tie-break — `false`
+/// sorts first, so an unlisted entry falling on an occupied index goes above
+/// it rather than after it.
+type OrderRank = (i64, bool);
 
 #[derive(Debug, Serialize)]
 pub struct CommitAuthor {
@@ -1089,10 +1113,11 @@ impl GitFiles {
     /// pagination — and it additionally walks commit history (still no blob
     /// opened, but cost scales with history length rather than page size).
     ///
-    /// When `apply_order_index` is set, each level of the result is reordered by the
+    /// When `order_options` is set, each level of the result is reordered by the
     /// stored order index of the directory it belongs to (see
-    /// [`Self::apply_order`]). This is the one mode that opens blobs — one
-    /// small index per directory actually rendered.
+    /// [`Self::apply_order`]), with its `implicit_default_index` deciding where
+    /// unlisted entries land. This is the one mode that opens blobs — one small
+    /// index per directory actually rendered.
     ///
     /// The performance contract (search, date-filter and order modes aside):
     /// **no blob is ever opened**. Names and entry kinds come entirely from
@@ -1112,11 +1137,11 @@ impl GitFiles {
         include_hidden_files: bool,
         file_name_starts_with: Option<&[String]>,
         date_filter: Option<DateFilter>,
-        apply_order_index: bool,
+        order_options: Option<OrderOptions>,
         page: usize,
         per_page: usize,
     ) -> Result<(Vec<TreeNode>, bool), AppError> {
-        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, file_name_starts_with = ?file_name_starts_with, date_filter = ?date_filter, apply_order_index = apply_order_index, page = page, per_page = per_page, "listing files");
+        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, file_name_starts_with = ?file_name_starts_with, date_filter = ?date_filter, order_options = ?order_options, page = page, per_page = per_page, "listing files");
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
         let head_commit = repo.head()?.peel_to_commit()?;
@@ -1151,7 +1176,7 @@ impl GitFiles {
                 maximum_depth,
                 include_hidden_files,
                 date_filter,
-                apply_order_index,
+                order_options,
                 page,
                 per_page,
             );
@@ -1168,7 +1193,7 @@ impl GitFiles {
                 maximum_depth,
                 include_hidden_files,
                 date_filter,
-                apply_order_index,
+                order_options,
                 page,
                 per_page,
             );
@@ -1235,7 +1260,7 @@ impl GitFiles {
         // sliced — pagination is over root-level entries, so ordering them
         // afterwards would page over the wrong sequence. Only one index is
         // read here; off-page directories are still never opened.
-        if apply_order_index {
+        if let Some(order_options) = order_options {
             if let Some(order) = GitOrder::stored_order(&repo, &walk_tree, "") {
                 let ranks = Self::order_ranks(&order);
 
@@ -1245,7 +1270,7 @@ impl GitFiles {
                         RootEntry::File(name) => name.as_str(),
                     };
 
-                    ranks.get(name).copied().unwrap_or(usize::MAX)
+                    Self::order_rank(&ranks, name, &order_options)
                 });
             }
         }
@@ -1289,10 +1314,10 @@ impl GitFiles {
 
         // The root level was ordered before pagination; every level *below* it
         // is ordered here, walking only the subtrees that made the page.
-        if apply_order_index {
+        if let Some(order_options) = order_options {
             for node in nodes.iter_mut() {
                 if let TreeNode::Directory { name, children } = node {
-                    Self::apply_order(&repo, &walk_tree, name, children);
+                    Self::apply_order(&repo, &walk_tree, name, children, &order_options);
                 }
             }
         }
@@ -1303,21 +1328,45 @@ impl GitFiles {
     }
 
     /// Position of each name in a stored order, so a *stable* sort by rank
-    /// puts listed entries first in index order and leaves everything else
-    /// (rank `usize::MAX`) in the order it already had — which is what makes a
-    /// sparse index pin only what it names.
+    /// puts listed entries in index order and leaves everything else in the
+    /// order it already had — which is what makes a sparse index pin only what
+    /// it names.
     ///
     /// Names are compared with any directory-marking trailing slash stripped.
     /// A duplicate keeps its first position; writes reject duplicates, but a
     /// hand-edited index must still rank deterministically.
-    fn order_ranks(order: &[String]) -> HashMap<&str, usize> {
-        let mut ranks: HashMap<&str, usize> = HashMap::with_capacity(order.len());
+    fn order_ranks(order: &[String]) -> HashMap<&str, i64> {
+        let mut ranks: HashMap<&str, i64> = HashMap::with_capacity(order.len());
 
         for (position, entry) in order.iter().enumerate() {
-            ranks.entry(order::entry_name(entry)).or_insert(position);
+            ranks
+                .entry(order::entry_name(entry))
+                .or_insert(position as i64);
         }
 
         ranks
+    }
+
+    /// Sort key of `name` against `ranks`: its stored index when the index
+    /// names it, and `order_options.implicit_default_index` when it does not —
+    /// falling back to "behind everything listed" when no implicit index is
+    /// configured, which is the default sparse-index behaviour.
+    ///
+    /// The `false` on the unlisted side is what makes an implicit index of `0`
+    /// mean "above the ordered entries" instead of "tied with the first one":
+    /// on an equal index, unlisted sorts before listed.
+    fn order_rank(
+        ranks: &HashMap<&str, i64>,
+        name: &str,
+        order_options: &OrderOptions,
+    ) -> OrderRank {
+        match ranks.get(name) {
+            Some(position) => (*position, true),
+            None => (
+                order_options.implicit_default_index.unwrap_or(i64::MAX),
+                false,
+            ),
+        }
     }
 
     /// Reorders `nodes` — the rendered children of `directory`, itself
@@ -1337,6 +1386,7 @@ impl GitFiles {
         base_tree: &git2::Tree<'_>,
         directory: &str,
         nodes: &mut [TreeNode],
+        order_options: &OrderOptions,
     ) {
         // Nothing rendered at this level, so no index is worth reading — a
         // depth-limited stub costs no blob read.
@@ -1344,10 +1394,13 @@ impl GitFiles {
             return;
         }
 
+        // A directory with no index is left in its ordinary order, whatever
+        // `implicit_default_index` says: with nothing listed, every entry is
+        // implicit, so a common fallback index cannot reorder any of them.
         if let Some(order) = GitOrder::stored_order(repo, base_tree, directory) {
             let ranks = Self::order_ranks(&order);
 
-            nodes.sort_by_key(|node| ranks.get(node.name()).copied().unwrap_or(usize::MAX));
+            nodes.sort_by_key(|node| Self::order_rank(&ranks, node.name(), order_options));
         }
 
         for node in nodes.iter_mut() {
@@ -1358,7 +1411,7 @@ impl GitFiles {
                     format!("{}/{}", directory, name)
                 };
 
-                Self::apply_order(repo, base_tree, &child_directory, children);
+                Self::apply_order(repo, base_tree, &child_directory, children, order_options);
             }
         }
     }
@@ -1456,7 +1509,7 @@ impl GitFiles {
         maximum_depth: Option<usize>,
         include_hidden_files: bool,
         date_filter: Option<DateFilter>,
-        apply_order_index: bool,
+        order_options: Option<OrderOptions>,
         page: usize,
         per_page: usize,
     ) -> Result<(Vec<TreeNode>, bool), AppError> {
@@ -1566,8 +1619,8 @@ impl GitFiles {
         // The whole matched tree is in hand before pagination here, so
         // ordering is applied to it in full and the page window is sliced from
         // the ordered result.
-        if apply_order_index {
-            Self::apply_order(repo, walk_tree, "", &mut tree);
+        if let Some(order_options) = order_options {
+            Self::apply_order(repo, walk_tree, "", &mut tree, &order_options);
         }
 
         let total = tree.len();
@@ -1595,7 +1648,7 @@ impl GitFiles {
         maximum_depth: Option<usize>,
         include_hidden_files: bool,
         date_filter: DateFilter,
-        apply_order_index: bool,
+        order_options: Option<OrderOptions>,
         page: usize,
         per_page: usize,
     ) -> Result<(Vec<TreeNode>, bool), AppError> {
@@ -1610,8 +1663,8 @@ impl GitFiles {
         // The whole surviving tree is in hand before pagination here, so
         // ordering is applied to it in full and the page window is sliced from
         // the ordered result.
-        if apply_order_index {
-            Self::apply_order(repo, walk_tree, "", &mut tree);
+        if let Some(order_options) = order_options {
+            Self::apply_order(repo, walk_tree, "", &mut tree, &order_options);
         }
 
         let total = tree.len();
@@ -3003,6 +3056,151 @@ impl GitOrder {
         )?;
 
         tracing::debug!(tenant_id = %tenant_id, directory = %display_directory, sha = %commit_oid, "order write committed");
+
+        Ok((commit_oid.to_string(), Some(change)))
+    }
+
+    /// Moves one entry to `position` inside its own parent directory's order
+    /// index, shifting the entries at and after that position down by one.
+    ///
+    /// `allow_prefix_path` decides whether the path may name a **directory**
+    /// rather than a file. It defaults off at the route, so only files are
+    /// positionable unless the caller opts in — the same "the flag permits, it
+    /// never forces" rule as `allow_prefix_path_recurse` on delete and move: a
+    /// file path with the flag on runs exactly as it would with it off, and a
+    /// directory path with it off is simply "not a file" and answers `404`. A
+    /// directory entry is stored in the canonical index spelling (a trailing
+    /// slash), which is what a stored order needs to be readable without
+    /// resolving every name against a tree.
+    ///
+    /// The index is *read and shifted*, never rebuilt from the directory: a
+    /// sibling that was never ordered stays unlisted, since being absent from
+    /// the index is a meaningful state (it means "implicitly ordered") and not a
+    /// gap to be filled. The entry itself is the one that must be there
+    /// afterwards, so it is dropped from wherever it sat and re-inserted at
+    /// `position` — which makes the position count against the index *without*
+    /// it, the intuitive reading of "move this to slot N".
+    ///
+    /// A `position` beyond the end of the resulting index is clamped to the
+    /// tail rather than rejected: the index is sparse, so its length is not
+    /// something a caller can be expected to know, and "as far down as possible"
+    /// is unambiguous. A directory with no index yet gets one holding just this
+    /// entry — unlike implicit upkeep, which never creates an index, this is an
+    /// explicit request for a position, exactly as `PUT /order` is.
+    ///
+    /// Reordering to the position the entry already holds is a no-op, exactly as
+    /// re-PUTting unchanged file content is: no commit, no hook, HEAD's sha.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reorder_entry(
+        repo_path: &Path,
+        tenant_id: &str,
+        entry_path: &str,
+        position: usize,
+        allow_prefix_path: bool,
+        commit_message: Option<&str>,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<(String, Option<FileChange>), AppError> {
+        tracing::debug!(tenant_id = %tenant_id, path = %entry_path, position = position, allow_prefix_path = allow_prefix_path, author_name = %author_name, author_email = %author_email, "reordering order index entry");
+
+        // The index is not a file, so it cannot be given a position of its own
+        // — to the `/files` routes it simply does not exist.
+        if order::is_order_file(entry_path) {
+            return Err(AppError::FileNotFound {
+                path: entry_path.to_string(),
+            });
+        }
+
+        // No auto-init here, as on every other order operation: a position can
+        // only be given to something that exists.
+        let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
+
+        let parent_commit = repo.head()?.peel_to_commit()?;
+        let head_tree = parent_commit.tree()?;
+
+        let (directory, name) = order::split_parent(entry_path);
+        let display_directory = order::display_directory(directory);
+
+        // Classified against HEAD's tree, under the tenant write lock, so the
+        // classification cannot go stale before the commit it drives. A folder
+        // only counts when the caller opted in; without the flag it is "not a
+        // file" and answers `404`, exactly as on a read or a plain delete.
+        let canonical_entry = match head_tree.get_path(Path::new(entry_path)) {
+            Ok(entry) if entry.kind() == Some(git2::ObjectType::Blob) => name.to_string(),
+
+            Ok(entry) if entry.kind() == Some(git2::ObjectType::Tree) && allow_prefix_path => {
+                order::directory_entry(name)
+            }
+
+            _ => {
+                tracing::debug!(tenant_id = %tenant_id, path = %entry_path, allow_prefix_path = allow_prefix_path, "entry not found for reorder");
+
+                return Err(AppError::FileNotFound {
+                    path: entry_path.to_string(),
+                });
+            }
+        };
+
+        let index_path = order::order_file_path(directory);
+        let existing_oid = GitUtils::blob_oid_in_tree(&head_tree, &index_path);
+
+        let stored = Self::stored_order(&repo, &head_tree, directory).unwrap_or_default();
+
+        // Dropped from wherever it sat first, so `position` counts against the
+        // other entries alone — moving an entry to the index it already holds
+        // then lands it right back where it was. Matching ignores the
+        // directory-marking slash, so a stale spelling cannot leave a duplicate
+        // behind.
+        let mut entries: Vec<String> = stored
+            .into_iter()
+            .filter(|entry| order::entry_name(entry) != name)
+            .collect();
+
+        let position = position.min(entries.len());
+
+        entries.insert(position, canonical_entry);
+
+        // Hashing the serialised document yields the oid the blob *would* get;
+        // matching HEAD's entry means this reorder changes nothing.
+        let incoming_oid = git2::Oid::hash_object(
+            git2::ObjectType::Blob,
+            order::serialize(&entries).as_bytes(),
+        )?;
+
+        if existing_oid == Some(incoming_oid) {
+            tracing::debug!(tenant_id = %tenant_id, directory = %display_directory, "order unchanged, skipping commit");
+
+            return Ok((parent_commit.id().to_string(), None));
+        }
+
+        let mut tree_update = TreeUpdateBuilder::new();
+
+        let change = Self::stage_index(
+            &repo,
+            repo_path,
+            &mut tree_update,
+            directory,
+            &entries,
+            existing_oid.is_some(),
+        )?;
+
+        let tree_id = tree_update.create_updated(&repo, &head_tree)?;
+        let tree = repo.find_tree(tree_id)?;
+        let signature = GitUtils::git_signature(author_name, author_email)?;
+
+        let auto_message = format!("order position: {} -> {}", entry_path, position);
+        let message = commit_message.unwrap_or(&auto_message);
+
+        let commit_oid = repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &[&parent_commit],
+        )?;
+
+        tracing::debug!(tenant_id = %tenant_id, directory = %display_directory, position = position, sha = %commit_oid, "order reorder committed");
 
         Ok((commit_oid.to_string(), Some(change)))
     }

@@ -4,7 +4,9 @@
 // Copyright: 2026, Valerian Saliou <valerian@valeriansaliou.name>
 // License: Mozilla Public License v2.0 (MPL v2.0)
 
-//! File CRUD routes: listing, read, existence check, write, delete, move.
+//! File CRUD routes: listing, read, existence check, write, delete, move, and
+//! reorder (a file's position in its parent directory's order index — the one
+//! route here that writes an order index rather than a file).
 //!
 //! See `routes/mod.rs` for the shared handler shape (validate → lock →
 //! blocking git op → hook enqueue → maintenance arm) that every write
@@ -17,8 +19,8 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
-use serde_json::json;
+use serde::{de::DeserializeOwned, Deserialize};
+use serde_json::{json, Value};
 
 use std::collections::HashSet;
 
@@ -68,6 +70,14 @@ pub struct ListFilesQuery {
     /// change — and so the per-directory index reads it costs are only paid
     /// for by callers that want them.
     pub apply_order_index: Option<bool>,
+    /// The index an entry the order index does not name is treated as holding,
+    /// so unordered entries can be placed *among* the ordered ones instead of
+    /// behind them: `0` (or any negative value) lifts them above every ordered
+    /// entry, `2` slots them between the index's second and third entries. Left
+    /// unset, unlisted entries follow the ordered ones, as they always have.
+    /// Only meaningful together with `apply_order_index=true`; passing it alone
+    /// changes nothing.
+    pub implicit_order_default_index: Option<i64>,
     pub page: Option<usize>,
     pub per_page: Option<usize>,
 }
@@ -169,6 +179,29 @@ pub struct MoveFileRequest {
     /// is relocated under `destination`, in one commit. Same default and same
     /// rationale for living in the body as its `DeleteFileRequest` namesake.
     pub allow_prefix_path_recurse: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct ReorderFileRequest {
+    pub author: AuthorRequest,
+    /// Where the entry should sit in its parent directory's order index,
+    /// zero-based, counted against the index's other entries. Must be a number
+    /// (a non-negative integer); a position past the end of the index is
+    /// clamped to the tail.
+    pub position: i64,
+    pub message: Option<String>,
+    /// When true, the path may name a folder instead of a file, giving the
+    /// folder itself a position among its siblings. Defaults to false — only
+    /// files are positionable, and a folder path is then simply "not a file" and
+    /// answers `404`.
+    ///
+    /// Lives in the body for the same reason as its `DeleteFileRequest` and
+    /// `MoveFileRequest` namesakes: it changes *what the write does*, alongside
+    /// `author`, `position` and `message`, rather than shaping a read. It is
+    /// named without their `_recurse` suffix because nothing here recurses — a
+    /// folder's position is one entry in one index, exactly as a file's is, and
+    /// the folder's own contents are untouched.
+    pub allow_prefix_path: Option<bool>,
 }
 
 /// Decodes the `file_name_starts_with` query value into its list of prefixes.
@@ -327,7 +360,15 @@ pub async fn list_files(
         query.include_date_type.as_deref(),
     )?;
 
-    let apply_order_index = query.apply_order_index.unwrap_or(false);
+    // The options object *is* the opt-in: absent, the git layer does not read a
+    // single index. `implicit_order_default_index` is inert on its own, exactly
+    // as `include_date_type` is without a date bound.
+    let order_options: Option<git::OrderOptions> = query
+        .apply_order_index
+        .unwrap_or(false)
+        .then_some(git::OrderOptions {
+            implicit_default_index: query.implicit_order_default_index,
+        });
 
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query
@@ -335,7 +376,7 @@ pub async fn list_files(
         .unwrap_or(DEFAULT_PER_PAGE)
         .clamp(1, MAX_PER_PAGE);
 
-    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, file_name_starts_with = ?file_name_starts_with, date_filter = ?date_filter, apply_order_index = apply_order_index, page = page, per_page = per_page, "handling list files request");
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, file_name_starts_with = ?file_name_starts_with, date_filter = ?date_filter, order_options = ?order_options, page = page, per_page = per_page, "handling list files request");
 
     let repo_path = state
         .config
@@ -355,7 +396,7 @@ pub async fn list_files(
             include_hidden_files,
             file_name_starts_with.as_deref(),
             date_filter,
-            apply_order_index,
+            order_options,
             page,
             per_page,
         )
@@ -900,33 +941,74 @@ pub async fn delete_file(
     Ok((StatusCode::OK, Json(json!({ "commit_sha": commit_sha }))))
 }
 
+/// POST /:collection_id/:tenant_id/files/*path/{move,reorder}
+/// The two POST operations on a file path, dispatched on the URL suffix.
+///
+/// Axum cannot match a fixed suffix after a wildcard segment, so both are
+/// registered on POST `/*path` and the suffix is enforced here. The body is
+/// therefore taken as raw JSON and deserialised once the suffix has said which
+/// operation it belongs to — the suffix decides, never the body's shape, so a
+/// mistyped field can never turn one operation into the other.
+pub async fn post_file(
+    State(state): State<AppState>,
+    Path((collection_id, tenant_id, raw_path)): Path<(String, String, String)>,
+    Json(body): Json<Value>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    if let Some(from_path_raw) = raw_path.strip_suffix("/move") {
+        return move_file(
+            state,
+            collection_id,
+            tenant_id,
+            from_path_raw,
+            parse_body(body)?,
+        )
+        .await;
+    }
+
+    if let Some(file_path_raw) = raw_path.strip_suffix("/reorder") {
+        return reorder_file(
+            state,
+            collection_id,
+            tenant_id,
+            file_path_raw,
+            parse_body(body)?,
+        )
+        .await;
+    }
+
+    Err(AppError::InvalidPath {
+        reason: "POST on a file path must end with /move or /reorder".to_string(),
+    })
+}
+
+/// Deserialises an already-parsed JSON body into the request type the URL
+/// suffix selected, reporting a malformed one as a `400` in this API's own
+/// error shape rather than as an extractor rejection.
+fn parse_body<T: DeserializeOwned>(body: Value) -> Result<T, AppError> {
+    serde_json::from_value(body).map_err(|err| AppError::InvalidOperation {
+        reason: format!("invalid request body: {}", err),
+    })
+}
+
 /// POST /:collection_id/:tenant_id/files/*path/move
 /// Moves/renames a file to a new path in a single atomic commit, fires a
 /// single hook with both the old and new paths so the receiver can
 /// correlate the rename without losing attached metadata.
-///
-/// Axum cannot match a fixed suffix after a wildcard segment, so this handler
-/// is registered on POST `/*path` and enforces the `/move` suffix itself.
 ///
 /// With `allow_prefix_path_recurse: true` in the body the source may also name
 /// a folder, in which case the whole folder is relocated in one commit and one
 /// `file.moved` hook fires per file — every file keeping its own leaf name, so
 /// downstream entity identity survives. Without the opt-in a folder source is
 /// simply not a file and answers `404`.
-pub async fn move_file(
-    State(state): State<AppState>,
-    Path((collection_id, tenant_id, raw_path)): Path<(String, String, String)>,
-    Json(body): Json<MoveFileRequest>,
-) -> Result<impl IntoResponse, AppError> {
+async fn move_file(
+    state: AppState,
+    collection_id: String,
+    tenant_id: String,
+    from_path_raw: &str,
+    body: MoveFileRequest,
+) -> Result<(StatusCode, Json<Value>), AppError> {
     let collection_id = validate::collection_id(&collection_id)?.to_string();
     let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
-
-    // Enforce that the URL ends with /move — anything else on POST is not found.
-    let from_path_raw = raw_path
-        .strip_suffix("/move")
-        .ok_or_else(|| AppError::InvalidPath {
-            reason: "POST on a file path must end with /move".to_string(),
-        })?;
 
     let allow_prefix_path_recurse = body.allow_prefix_path_recurse.unwrap_or(false);
 
@@ -1061,6 +1143,128 @@ pub async fn move_file(
             commit_sha.clone(),
             Utc::now(),
             file_changes,
+        ),
+    );
+
+    state
+        .maintenance
+        .schedule(&lock_key, repo_path_for_maintenance, lock.clone());
+
+    Ok((StatusCode::OK, Json(json!({ "commit_sha": commit_sha }))))
+}
+
+/// POST /:collection_id/:tenant_id/files/*path/reorder
+/// Gives one file a numerical position inside its parent directory's file order
+/// index, shifting the entries at and after that position down by one, and
+/// fires one `order.updated` hook carrying the resulting order.
+///
+/// The index is read and shifted, never rebuilt from the directory: siblings
+/// that were never ordered stay unlisted (they are implicitly ordered, which is
+/// a state, not a gap). A parent with no index yet gets one holding just this
+/// entry — the caller explicitly asked for a position, exactly as they would
+/// through `PUT /order`. A position past the end of the index is clamped to the
+/// tail, and reordering an entry to the position it already holds is a no-op: no
+/// commit, no hook, HEAD's sha.
+///
+/// With `allow_prefix_path: true` in the body the path may also name a folder,
+/// positioning the folder itself among its siblings (an index interleaves files
+/// and directories freely). Without the opt-in a folder path is simply not a
+/// file and answers `404`. Nothing recurses either way: a folder's position is
+/// one entry in one index, and its contents are untouched.
+///
+/// It commits through the same machinery as the order routes, so the change
+/// arrives as an `order.updated` event on the parent directory rather than as a
+/// `file.*` one — the entry itself is untouched.
+async fn reorder_file(
+    state: AppState,
+    collection_id: String,
+    tenant_id: String,
+    entry_path_raw: &str,
+    body: ReorderFileRequest,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    let collection_id = validate::collection_id(&collection_id)?.to_string();
+    let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
+
+    let allow_prefix_path = body.allow_prefix_path.unwrap_or(false);
+
+    // Folders are naturally spelled with a trailing slash, so tolerate one
+    // once folders are in scope at all.
+    let entry_path = if allow_prefix_path {
+        validate::file_or_folder_path(entry_path_raw)?
+    } else {
+        validate::file_path(entry_path_raw)?
+    }
+    .to_string();
+
+    // Positions are indexes into a list, so there is nothing a negative one
+    // could mean here — "at the top" is `0`.
+    if body.position < 0 {
+        return Err(AppError::InvalidOperation {
+            reason: format!("position must not be negative: {}", body.position),
+        });
+    }
+
+    let position = body.position as usize;
+
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %entry_path, position = position, allow_prefix_path = allow_prefix_path, "handling reorder file request");
+
+    let repo_path = state
+        .config
+        .server
+        .repos_path
+        .join(&collection_id)
+        .join(&tenant_id);
+
+    let lock_key = format!("{}/{}", collection_id, tenant_id);
+    let lock = state.get_repo_lock(&lock_key);
+    let _lock_guard = lock.lock().await;
+
+    let ReorderFileRequest {
+        author,
+        position: _,
+        message,
+        allow_prefix_path: _,
+    } = body;
+
+    let repo_path_for_maintenance = repo_path.clone();
+    let tenant_id_for_task = tenant_id.clone();
+
+    let (commit_sha, change) = run_blocking(move || {
+        git::GitOrder::reorder_entry(
+            &repo_path,
+            &tenant_id_for_task,
+            &entry_path,
+            position,
+            allow_prefix_path,
+            message.as_deref(),
+            &author.name,
+            &author.email,
+        )
+    })
+    .await?;
+
+    // A `None` change means the index already gave the file that position: no
+    // commit was created, so there is nothing to sync and no new objects for
+    // maintenance to consolidate.
+    let Some(change) = change else {
+        tracing::debug!(tenant_id = %tenant_id, sha = %commit_sha, "order unchanged, no commit created");
+
+        return Ok((StatusCode::OK, Json(json!({ "commit_sha": commit_sha }))));
+    };
+
+    tracing::debug!(tenant_id = %tenant_id, sha = %commit_sha, "order reorder committed, enqueuing hook delivery");
+
+    // Enqueued while the tenant write lock is still held, so per-tenant hook
+    // order always matches commit order. The change lands on the index's own
+    // path, which is what `HookJob::new` classifies into an order event.
+    state.hook_queue.enqueue(
+        &lock_key,
+        HookJob::new(
+            collection_id,
+            tenant_id,
+            commit_sha.clone(),
+            Utc::now(),
+            vec![change],
         ),
     );
 
