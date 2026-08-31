@@ -91,6 +91,36 @@ pub struct FileCounts {
     pub directories: usize,
 }
 
+/// Where a reorder request wants its entry to sit in its parent directory's
+/// order index. The two variants are the two halves of what the read route
+/// reports as `position`, so the same value a caller read back is a value it can
+/// send: a zero-based index, or [`order::UNLISTED_POSITION`] (`-1`) meaning the
+/// entry should not be in the index at all.
+#[derive(Debug, Clone, Copy)]
+pub enum OrderPosition {
+    /// Zero-based index, clamped to the tail when it lands past the end.
+    At(usize),
+    /// Dropped from the index entirely, leaving the entry implicitly ordered
+    /// again. Not a deletion of anything else: the file (or folder) itself is
+    /// untouched, exactly as it is when the entry is merely moved.
+    Unlisted,
+}
+
+/// One file as the read route returns it: its content, already narrowed to any
+/// seek window, plus where it sits in its parent directory's file-order index.
+///
+/// `position` is zero-based, or [`order::UNLISTED_POSITION`] when the index does
+/// not name the file — including when the directory has no index at all, which
+/// is the same answer from the caller's point of view (nothing pins this file).
+/// It is reported unconditionally because a client rendering one file usually
+/// needs to know where it belongs among its siblings, and the cost is one small
+/// blob read, paid only when the parent directory actually has an index.
+#[derive(Debug)]
+pub struct FileRead {
+    pub content: String,
+    pub position: i64,
+}
+
 /// What a path resolves to in HEAD's tree. Answered from tree objects alone
 /// — a tree entry already carries its kind, so no blob is opened and the
 /// working tree is never consulted (HEAD is authoritative everywhere in this
@@ -1980,12 +2010,16 @@ impl GitFiles {
     /// consistent with the HEAD existence endpoint, and so does a path naming
     /// an order index, which is reachable only through `/order`. See
     /// `GitUtils::windowed_blob_content` for how seek windows are read.
+    ///
+    /// The file's position in its parent directory's order index travels with
+    /// the content (see [`FileRead`]), so a caller reading one file learns where
+    /// it sits among its siblings without a second request.
     pub fn read_file(
         repo_path: &Path,
         tenant_id: &str,
         file_path: &str,
         seek: &SeekFilter,
-    ) -> Result<String, AppError> {
+    ) -> Result<FileRead, AppError> {
         tracing::debug!(tenant_id = %tenant_id, path = %file_path, "reading file");
 
         if order::is_order_file(file_path) {
@@ -2007,7 +2041,11 @@ impl GitFiles {
             }
         })?;
 
-        GitUtils::windowed_blob_content(&repo, blob_oid, file_path, seek)
+        let content = GitUtils::windowed_blob_content(&repo, blob_oid, file_path, seek)?;
+        let (directory, name) = order::split_parent(file_path);
+        let position = GitOrder::entry_position(&repo, &head_tree, directory, name);
+
+        Ok(FileRead { content, position })
     }
 
     /// Reads several files from HEAD's tree in one repository pass. The
@@ -3088,20 +3126,30 @@ impl GitOrder {
     /// entry — unlike implicit upkeep, which never creates an index, this is an
     /// explicit request for a position, exactly as `PUT /order` is.
     ///
-    /// Reordering to the position the entry already holds is a no-op, exactly as
+    /// [`OrderPosition::Unlisted`] is the inverse operation on the same route:
+    /// the entry is dropped from the index and not re-inserted, leaving it
+    /// implicitly ordered again. Nothing else changes — the file or folder itself
+    /// is untouched — and when it was the index's last entry the index is removed
+    /// rather than stored empty (an `order.deleted` event), the same rule every
+    /// other producer follows.
+    ///
+    /// Asking for the state the index already holds is a no-op, exactly as
     /// re-PUTting unchanged file content is: no commit, no hook, HEAD's sha.
+    /// That covers both directions — the entry already sitting at `position`,
+    /// and an already-unlisted entry asked to be unlisted (including when the
+    /// directory has no index at all).
     #[allow(clippy::too_many_arguments)]
     pub fn reorder_entry(
         repo_path: &Path,
         tenant_id: &str,
         entry_path: &str,
-        position: usize,
+        position: OrderPosition,
         allow_prefix_path: bool,
         commit_message: Option<&str>,
         author_name: &str,
         author_email: &str,
     ) -> Result<(String, Option<FileChange>), AppError> {
-        tracing::debug!(tenant_id = %tenant_id, path = %entry_path, position = position, allow_prefix_path = allow_prefix_path, author_name = %author_name, author_email = %author_email, "reordering order index entry");
+        tracing::debug!(tenant_id = %tenant_id, path = %entry_path, position = ?position, allow_prefix_path = allow_prefix_path, author_name = %author_name, author_email = %author_email, "reordering order index entry");
 
         // The index is not a file, so it cannot be given a position of its own
         // — to the `/files` routes it simply does not exist.
@@ -3156,18 +3204,41 @@ impl GitOrder {
             .filter(|entry| order::entry_name(entry) != name)
             .collect();
 
-        let position = position.min(entries.len());
+        // `Unlisted` stops here: the entry is dropped and never re-inserted.
+        // The position it actually landed at (after clamping) is kept for the
+        // auto-generated message, so the commit records where it went rather
+        // than what was asked for.
+        let inserted_at = match position {
+            OrderPosition::At(position) => {
+                let position = position.min(entries.len());
 
-        entries.insert(position, canonical_entry);
+                entries.insert(position, canonical_entry);
 
-        // Hashing the serialised document yields the oid the blob *would* get;
-        // matching HEAD's entry means this reorder changes nothing.
-        let incoming_oid = git2::Oid::hash_object(
-            git2::ObjectType::Blob,
-            order::serialize(&entries).as_bytes(),
-        )?;
+                Some(position)
+            }
 
-        if existing_oid == Some(incoming_oid) {
+            OrderPosition::Unlisted => None,
+        };
+
+        // An index left with no entries is removed rather than stored empty (an
+        // empty index and no index are the same state), so the "does this change
+        // anything" question is asked of the two states separately: an empty
+        // result changes nothing when there was no index to begin with, and a
+        // non-empty one changes nothing when it hashes to what HEAD already
+        // holds. Hashing the serialised document yields the oid the blob *would*
+        // get, so neither branch touches the object database.
+        let unchanged = if entries.is_empty() {
+            existing_oid.is_none()
+        } else {
+            let incoming_oid = git2::Oid::hash_object(
+                git2::ObjectType::Blob,
+                order::serialize(&entries).as_bytes(),
+            )?;
+
+            existing_oid == Some(incoming_oid)
+        };
+
+        if unchanged {
             tracing::debug!(tenant_id = %tenant_id, directory = %display_directory, "order unchanged, skipping commit");
 
             return Ok((parent_commit.id().to_string(), None));
@@ -3188,7 +3259,11 @@ impl GitOrder {
         let tree = repo.find_tree(tree_id)?;
         let signature = GitUtils::git_signature(author_name, author_email)?;
 
-        let auto_message = format!("order position: {} -> {}", entry_path, position);
+        let auto_message = match inserted_at {
+            Some(position) => format!("order position: {} -> {}", entry_path, position),
+            None => format!("order position: {} -> unlisted", entry_path),
+        };
+
         let message = commit_message.unwrap_or(&auto_message);
 
         let commit_oid = repo.commit(
@@ -3200,7 +3275,7 @@ impl GitOrder {
             &[&parent_commit],
         )?;
 
-        tracing::debug!(tenant_id = %tenant_id, directory = %display_directory, position = position, sha = %commit_oid, "order reorder committed");
+        tracing::debug!(tenant_id = %tenant_id, directory = %display_directory, position = ?inserted_at, sha = %commit_oid, "order reorder committed");
 
         Ok((commit_oid.to_string(), Some(change)))
     }
@@ -3285,6 +3360,29 @@ impl GitOrder {
         }
 
         parsed
+    }
+
+    /// Zero-based position of `name` in `directory`'s stored order, or
+    /// [`order::UNLISTED_POSITION`] when the index does not name it.
+    ///
+    /// "No index", "an unparseable index" and "an index that does not list this
+    /// name" all collapse to the same answer, because they are the same answer:
+    /// nothing pins this entry. Matching ignores the directory-marking trailing
+    /// slash, so a directory reports the position it holds under either
+    /// spelling.
+    fn entry_position(
+        repo: &Repository,
+        tree: &git2::Tree<'_>,
+        directory: &str,
+        name: &str,
+    ) -> i64 {
+        Self::stored_order(repo, tree, directory)
+            .and_then(|stored| {
+                stored
+                    .iter()
+                    .position(|entry| order::entry_name(entry) == name)
+            })
+            .map_or(order::UNLISTED_POSITION, |position| position as i64)
     }
 
     /// Stages `directory`'s index to hold `order_entries` — or removes the

@@ -46,6 +46,14 @@ use crate::error::AppError;
 /// regardless of `include_hidden_files`.
 pub const ORDER_FILE_NAME: &str = ".order.json";
 
+/// The position reported for an entry the stored order does not name (or whose
+/// directory has no order at all). Positions are zero-based, so `-1` cannot
+/// collide with a real one, and a sentinel rather than a `null` keeps the field
+/// one number always — a client comparing or sorting on it needs no branch for
+/// the unordered case, and `implicit_order_default_index` on the listing route
+/// already lets a caller say where unordered entries belong.
+pub const UNLISTED_POSITION: i64 = -1;
+
 /// The stored document, deserialising side. An object rather than a bare
 /// array so per-entry metadata (a title, a hidden flag, a group) can be added
 /// later without a format version bump.

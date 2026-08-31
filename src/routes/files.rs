@@ -28,6 +28,7 @@ use crate::{
     error::AppError,
     git,
     hooks::HookJob,
+    order,
     routes::AuthorRequest,
     seek::{SeekBody, SeekFilter, SeekOptions},
     state::AppState,
@@ -185,9 +186,13 @@ pub struct MoveFileRequest {
 pub struct ReorderFileRequest {
     pub author: AuthorRequest,
     /// Where the entry should sit in its parent directory's order index,
-    /// zero-based, counted against the index's other entries. Must be a number
-    /// (a non-negative integer); a position past the end of the index is
-    /// clamped to the tail.
+    /// zero-based, counted against the index's other entries. Must be a number;
+    /// a position past the end of the index is clamped to the tail.
+    ///
+    /// `-1` is the one accepted negative value and means the opposite: drop the
+    /// entry from the index, leaving it implicitly ordered again. It is the
+    /// value the read route reports for an unlisted file, so what a caller reads
+    /// back is what it can send.
     pub position: i64,
     pub message: Option<String>,
     /// When true, the path may name a folder instead of a file, giving the
@@ -526,7 +531,9 @@ fn parse_restrict_file_extensions(raw: &str) -> Result<Vec<String>, AppError> {
 }
 
 /// GET /:collection_id/:tenant_id/files/*path
-/// Returns the file content and path as JSON.
+/// Returns the file content, path, and its position in its parent directory's
+/// file order index as JSON (`-1` when the index does not name it, or the
+/// directory has no index).
 ///
 /// Optional `seek_*` query parameters (`seek_from_line_starts_with`,
 /// `seek_to_line_starts_with`, `seek_lines_maximum`) narrow `content` to a
@@ -556,14 +563,15 @@ pub async fn read_file(
     let file_path_for_task = file_path.clone();
     let tenant_id_for_task = tenant_id.clone();
 
-    let content = run_blocking(move || {
+    let file = run_blocking(move || {
         git::GitFiles::read_file(&repo_path, &tenant_id_for_task, &file_path_for_task, &seek)
     })
     .await?;
 
     Ok(Json(json!({
         "path": file_path,
-        "content": content,
+        "content": file.content,
+        "position": file.position,
     })))
 }
 
@@ -1166,6 +1174,12 @@ async fn move_file(
 /// tail, and reordering an entry to the position it already holds is a no-op: no
 /// commit, no hook, HEAD's sha.
 ///
+/// `position: -1` is the inverse: it drops the entry from the index, leaving it
+/// implicitly ordered again (the file itself is untouched). That is the value the
+/// read route reports for an unlisted file, so what a caller reads back is what
+/// it can send. When it empties the index, the index is removed rather than
+/// stored empty and the event is `order.deleted`.
+///
 /// With `allow_prefix_path: true` in the body the path may also name a folder,
 /// positioning the folder itself among its siblings (an index interleaves files
 /// and directories freely). Without the opt-in a folder path is simply not a
@@ -1196,17 +1210,27 @@ async fn reorder_file(
     }
     .to_string();
 
-    // Positions are indexes into a list, so there is nothing a negative one
-    // could mean here — "at the top" is `0`.
-    if body.position < 0 {
-        return Err(AppError::InvalidOperation {
-            reason: format!("position must not be negative: {}", body.position),
-        });
-    }
+    // Positions are indexes into a list, so `-1` is the only negative value
+    // that means anything: it is what the read route reports for an unlisted
+    // entry, and sending it back drops the entry from the index. Anything
+    // further below zero is a caller bug.
+    let position = match body.position {
+        position if position >= 0 => git::OrderPosition::At(position as usize),
 
-    let position = body.position as usize;
+        order::UNLISTED_POSITION => git::OrderPosition::Unlisted,
 
-    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %entry_path, position = position, allow_prefix_path = allow_prefix_path, "handling reorder file request");
+        position => {
+            return Err(AppError::InvalidOperation {
+                reason: format!(
+                    "position must be zero or greater, or {} to drop the entry from the index: {}",
+                    order::UNLISTED_POSITION,
+                    position
+                ),
+            })
+        }
+    };
+
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %entry_path, position = ?position, allow_prefix_path = allow_prefix_path, "handling reorder file request");
 
     let repo_path = state
         .config
