@@ -103,11 +103,7 @@ Use the sample [config.toml](https://github.com/crisp-oss/githttp-fs/blob/master
 
 #### Reserved files
 
-githttp-fs stores one kind of file of its own inside a tenant repository, used to hold data Git itself cannot express:
-
-**`.order.json`** — the file order index of the directory it sits in.
-
-Git tree entries are name-sorted by definition and carry no metadata slot, so a *presentation* order (the order a sidebar or a table of contents should show entries in) has to be stored as data. githttp-fs stores it per directory, as a `.order.json` holding the leaf names of that directory's entries in the order they should be presented:
+githttp-fs stores one file of its own inside a tenant repository, holding data Git itself cannot express: **`.order.json`**, the presentation order of the directory it sits in (Git tree entries are name-sorted and carry no metadata slot).
 
 ```json
 {
@@ -115,19 +111,12 @@ Git tree entries are name-sorted by definition and carry no metadata slot, so a 
 }
 ```
 
-**This is entirely opt-in, and nothing is written until you ask for it.** No `.order.json` is ever created unless you call `PUT /v1/:collection_id/:tenant_id/order[/*path]`. A repository whose order routes are never used holds no reserved file anywhere, and behaves exactly as it did before the feature existed — the same is true of the hooks, since `order.updated` and `order.deleted` are ordinary `[hooks] events` subscriptions that a receiver has to list to get.
-
-**It is a separate resource, not a file you can address.** Read and write it through `GET` / `PUT` / `DELETE` on `/v1/:collection_id/:tenant_id/order[/*path]`, exchanging a plain JSON array of names — that the server keeps it in a `.order.json` blob is an implementation detail, on the same footing as Git itself. Concretely:
-
-* It is **invisible to every `/files` route** — listing, count, read, `HEAD`, and batch read (where it comes back as `null`) — regardless of `include_hidden_files`. It is never counted as a file, and never matched by a name search.
-* The file routes **refuse the path**: `PUT`, and a move destination, answer `400` pointing at `/order`; a move source, and `DELETE`, answer `404`, since to those it is simply not a file.
-* A change to it delivers as an **`order.updated` / `order.deleted` webhook**, never as a `file.*` one. `order.updated` carries the directory's complete resulting order, so applying it downstream is a replace rather than a diff.
-
-The dot prefix is the Unix convention for metadata, and a courtesy to humans browsing a repository with `git`; it is not the mechanism that hides the file.
-
-**Its upkeep is automatic.** Deleting or moving a file or folder rewrites the affected directory's index in the very same commit, so a downstream order table can never hold a position for something that is gone. A rename inside one directory keeps the entry's position; a move across directories drops it from the source index and appends it to the destination index only if one already exists; an index left with no entries is removed rather than stored empty. Creating a file adds nothing — an unlisted entry sorts to the tail, so indexes stay sparse by default.
-
-**Reading it back is optional too.** Pass `apply_order_index=true` on the file listing route to have every level of the returned tree ordered by its directory's index; unlisted entries follow in the ordinary order (directories first, then alphabetical). It defaults to `false`, so no existing caller's results change.
+* **Entirely opt-in:** no `.order.json` is ever written unless you call `PUT /v1/:collection_id/:tenant_id/order[/*path]`. Never use those routes and no reserved file exists anywhere.
+* **A separate resource, not an addressable file:** read and write it through `GET` / `PUT` / `DELETE` on `/order[/*path]`, exchanging a plain JSON array of names.
+* **Invisible to every `/files` route** — list, count, read, `HEAD`, batch (where it is `null`) — regardless of `include_hidden_files`. `PUT` and move destinations refuse the path with `400`; move sources and `DELETE` answer `404`.
+* **Delivers `order.updated` / `order.deleted` webhooks, never `file.*` ones.** `order.updated` carries the directory's complete resulting order, so downstream it is a replace, not a diff. Both are ordinary `[hooks] events` subscriptions, so a receiver that does not list them gets none.
+* **Kept up to date automatically:** deleting or moving a file rewrites the affected index in the same commit. Renames keep their position, cross-directory moves append only to an index that already exists, and an emptied index is removed.
+* **Applied on read only if asked:** pass `apply_order_index=true` on the file listing route (default `false`); unlisted entries follow in the ordinary order.
 
 ## :fire: Report A Vulnerability
 
