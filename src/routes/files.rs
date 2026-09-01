@@ -194,6 +194,16 @@ pub struct ReorderFileRequest {
     /// value the read route reports for an unlisted file, so what a caller reads
     /// back is what it can send.
     pub position: i64,
+    /// Where the siblings the index does not name yet are folded in when it is
+    /// materialised, carrying the listing parameter's meaning exactly: unset
+    /// leaves them behind everything the index lists, `0` (or any negative
+    /// value) lifts them above it, `2` slots them between the index's second and
+    /// third entries.
+    ///
+    /// A caller reordering inside a rendered listing passes the same value it
+    /// rendered with, and the index it gets back pins what it was looking at.
+    /// Inert with `position: -1`, which materialises nothing.
+    pub implicit_order_default_index: Option<i64>,
     pub message: Option<String>,
     /// When true, the path may name a folder instead of a file, giving the
     /// folder itself a position among its siblings. Defaults to false — only
@@ -1166,19 +1176,25 @@ async fn move_file(
 /// index, shifting the entries at and after that position down by one, and
 /// fires one `order.updated` hook carrying the resulting order.
 ///
-/// The index is read and shifted, never rebuilt from the directory: siblings
-/// that were never ordered stay unlisted (they are implicitly ordered, which is
-/// a state, not a gap). A parent with no index yet gets one holding just this
-/// entry — the caller explicitly asked for a position, exactly as they would
-/// through `PUT /order`. A position past the end of the index is clamped to the
-/// tail, and reordering an entry to the position it already holds is a no-op: no
-/// commit, no hook, HEAD's sha.
+/// The index is materialised over the whole directory first: every sibling it
+/// does not name yet is folded in at the rank a listing renders it with, so the
+/// position the caller sent counts against the rows they were looking at rather
+/// than against however few entries happen to be pinned. `implicit_order_default_index`
+/// says where those siblings are folded in and carries the listing parameter's
+/// meaning exactly — unset leaves them behind everything listed, `0` lifts them
+/// above it — so a caller passes back whatever it rendered with. A parent with no
+/// index yet gets one covering the directory; the caller explicitly asked for a
+/// position, exactly as they would through `PUT /order`. A position past the end
+/// is clamped to the tail, and asking for the arrangement the index already holds
+/// is a no-op: no commit, no hook, HEAD's sha.
 ///
 /// `position: -1` is the inverse: it drops the entry from the index, leaving it
-/// implicitly ordered again (the file itself is untouched). That is the value the
-/// read route reports for an unlisted file, so what a caller reads back is what
-/// it can send. When it empties the index, the index is removed rather than
-/// stored empty and the event is `order.deleted`.
+/// implicitly ordered again (the file itself is untouched, and nothing is
+/// materialised — unpinning one entry is no reason to pin every other one, so an
+/// already-unlisted entry stays a no-op). That is the value the read route
+/// reports for an unlisted file, so what a caller reads back is what it can send.
+/// When it empties the index, the index is removed rather than stored empty and
+/// the event is `order.deleted`.
 ///
 /// With `allow_prefix_path: true` in the body the path may also name a folder,
 /// positioning the folder itself among its siblings (an index interleaves files
@@ -1230,7 +1246,7 @@ async fn reorder_file(
         }
     };
 
-    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %entry_path, position = ?position, allow_prefix_path = allow_prefix_path, "handling reorder file request");
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %entry_path, position = ?position, implicit_order_default_index = ?body.implicit_order_default_index, allow_prefix_path = allow_prefix_path, "handling reorder file request");
 
     let repo_path = state
         .config
@@ -1246,6 +1262,7 @@ async fn reorder_file(
     let ReorderFileRequest {
         author,
         position: _,
+        implicit_order_default_index,
         message,
         allow_prefix_path: _,
     } = body;
@@ -1259,6 +1276,7 @@ async fn reorder_file(
             &tenant_id_for_task,
             &entry_path,
             position,
+            implicit_order_default_index,
             allow_prefix_path,
             message.as_deref(),
             &author.name,

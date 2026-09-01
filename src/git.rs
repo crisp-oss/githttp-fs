@@ -3218,27 +3218,39 @@ impl GitOrder {
     /// slash), which is what a stored order needs to be readable without
     /// resolving every name against a tree.
     ///
-    /// The index is *read and shifted*, never rebuilt from the directory: a
-    /// sibling that was never ordered stays unlisted, since being absent from
-    /// the index is a meaningful state (it means "implicitly ordered") and not a
-    /// gap to be filled. The entry itself is the one that must be there
-    /// afterwards, so it is dropped from wherever it sat and re-inserted at
-    /// `position` — which makes the position count against the index *without*
-    /// it, the intuitive reading of "move this to slot N".
+    /// Positioning an entry **materialises the whole directory** into the
+    /// index: every sibling the index does not name yet is folded in first, at
+    /// the rank it is rendered with (see [`Self::materialized_order`]), so the
+    /// index that comes out pins exactly the sequence the caller was looking at
+    /// when they asked for the move. Without that, a position would count
+    /// against the listed entries alone while the caller counted against
+    /// everything they could see, and the two only agree when the index is
+    /// already complete. `implicit_default_index` is where the unlisted
+    /// siblings are folded in, and it carries the listing parameter's meaning
+    /// exactly (unset: behind everything listed; `0` or negative: above it) —
+    /// so a caller reordering inside a rendered listing passes the same value
+    /// it rendered with, and the index it gets back is what it saw.
+    ///
+    /// The entry itself is the one that must be there afterwards, so it is
+    /// dropped from wherever it sat and re-inserted at `position` — which makes
+    /// the position count against the rest of the directory, the intuitive
+    /// reading of "move this to slot N".
     ///
     /// A `position` beyond the end of the resulting index is clamped to the
-    /// tail rather than rejected: the index is sparse, so its length is not
-    /// something a caller can be expected to know, and "as far down as possible"
-    /// is unambiguous. A directory with no index yet gets one holding just this
-    /// entry — unlike implicit upkeep, which never creates an index, this is an
-    /// explicit request for a position, exactly as `PUT /order` is.
+    /// tail rather than rejected: it is not something a caller can be expected
+    /// to compute, and "as far down as possible" is unambiguous. A directory
+    /// with no index yet gets one — unlike implicit upkeep, which never creates
+    /// an index, this is an explicit request for a position, exactly as
+    /// `PUT /order` is.
     ///
     /// [`OrderPosition::Unlisted`] is the inverse operation on the same route:
     /// the entry is dropped from the index and not re-inserted, leaving it
     /// implicitly ordered again. Nothing else changes — the file or folder itself
-    /// is untouched — and when it was the index's last entry the index is removed
-    /// rather than stored empty (an `order.deleted` event), the same rule every
-    /// other producer follows.
+    /// is untouched, and the index is *not* materialised (unpinning one entry has
+    /// no business pinning every other one), so an already-unlisted entry stays a
+    /// no-op. When the entry was the index's last one the index is removed rather
+    /// than stored empty (an `order.deleted` event), the same rule every other
+    /// producer follows.
     ///
     /// Asking for the state the index already holds is a no-op, exactly as
     /// re-PUTting unchanged file content is: no commit, no hook, HEAD's sha.
@@ -3251,12 +3263,13 @@ impl GitOrder {
         tenant_id: &str,
         entry_path: &str,
         position: OrderPosition,
+        implicit_default_index: Option<i64>,
         allow_prefix_path: bool,
         commit_message: Option<&str>,
         author_name: &str,
         author_email: &str,
     ) -> Result<(String, Option<FileChange>), AppError> {
-        tracing::debug!(tenant_id = %tenant_id, path = %entry_path, position = ?position, allow_prefix_path = allow_prefix_path, author_name = %author_name, author_email = %author_email, "reordering order index entry");
+        tracing::debug!(tenant_id = %tenant_id, path = %entry_path, position = ?position, implicit_default_index = ?implicit_default_index, allow_prefix_path = allow_prefix_path, author_name = %author_name, author_email = %author_email, "reordering order index entry");
 
         // The index is not a file, so it cannot be given a position of its own
         // — to the `/files` routes it simply does not exist.
@@ -3301,15 +3314,29 @@ impl GitOrder {
 
         let stored = Self::stored_order(&repo, &head_tree, directory).unwrap_or_default();
 
+        // A position is asked for against the directory as the caller sees it,
+        // so the index is materialised first: every sibling it does not name
+        // yet joins it at the rank it renders with. `Unlisted` skips that — it
+        // says "stop pinning this entry", which is no reason to start pinning
+        // all the others.
+        let mut entries: Vec<String> = match position {
+            OrderPosition::At(_) => Self::materialized_order(
+                &repo,
+                &head_tree,
+                directory,
+                &stored,
+                implicit_default_index,
+            )?,
+
+            OrderPosition::Unlisted => stored,
+        };
+
         // Dropped from wherever it sat first, so `position` counts against the
         // other entries alone — moving an entry to the index it already holds
         // then lands it right back where it was. Matching ignores the
         // directory-marking slash, so a stale spelling cannot leave a duplicate
         // behind.
-        let mut entries: Vec<String> = stored
-            .into_iter()
-            .filter(|entry| order::entry_name(entry) != name)
-            .collect();
+        entries.retain(|entry| order::entry_name(entry) != name);
 
         // `Unlisted` stops here: the entry is dropped and never re-inserted.
         // The position it actually landed at (after clamping) is kept for the
@@ -3467,6 +3494,116 @@ impl GitOrder {
         }
 
         parsed
+    }
+
+    /// `directory`'s complete order, as it is *rendered* right now: every entry
+    /// the directory holds in HEAD, ranked by `stored` exactly as a listing
+    /// ranks it, with the entries `stored` does not name folded in at
+    /// `implicit_default_index` (unset meaning "behind everything listed", the
+    /// default sparse-index behaviour).
+    ///
+    /// This is what turns a numerical position into the one the caller means. A
+    /// caller positions an entry against the directory they are looking at, and
+    /// what they are looking at is the rendered order — not the index, which may
+    /// name two of the twenty siblings on screen. Materialising through the same
+    /// ranking the listing uses makes "put this third" mean the third row, and it
+    /// keeps every other entry exactly where it was rendered.
+    ///
+    /// Sharing [`GitFiles::order_rank`] is the point rather than a convenience:
+    /// were the two rankings to drift, a reorder would silently permute rows the
+    /// caller never touched. Stale entries — names the index holds but the
+    /// directory no longer has — are dropped in passing, since the result is
+    /// built from what HEAD actually holds; read paths stay tolerant of them, but
+    /// there is no reason to write one back.
+    ///
+    /// A directory absent from HEAD yields nothing, which cannot happen through
+    /// the reorder route (the entry itself was just resolved inside it) and would
+    /// leave the caller's entry as the index's only member if it ever did.
+    fn materialized_order(
+        repo: &Repository,
+        head_tree: &git2::Tree<'_>,
+        directory: &str,
+        stored: &[String],
+        implicit_default_index: Option<i64>,
+    ) -> Result<Vec<String>, AppError> {
+        let mut entries = Self::directory_entries(repo, head_tree, directory)?;
+
+        let ranks = GitFiles::order_ranks(stored);
+        let order_options = OrderOptions {
+            implicit_default_index,
+        };
+
+        // Stable, so the entries sharing a rank — all the unlisted ones — keep
+        // the ordinary listing order they came in with.
+        entries.sort_by_key(|entry| {
+            GitFiles::order_rank(&ranks, order::entry_name(entry), &order_options)
+        });
+
+        Ok(entries)
+    }
+
+    /// Every entry `directory` holds in HEAD, in the ordinary listing order
+    /// (directories first, then alphabetical) and in the canonical index
+    /// spelling (directories with a trailing slash, files without).
+    ///
+    /// Read from tree objects alone, one level deep — an index orders siblings,
+    /// so nothing below the directory is any of its business. The index file
+    /// itself is skipped: it is not an entry of the directory it orders. Hidden
+    /// entries are *not* skipped, unlike a default listing: an index is data
+    /// rather than a rendering, and leaving a dot-file unlisted would only move
+    /// it to wherever unlisted entries land the day someone lists with
+    /// `include_hidden_files=true`. Anything that is neither a blob nor a tree
+    /// (a submodule) is left out, exactly as it is everywhere else in this API.
+    fn directory_entries(
+        repo: &Repository,
+        head_tree: &git2::Tree<'_>,
+        directory: &str,
+    ) -> Result<Vec<String>, AppError> {
+        let subtree;
+
+        let tree = if directory.is_empty() {
+            head_tree
+        } else {
+            match head_tree.get_path(Path::new(directory)) {
+                Ok(entry) if entry.kind() == Some(git2::ObjectType::Tree) => {
+                    subtree = entry.to_object(repo)?.peel_to_tree()?;
+
+                    &subtree
+                }
+
+                _ => return Ok(Vec::new()),
+            }
+        };
+
+        let mut directories: Vec<String> = Vec::new();
+        let mut files: Vec<String> = Vec::new();
+
+        for entry in tree.iter() {
+            let Ok(entry_name) = entry.name() else {
+                continue;
+            };
+
+            if entry_name == order::ORDER_FILE_NAME {
+                continue;
+            }
+
+            match entry.kind() {
+                Some(git2::ObjectType::Tree) => {
+                    directories.push(order::directory_entry(entry_name))
+                }
+
+                Some(git2::ObjectType::Blob) => files.push(entry_name.to_string()),
+
+                _ => {}
+            }
+        }
+
+        directories.sort();
+        files.sort();
+
+        directories.extend(files);
+
+        Ok(directories)
     }
 
     /// Zero-based position of `name` in `directory`'s stored order, or
