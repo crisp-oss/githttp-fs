@@ -55,6 +55,11 @@ pub struct WriteOrderRequest {
     /// names only — a trailing slash on a directory is accepted and
     /// normalised, and every entry must exist in that directory.
     pub order: Vec<String>,
+    /// When true, the order may name dot-prefixed (hidden) entries. Defaults to
+    /// false, where a hidden entry is a `400`: an index is a presentation
+    /// order, and a dot-file is by convention not presented, so pinning one is
+    /// noise the caller has to ask for.
+    pub allow_hidden_files: Option<bool>,
     pub message: Option<String>,
 }
 
@@ -100,6 +105,10 @@ pub async fn write_order_root(
 /// (`400` otherwise) — the check runs under the tenant write lock, so it
 /// cannot go stale before the commit it drives. Writing the order the index
 /// already holds is a no-op: no commit, no hook, HEAD's sha in the response.
+///
+/// Hidden (dot-prefixed) entries are refused unless the body sets
+/// `allow_hidden_files: true` — an index is a presentation order, and a
+/// dot-file is by convention not presented.
 pub async fn write_order(
     State(state): State<AppState>,
     Path((collection_id, tenant_id, directory)): Path<(String, String, String)>,
@@ -182,9 +191,11 @@ async fn write(
     // Everything judgeable from the values alone is settled before the
     // repository is opened; existence is checked in the git layer, under the
     // write lock.
-    order::validate_order(&body.order)?;
+    let allow_hidden_files = body.allow_hidden_files.unwrap_or(false);
 
-    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, directory = %order::display_directory(&directory), entry_count = body.order.len(), "handling write order request");
+    order::validate_order(&body.order, allow_hidden_files)?;
+
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, directory = %order::display_directory(&directory), entry_count = body.order.len(), allow_hidden_files = allow_hidden_files, "handling write order request");
 
     let repo_path = state
         .config
@@ -200,6 +211,7 @@ async fn write(
     let WriteOrderRequest {
         author,
         order: order_entries,
+        allow_hidden_files: _,
         message,
     } = body;
 

@@ -204,6 +204,19 @@ pub struct ReorderFileRequest {
     /// rendered with, and the index it gets back pins what it was looking at.
     /// Inert with `position: -1`, which materialises nothing.
     pub implicit_order_default_index: Option<i64>,
+    /// Whether the index materialised around the positioned entry may hold
+    /// dot-prefixed (hidden) siblings. Defaults to false, which keeps them out
+    /// of the generated index — the same judgement `include_hidden_files=false`
+    /// makes on a listing, and the right default for an index the server
+    /// generates rather than one the caller dictates entry by entry.
+    ///
+    /// It becomes **required** (as `true`) when the positioned entry is itself
+    /// hidden: pinning a dot-file has to be asked for, and asking for it
+    /// through the same flag that decides its siblings' fate keeps one answer
+    /// per request. `_implicit_` names what it governs — the entries folded in
+    /// implicitly — which is also why it is inert with `position: -1`, where
+    /// nothing is materialised.
+    pub implicit_allow_hidden_files: Option<bool>,
     pub message: Option<String>,
     /// When true, the path may name a folder instead of a file, giving the
     /// folder itself a position among its siblings. Defaults to false — only
@@ -1188,6 +1201,13 @@ async fn move_file(
 /// is clamped to the tail, and asking for the arrangement the index already holds
 /// is a no-op: no commit, no hook, HEAD's sha.
 ///
+/// Hidden (dot-prefixed) siblings are left out of the materialised index unless
+/// `implicit_allow_hidden_files: true` — an index the server generates should not
+/// quietly pin a repository's metadata — though one the index already names is
+/// kept, since positioning an unrelated file is no occasion to unpin it. The flag
+/// is *required* when the positioned entry is itself hidden (`400` otherwise):
+/// pinning a dot-file has to be asked for.
+///
 /// `position: -1` is the inverse: it drops the entry from the index, leaving it
 /// implicitly ordered again (the file itself is untouched, and nothing is
 /// materialised — unpinning one entry is no reason to pin every other one, so an
@@ -1246,7 +1266,27 @@ async fn reorder_file(
         }
     };
 
-    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %entry_path, position = ?position, implicit_order_default_index = ?body.implicit_order_default_index, allow_prefix_path = allow_prefix_path, "handling reorder file request");
+    let implicit_allow_hidden_files = body.implicit_allow_hidden_files.unwrap_or(false);
+
+    // Pinning a dot-file has to be asked for, so the flag that keeps hidden
+    // siblings out of the generated index is *required* when the positioned
+    // entry is itself hidden — one answer per request rather than a second flag
+    // that could contradict this one. Judged on the sanitised leaf name alone,
+    // so it costs no repository access. Only `At` pins anything: `-1` unpins,
+    // which is the guardrail's own direction and needs no opt-in.
+    if matches!(position, git::OrderPosition::At(_))
+        && !implicit_allow_hidden_files
+        && order::is_hidden(order::split_parent(&entry_path).1)
+    {
+        return Err(AppError::InvalidOperation {
+            reason: format!(
+                "entry is a hidden file; set implicit_allow_hidden_files to give it a position: {}",
+                entry_path
+            ),
+        });
+    }
+
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path = %entry_path, position = ?position, implicit_order_default_index = ?body.implicit_order_default_index, implicit_allow_hidden_files = implicit_allow_hidden_files, allow_prefix_path = allow_prefix_path, "handling reorder file request");
 
     let repo_path = state
         .config
@@ -1263,6 +1303,7 @@ async fn reorder_file(
         author,
         position: _,
         implicit_order_default_index,
+        implicit_allow_hidden_files: _,
         message,
         allow_prefix_path: _,
     } = body;
@@ -1277,6 +1318,7 @@ async fn reorder_file(
             &entry_path,
             position,
             implicit_order_default_index,
+            implicit_allow_hidden_files,
             allow_prefix_path,
             message.as_deref(),
             &author.name,

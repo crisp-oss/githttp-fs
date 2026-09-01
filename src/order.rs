@@ -121,6 +121,20 @@ pub fn entry_name(entry: &str) -> &str {
     entry.strip_suffix('/').unwrap_or(entry)
 }
 
+/// Whether an entry is hidden by the Unix dot convention — the same test the
+/// listing's `include_hidden_files` applies, run on the index entry's own
+/// spelling so the directory-marking trailing slash is irrelevant.
+///
+/// Hidden entries are kept out of an index by default: an index is a
+/// *presentation* order, and a dot-file is by convention not presented, so
+/// pinning one is noise a caller has to have asked for. Every way into an index
+/// enforces that on its own terms — `PUT /order` rejects a hidden entry, and a
+/// reorder leaves hidden siblings out of the index it materialises — each behind
+/// its own opt-in flag.
+pub fn is_hidden(entry: &str) -> bool {
+    entry_name(entry).starts_with('.')
+}
+
 /// Canonical index spelling of a directory entry: the trailing slash marks it
 /// as a folder, so a stored index is readable on its own without resolving
 /// every name against a tree.
@@ -170,7 +184,14 @@ pub fn parse(content: &str) -> Option<Vec<String>> {
 /// An empty order is rejected rather than accepted as "no ordering": it would
 /// mean exactly what deleting the index means, and one operation with two
 /// spellings is a worse API than two operations with one each.
-pub fn validate_order(order: &[String]) -> Result<(), AppError> {
+///
+/// `allow_hidden_files` is the caller's opt-in to naming dot-prefixed entries.
+/// Off (the default) a hidden entry is a `400` rather than being dropped
+/// silently: the caller sent a name and a position for it, and quietly storing
+/// a different order than the one they wrote would be worse than telling them
+/// the rule. The index file itself stays rejected either way — the flag opens
+/// hidden *entries*, not the one path that is not an entry at all.
+pub fn validate_order(order: &[String], allow_hidden_files: bool) -> Result<(), AppError> {
     if order.is_empty() {
         return Err(AppError::InvalidOperation {
             reason: "order must contain at least one entry; delete the index instead of writing an empty order"
@@ -215,6 +236,17 @@ pub fn validate_order(order: &[String]) -> Result<(), AppError> {
         if name == ORDER_FILE_NAME {
             return Err(AppError::InvalidOperation {
                 reason: format!("order entry must not reference the index itself: {}", entry),
+            });
+        }
+
+        // Checked after the index's own name, so naming `.order.json` keeps
+        // answering with the reason that actually applies to it.
+        if !allow_hidden_files && is_hidden(name) {
+            return Err(AppError::InvalidOperation {
+                reason: format!(
+                    "order entry is a hidden file; set allow_hidden_files to order it: {}",
+                    entry
+                ),
             });
         }
 
