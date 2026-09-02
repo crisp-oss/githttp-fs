@@ -38,6 +38,44 @@ In the configuration file, ensure that:
 
 githttp-fs will be reachable from `http://localhost:5355`.
 
+**Install from packages:**
+
+githttp-fs provides [pre-built packages](https://packagecloud.io/crisp-im/githttp-fs) for Debian-based systems (Debian, Ubuntu, etc.).
+
+**Important: githttp-fs only provides 64 bits packages targeting Debian 11 & 12 for now (codenames: `bullseye` & `bookworm`). You will still be able to use them on other Debian versions, as well as Ubuntu.**
+
+First, add the githttp-fs APT repository (eg. for Debian `bookworm`):
+
+```bash
+echo "deb [signed-by=/usr/share/keyrings/crisp-im_githttp-fs.gpg] https://packagecloud.io/crisp-im/githttp-fs/debian/ bookworm main" > /etc/apt/sources.list.d/crisp-im_githttp-fs.list
+```
+
+```bash
+curl -fsSL https://packagecloud.io/crisp-im/githttp-fs/gpgkey | gpg --dearmor -o /usr/share/keyrings/crisp-im_githttp-fs.gpg
+```
+
+```bash
+apt-get update
+```
+
+Then, install the githttp-fs package:
+
+```bash
+apt-get install githttp-fs
+```
+
+Then, edit the pre-filled githttp-fs configuration file:
+
+```bash
+nano /etc/githttp-fs.toml
+```
+
+Finally, restart githttp-fs:
+
+```
+service githttp-fs restart
+```
+
 **Install from binary:**
 
 A pre-built binary of githttp-fs is shared in the releases on GitHub. You can simply download the latest binary version from the [releases page](https://github.com/crispim/githttp-fs/releases), and run it on your server.
