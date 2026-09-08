@@ -3078,6 +3078,114 @@ impl GitOrder {
         })
     }
 
+    /// Every directory in scope that holds an order index, as a flat list of
+    /// repo-root-relative directory paths (`""` for the repository root).
+    ///
+    /// This is the order-side counterpart of
+    /// [`GitFiles::list_all_file_paths`], and the replay route's snapshot of
+    /// what a downstream order table should hold. It opens no blob — an index
+    /// is located by its tree entry alone, and its content is read later, per
+    /// chunk, at delivery time.
+    ///
+    /// `path_prefix` scopes the walk exactly as it does on the file snapshot
+    /// (an absent or non-directory prefix yields an empty list), and
+    /// `include_hidden_files` prunes hidden *directories* by the listing's
+    /// dot-prefix rule — the index's own dot-prefixed name is never what that
+    /// test is about, since an index is not a file to begin with.
+    pub fn list_order_directories(
+        repo_path: &Path,
+        tenant_id: &str,
+        path_prefix: Option<&str>,
+        include_hidden_files: bool,
+    ) -> Result<Vec<String>, AppError> {
+        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, include_hidden_files = include_hidden_files, "listing order index directories");
+
+        let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
+        let head_tree = repo.head()?.peel_to_commit()?.tree()?;
+
+        let prefix = path_prefix.filter(|prefix| !prefix.is_empty());
+
+        let walk_tree: git2::Tree<'_> = match prefix {
+            Some(prefix) => match head_tree.get_path(Path::new(prefix)) {
+                Ok(entry) => match repo.find_tree(entry.id()) {
+                    Ok(tree) => tree,
+                    Err(_not_a_directory) => return Ok(Vec::new()),
+                },
+                Err(_absent) => return Ok(Vec::new()),
+            },
+            None => head_tree,
+        };
+
+        let mut directories: Vec<String> = Vec::new();
+
+        walk_tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            if entry.kind() == Some(git2::ObjectType::Tree) {
+                if !include_hidden_files && entry.name().is_ok_and(|name| name.starts_with('.')) {
+                    return git2::TreeWalkResult::Skip;
+                }
+
+                return git2::TreeWalkResult::Ok;
+            }
+
+            if entry.kind() == Some(git2::ObjectType::Blob)
+                && entry
+                    .name()
+                    .is_ok_and(|name| name == order::ORDER_FILE_NAME)
+            {
+                // `root` is the walk-relative directory with a trailing slash
+                // (empty at the walk root), and a directory is spelled without
+                // one everywhere an order event carries it.
+                directories.push(root.trim_end_matches('/').to_string());
+            }
+
+            git2::TreeWalkResult::Ok
+        })?;
+
+        // Paths are repo-root-relative, like every other identity on this API.
+        let directories: Vec<String> = match prefix {
+            Some(prefix) => directories
+                .into_iter()
+                .map(|directory| {
+                    if directory.is_empty() {
+                        prefix.to_string()
+                    } else {
+                        format!("{}/{}", prefix, directory)
+                    }
+                })
+                .collect(),
+            None => directories,
+        };
+
+        tracing::debug!(tenant_id = %tenant_id, directory_count = directories.len(), "collected order index directories");
+
+        Ok(directories)
+    }
+
+    /// Reads the stored order of one chunk of directories for a replay, in a
+    /// single repository pass, index-aligned with `directories`.
+    ///
+    /// `None` marks a directory whose index can no longer be delivered — it
+    /// was dropped between the snapshot and now, or it is malformed — on the
+    /// same reasoning as [`GitFiles::replay_read_files`]: a replay runs
+    /// unattended over a snapshot that may already have moved on, and one
+    /// unreadable index must not abort the others. Only a failure to read the
+    /// *repository* is an error.
+    pub fn replay_read_orders(
+        repo_path: &Path,
+        tenant_id: &str,
+        directories: &[String],
+    ) -> Result<Vec<Option<Vec<String>>>, AppError> {
+        tracing::trace!(tenant_id = %tenant_id, count = directories.len(), "reading replay order chunk");
+
+        let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
+        let head_tree = repo.head()?.peel_to_commit()?.tree()?;
+
+        Ok(directories
+            .iter()
+            .map(|directory| Self::stored_order(&repo, &head_tree, directory))
+            .collect())
+    }
+
     /// Replaces `directory`'s order index with `order`.
     ///
     /// Every entry is resolved against HEAD's tree and canonicalised from what

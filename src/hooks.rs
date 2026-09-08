@@ -52,7 +52,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
 use crate::config::{Config, HookEvent, HooksConfig};
-use crate::git::{FileChange, GitFiles};
+use crate::git::{FileChange, GitFiles, GitOrder};
 use crate::order;
 
 /// Cap on the exponential backoff exponent to avoid `1 << n` overflow when an
@@ -130,6 +130,14 @@ pub struct ReplayJob {
     pub kind: ReplayKind,
     /// Repo-root-relative paths, in the order they should be delivered.
     pub paths: Vec<String>,
+    /// Repo-root-relative directories that hold an order index, delivered as
+    /// one `order.updated` each **after every file event of the replay** —
+    /// the same rule a commit-shaped job follows, and for the same reason: an
+    /// order snapshot must never name a file the receiver has not been told
+    /// about yet. Their content is resolved at delivery like every other
+    /// replay payload, so a directory whose index was dropped meanwhile is
+    /// skipped rather than replayed stale.
+    pub order_directories: Vec<String>,
     /// Optional pause between consecutive deliveries. Delivery is already
     /// strictly sequential per repository, so this is a *throttle* for the
     /// receiver, not an ordering device — and it holds this repository's queue
@@ -452,6 +460,7 @@ impl HookDelivery {
                 &job.commit_sha,
                 &job.committed_at,
                 &order_change,
+                false,
             );
             let description = Self::order_change_description(&order_change);
 
@@ -468,8 +477,17 @@ impl HookDelivery {
         }
     }
 
-    /// Delivers one replay: a `file.updated` or `file.deleted` per path, in
-    /// order, optionally throttled by `delay_ms`.
+    /// Delivers one replay: a `file.created` or `file.deleted` per path, in
+    /// order, then one `order.updated` per directory holding an order index,
+    /// all optionally throttled by `delay_ms`.
+    ///
+    /// The order phase comes **last**, after every file event, exactly as it
+    /// does in a commit-shaped job and for the same reason: an order snapshot
+    /// must never name a file the receiver has not been told about yet. Only
+    /// `order.updated` is ever replayed — a replay states what the repository
+    /// currently holds, and a directory with no index holds nothing to state.
+    /// The two phases are subscription-gated independently, so a receiver can
+    /// take either alone.
     ///
     /// Two things make this different from a commit-shaped job:
     ///
@@ -503,15 +521,30 @@ impl HookDelivery {
         // Subscriptions apply to a replay exactly as to a live event. An
         // unsubscribed replay delivers nothing, which is correct but silent
         // enough to look like a bug from the outside — so it is logged at warn
-        // rather than skipped quietly.
-        if !hooks.events.contains(&required_event) {
+        // rather than skipped quietly. The two phases are gated separately:
+        // a receiver subscribed to `order.updated` but not to the file event
+        // still gets its order snapshots, and vice versa.
+        let deliver_files = hooks.events.contains(&required_event);
+        let deliver_orders = hooks.events.contains(&HookEvent::OrderUpdated);
+
+        if !deliver_files && !replay.paths.is_empty() {
             tracing::warn!(
                 repository,
                 event = ?replay.kind,
                 path_count = replay.paths.len(),
-                "replay requested but its event kind is not listed in [hooks] events, delivering nothing"
+                "replay requested but its event kind is not listed in [hooks] events, delivering no file events"
             );
+        }
 
+        if !deliver_orders && !replay.order_directories.is_empty() {
+            tracing::warn!(
+                repository,
+                directory_count = replay.order_directories.len(),
+                "replay found order indexes but order.updated is not listed in [hooks] events, delivering no order events"
+            );
+        }
+
+        if !deliver_files && !deliver_orders {
             return;
         }
 
@@ -525,23 +558,32 @@ impl HookDelivery {
             repository,
             event = ?replay.kind,
             path_count = total,
+            order_directory_count = replay.order_directories.len(),
             delay_ms = ?replay.delay_ms,
             "replay starting"
         );
 
         let mut delivered: usize = 0;
         let mut skipped: usize = 0;
+        let mut orders_delivered: usize = 0;
+        let mut orders_skipped: usize = 0;
 
-        for chunk in replay.paths.chunks(REPLAY_READ_CHUNK) {
-            let changes =
-                match Self::replay_chunk_changes(&replay.repo_path, tenant_id, replay.kind, chunk)
-                    .await
+        if deliver_files {
+            for chunk in replay.paths.chunks(REPLAY_READ_CHUNK) {
+                let changes = match Self::replay_chunk_changes(
+                    &replay.repo_path,
+                    tenant_id,
+                    replay.kind,
+                    chunk,
+                )
+                .await
                 {
                     Some(changes) => changes,
 
                     // The repository could not be read at all (deleted mid-replay,
                     // or a git failure). Continuing would emit nothing useful for
-                    // every remaining chunk, so the replay stops here.
+                    // every remaining chunk, so the replay stops here — order
+                    // events included, since they read the same repository.
                     None => {
                         tracing::error!(
                             repository,
@@ -554,44 +596,117 @@ impl HookDelivery {
                     }
                 };
 
-            for change in changes {
-                let Some(change) = change else {
-                    skipped += 1;
+                for change in changes {
+                    let Some(change) = change else {
+                        skipped += 1;
 
-                    continue;
+                        continue;
+                    };
+
+                    // Sleeping *before* each delivery but the first is what keeps
+                    // the throttle strictly between deliveries — no trailing pause
+                    // holding the queue after the final POST.
+                    if delivered > 0 {
+                        if let Some(delay) = delay {
+                            sleep(delay).await;
+                        }
+                    }
+
+                    let payload = Self::build_payload(
+                        collection_id,
+                        tenant_id,
+                        commit_sha,
+                        committed_at,
+                        &change,
+                        true,
+                    );
+                    let description = Self::change_description(&change);
+
+                    Self::deliver_with_retries(
+                        client,
+                        hooks,
+                        attempts,
+                        payload,
+                        repository,
+                        commit_sha,
+                        &description,
+                    )
+                    .await;
+
+                    delivered += 1;
+                }
+            }
+        }
+
+        // Order events come last, after every file event this replay carries —
+        // the same ordering rule a commit-shaped job follows, so an order
+        // snapshot never names a file the receiver has not just been told
+        // about. Only `order.updated` is ever replayed: a replay states what
+        // the repository holds, and it holds no deletions.
+        if deliver_orders {
+            for chunk in replay.order_directories.chunks(REPLAY_READ_CHUNK) {
+                let orders = match Self::replay_chunk_orders(&replay.repo_path, tenant_id, chunk)
+                    .await
+                {
+                    Some(orders) => orders,
+
+                    None => {
+                        tracing::error!(
+                            repository,
+                            orders_delivered,
+                            remaining =
+                                replay.order_directories.len() - orders_delivered - orders_skipped,
+                            "replay aborted: repository could not be read for order indexes"
+                        );
+
+                        return;
+                    }
                 };
 
-                // Sleeping *before* each delivery but the first is what keeps
-                // the throttle strictly between deliveries — no trailing pause
-                // holding the queue after the final POST.
-                if delivered > 0 {
-                    if let Some(delay) = delay {
-                        sleep(delay).await;
+                for (directory, order) in chunk.iter().zip(orders) {
+                    // The index was dropped (or broke) between the snapshot and
+                    // now. Its real `order.deleted` is queued behind this replay,
+                    // so skipping keeps the receiver converging.
+                    let Some(order) = order else {
+                        orders_skipped += 1;
+
+                        continue;
+                    };
+
+                    if delivered + orders_delivered > 0 {
+                        if let Some(delay) = delay {
+                            sleep(delay).await;
+                        }
                     }
+
+                    let order_change = OrderChange::Updated {
+                        directory: directory.clone(),
+                        order,
+                    };
+
+                    let payload = Self::build_order_payload(
+                        collection_id,
+                        tenant_id,
+                        commit_sha,
+                        committed_at,
+                        &order_change,
+                        true,
+                    );
+                    let description = Self::order_change_description(&order_change);
+
+                    Self::deliver_with_retries(
+                        client,
+                        hooks,
+                        attempts,
+                        payload,
+                        repository,
+                        commit_sha,
+                        &description,
+                    )
+                    .await;
+
+                    orders_delivered += 1;
                 }
-
-                let payload = Self::build_payload(
-                    collection_id,
-                    tenant_id,
-                    commit_sha,
-                    committed_at,
-                    &change,
-                    true,
-                );
-                let description = Self::change_description(&change);
-
-                Self::deliver_with_retries(
-                    client,
-                    hooks,
-                    attempts,
-                    payload,
-                    repository,
-                    commit_sha,
-                    &description,
-                )
-                .await;
-
-                delivered += 1;
             }
         }
 
@@ -600,6 +715,8 @@ impl HookDelivery {
             event = ?replay.kind,
             delivered,
             skipped,
+            orders_delivered,
+            orders_skipped,
             "replay finished"
         );
     }
@@ -665,6 +782,43 @@ impl HookDelivery {
                 })
                 .collect(),
         )
+    }
+
+    /// Resolves one chunk of replay directories into the orders to deliver.
+    ///
+    /// Mirrors [`Self::replay_chunk_changes`] exactly: `None` means the
+    /// repository itself could not be read (the caller aborts), while an inner
+    /// `None` means that directory's index is no longer deliverable — dropped
+    /// since the snapshot, or malformed — and is skipped.
+    async fn replay_chunk_orders(
+        repo_path: &std::path::Path,
+        tenant_id: &str,
+        chunk: &[String],
+    ) -> Option<Vec<Option<Vec<String>>>> {
+        let repo_path = repo_path.to_path_buf();
+        let tenant_id = tenant_id.to_string();
+        let directories = chunk.to_vec();
+
+        let read = tokio::task::spawn_blocking(move || {
+            GitOrder::replay_read_orders(&repo_path, &tenant_id, &directories)
+        })
+        .await;
+
+        match read {
+            Ok(Ok(orders)) => Some(orders),
+
+            Ok(Err(read_err)) => {
+                tracing::error!("replay order chunk read failed: {}", read_err);
+
+                None
+            }
+
+            Err(join_err) => {
+                tracing::error!("replay order chunk read task failed: {}", join_err);
+
+                None
+            }
+        }
     }
 
     /// The retry loop for one payload: attempt, and on failure sleep
@@ -822,6 +976,7 @@ impl HookDelivery {
         commit_sha: &str,
         committed_at: &DateTime<Utc>,
         order_change: &OrderChange,
+        replay: bool,
     ) -> Value {
         let mut payload = Map::with_capacity(7);
 
@@ -841,6 +996,13 @@ impl HookDelivery {
             "committed_at".to_string(),
             Value::String(committed_at.to_rfc3339()),
         );
+
+        // Marked exactly as a replayed file event is, and only when replayed —
+        // see [`Self::build_payload`] for why the event name itself does not
+        // vary.
+        if replay {
+            payload.insert("replayed".to_string(), Value::Bool(true));
+        }
 
         match order_change {
             OrderChange::Updated { directory, order } => {

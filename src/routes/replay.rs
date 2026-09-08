@@ -27,6 +27,17 @@
 //! holds, which makes `create` cover the whole scope and makes `delete` a
 //! no-op by construction — git cannot be missing what it just listed.
 //!
+//! **Order indexes are replayed last, on every replay.** After the file
+//! events, one `order.updated` fires per directory in scope that holds an
+//! order index. It takes no flag and no direction: an index belongs to a
+//! directory, not to a file, so there is nothing in the caller's `files` list
+//! to intersect it with, and an order event is a snapshot — replaying one the
+//! mirror already has right changes nothing downstream. Only `order.updated`
+//! is replayable, since a replay states what the repository *holds*, and an
+//! `order.deleted` would have to fire for every directory without an index.
+//! The phase is subscription-gated on its own, so it stays invisible to a
+//! receiver that does not list `order.updated`.
+//!
 //! Nothing here writes. No commit is created, no file is touched, and
 //! background maintenance is not armed: this is a pure read that enqueues
 //! hook work. What it *does* share with every write handler is the tenant
@@ -205,6 +216,25 @@ pub async fn replay_hook(
     })
     .await?;
 
+    // The order side of the snapshot, taken under the same lock and from the
+    // same HEAD. It is scoped by `prefix_path` like the file side, but it is
+    // *not* intersected with `files`: an index belongs to a directory, not to
+    // a file, so there is nothing in the caller's list to intersect it with —
+    // the replay simply restates every order the repository holds in scope.
+    let repo_path_for_orders = repo_path.clone();
+    let tenant_id_for_orders = tenant_id.clone();
+    let prefix_for_orders = prefix_path.clone();
+
+    let order_directories = run_blocking(move || {
+        git::GitOrder::list_order_directories(
+            &repo_path_for_orders,
+            &tenant_id_for_orders,
+            prefix_for_orders.as_deref(),
+            include_hidden_files,
+        )
+    })
+    .await?;
+
     let present: HashSet<&str> = present_paths.iter().map(String::as_str).collect();
 
     // Omitting `files` defaults it to everything git holds. The two
@@ -222,9 +252,10 @@ pub async fn replay_hook(
         .collect();
 
     let file_count = affected.len();
-    let scheduled = file_count > 0;
+    let order_count = order_directories.len();
+    let scheduled = file_count > 0 || order_count > 0;
 
-    tracing::info!(collection_id = %collection_id, tenant_id = %tenant_id, direction = ?direction, candidate_count = candidates.len(), present_count = present.len(), file_count, "computed hook replay set");
+    tracing::info!(collection_id = %collection_id, tenant_id = %tenant_id, direction = ?direction, candidate_count = candidates.len(), present_count = present.len(), file_count, order_count, "computed hook replay set");
 
     if scheduled {
         state.hook_queue.enqueue(
@@ -238,6 +269,7 @@ pub async fn replay_hook(
                     repo_path,
                     kind: direction.replay_kind(),
                     paths: affected,
+                    order_directories,
                     delay_ms,
                 },
             ),
@@ -255,6 +287,7 @@ pub async fn replay_hook(
         Json(json!({
             "commit_sha": head_sha,
             "files": file_count,
+            "orders": order_count,
         })),
     ))
 }
