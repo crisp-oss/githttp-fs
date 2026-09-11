@@ -94,6 +94,18 @@ pub struct MaintenanceConfig {
     /// maintenance can never destroy data under any circumstance — at the
     /// cost of orphaned garbage being retained forever.
     pub destructive_prune: bool,
+    /// Opt-in pack-count trigger. When set, a repository holding at least
+    /// this many packfiles gets its maintenance pass *immediately* on the
+    /// next write (or replicated pack apply) instead of after `delay_secs`.
+    ///
+    /// Unset by default, because a master rarely needs it: its writes land
+    /// as loose objects and one consolidated pack a day is plenty. A replica
+    /// is the case it exists for — every applied delta arrives as its own
+    /// pack, so a busy tenant polled every minute can carry hundreds of packs
+    /// before a daily pass, and libgit2 consults every pack index on every
+    /// object lookup. The count is one directory read per write, checked
+    /// only when this is set.
+    pub maximum_packs: Option<usize>,
 }
 
 impl Default for MaintenanceConfig {
@@ -103,6 +115,7 @@ impl Default for MaintenanceConfig {
             // 24 hours
             delay_secs: 86_400,
             destructive_prune: false,
+            maximum_packs: None,
         }
     }
 }
@@ -111,6 +124,16 @@ impl MaintenanceConfig {
     fn collect_errors(&self, errors: &mut Vec<String>) {
         if self.enabled && self.delay_secs < 1 {
             errors.push("maintenance.delay_secs must be at least 1".to_string());
+        }
+
+        // Two packs is the smallest count at which consolidation does
+        // anything: the pass already skips a repository holding one pack and
+        // no loose objects, so a threshold of 1 would arm a no-op after every
+        // write.
+        if let Some(maximum_packs) = self.maximum_packs {
+            if maximum_packs < 2 {
+                errors.push("maintenance.maximum_packs must be at least 2".to_string());
+            }
         }
     }
 }
@@ -253,22 +276,24 @@ pub struct ReplicationConfig {
     /// githttp-fs to githttp-fs. Two keys in one config file called the same
     /// thing is an invitation to paste the wrong one.
     pub secret: String,
-    /// How this node names itself to its peers, so an operator reading the
-    /// health route sees meaningful names instead of anonymous rows.
+    /// How this node names itself to its peers: the row it occupies in a
+    /// master's roster, and the name every log line about it carries.
     ///
-    /// This is **telemetry, not authentication** — `api_key` is what guards
-    /// the replication surface. A node id only ever labels a row in a
-    /// roster, so a node that lies about its own can mislead a dashboard and
-    /// nothing more. Keeping it out of the auth path is what lets it stay
-    /// optional and self-asserted, which preserves the property that a
-    /// replica needs no registration on its master: it joins by connecting.
+    /// **Required**, and required to be unique within a deployment. The
+    /// master refuses a second notification stream claiming a node id that
+    /// is already connected from a different process (`409`), because a
+    /// roster keyed on a shared name would fold two replicas into one row
+    /// and an operator would never learn that one of them had gone. There
+    /// is no default on purpose: the obvious one, `host:port`, is
+    /// `0.0.0.0:5355` on every node bound to all interfaces — identical
+    /// everywhere, which is the collision this rule exists to prevent.
     ///
-    /// Defaults to `"host:port"`, which is deterministic across restarts (so
-    /// a roster row survives a reboot instead of forking into two) and is
-    /// usually already meaningful. Override it where the bind address is not
-    /// how peers see this node — behind NAT, in a container, or when several
-    /// nodes share a host.
-    pub node_id: Option<String>,
+    /// This is **identity for telemetry, not authentication** — `secret` is
+    /// what guards the replication surface. A node that lies about its name
+    /// can mislead a dashboard or be refused a stream, nothing more, which is
+    /// what lets a replica still need no registration on its master: it
+    /// joins by connecting.
+    pub node_id: String,
     /// Base URL of the master's **replication server** — its `[replication]
     /// host`/`port`, not the content API's. Required on a replica, rejected
     /// on a master (a master that names a master is a config mistake worth
@@ -299,6 +324,17 @@ pub struct ReplicationConfig {
     /// Backoff doubles up to a minute.
     #[serde(default = "default_reconnect_backoff_ms")]
     pub reconnect_backoff_ms: u64,
+    /// The mass-deletion guard. While `true` (the default), a replica refuses
+    /// a master listing that would delete more than half of the repositories
+    /// it holds, and reports it instead. Set to `false` — temporarily, with
+    /// a restart — to accept such a deletion on purpose; nothing else clears
+    /// a refused one, since a restarted replica still holds what it held.
+    #[serde(default = "default_deletion_guard")]
+    pub deletion_guard: bool,
+}
+
+fn default_deletion_guard() -> bool {
+    true
 }
 
 fn default_poll_interval_secs() -> u64 {
@@ -322,12 +358,9 @@ impl ReplicationConfig {
         self.role == ReplicationRole::Replica
     }
 
-    /// This node's id, falling back to `host:port` when unset.
-    pub fn node_id(&self, server: &ServerConfig) -> String {
-        match &self.node_id {
-            Some(node_id) => node_id.clone(),
-            None => format!("{}:{}", server.host, server.port),
-        }
+    /// This node's id, as configured.
+    pub fn node_id(&self) -> &str {
+        &self.node_id
     }
 
     /// Address the replication server binds, falling back to `server.host`.
@@ -351,12 +384,14 @@ impl ReplicationConfig {
         }
 
         // Held to the same rule peers apply on receipt (`validate::node_id`),
-        // so a node never announces a name its master would discard and show
-        // as anonymous.
-        if let Some(node_id) = &self.node_id {
-            if let Err(err) = crate::validate::node_id(node_id) {
-                errors.push(format!("replication.node_id is invalid: {}", err));
-            }
+        // so a node never announces a name its master would discard. An
+        // empty name is the same error as a missing one, and it is caught
+        // here rather than deserialisation so the message names the rule.
+        if let Err(err) = crate::validate::node_id(&self.node_id) {
+            errors.push(format!(
+                "replication.node_id is required and must be valid: {}",
+                err
+            ));
         }
 
         match (self.role, &self.master_url) {

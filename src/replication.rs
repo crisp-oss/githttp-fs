@@ -78,15 +78,16 @@
 use dashmap::DashMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::sync::{broadcast, Notify, Semaphore};
 use tokio::time::{sleep, Duration};
 
 use crate::config::{Config, ReplicationConfig};
-use crate::git::{GitReplication, PackApply, RepositoryHead, RepositoryScan};
+use crate::git::{GitReplication, HeadRelation, PackApply, RepositoryHead, RepositoryScan};
 use crate::state::AppState;
 use crate::util::run_blocking;
 use crate::validate;
@@ -119,6 +120,50 @@ const STATE_TIMEOUT_SECS: u64 = 30;
 /// exactly the repositories that need a full clone the ones that can never
 /// get one. The connect timeout still catches a master that is down.
 const PACK_READ_TIMEOUT_SECS: u64 = 600;
+
+/// Floor between two rescans forced by an *incomplete* index. An index that
+/// cannot be completed (an unreadable collection directory, a missing
+/// identity file) would otherwise rescan on every state poll and every
+/// health probe, turning a fault into a disk walk per request.
+const INCOMPLETE_RESCAN_MIN_SECS: u64 = 5;
+
+/// A replica whose last reconcile-or-drain failed this many times in a row is
+/// `stalled`: three consecutive misses is past the point where a single
+/// transient error explains it, and short enough to page before an outage
+/// has aged. Below it the replica is merely `lagging`.
+const STALLED_AFTER_FAILURES: u32 = 3;
+
+/// A roster row whose stream is down *and* whose last contact is older than
+/// this makes the master report `degraded`. Two poll intervals at the default
+/// setting: a replica polling normally with its stream down is heard from
+/// well inside it.
+const REPLICA_SILENT_SECS: i64 = 120;
+
+/// The mass-deletion guard. A complete listing that would have a replica
+/// delete *more than half* of the repositories it holds is refused outright
+/// and reported instead of applied. A master genuinely deleting most of its
+/// tenants in one poll interval is rare; a master whose store was swapped,
+/// emptied, or mis-mounted is not, and the difference is not one a replica
+/// can tell on its own. A replica holding fewer than this many repositories
+/// is exempt, since "more than half of one" is every ordinary deletion.
+const DELETION_GUARD_MINIMUM_HELD: usize = 2;
+
+/// How long after its last refused connection a node id collision stays
+/// reported on the *master*. A colliding replica re-dials with backoff that
+/// caps at 60 s, so a collision still in progress refreshes itself well
+/// inside this; one that has gone quiet for longer was fixed (renamed and
+/// restarted), and there is no other event a master could learn that from.
+const COLLISION_EXPIRY_SECS: i64 = 150;
+
+/// How long a `409` on the notification stream may persist before the
+/// replica reports it as an issue. A replica that restarted while its old
+/// socket was still open on the master collides with *itself* until the
+/// master notices the dead connection, which takes about a heartbeat; only
+/// a collision outlasting two of them is worth a page.
+const COLLISION_REPORT_AFTER_SECS: u64 = 2 * EVENT_HEARTBEAT_SECS;
+
+/// Size of the per-process instance token, before hex encoding.
+const INSTANCE_BYTES: usize = 16;
 
 /// How often a node re-walks its repositories directory to refresh the
 /// in-memory index. The index is kept current by every commit and deletion
@@ -268,6 +313,14 @@ pub struct RepositoryEntry {
 pub const NODE_ID_HEADER: &str = "x-replication-node-id";
 pub const REPOSITORIES_HEADER: &str = "x-replication-repositories";
 pub const PENDING_HEADER: &str = "x-replication-pending";
+/// The replica's own [`SyncStatus`], so the master's roster shows every
+/// follower's condition in one place.
+pub const SYNC_HEADER: &str = "x-replication-sync";
+/// A random token generated once per replica *process*. Two connections
+/// bearing the same node id and the same instance are one replica
+/// reconnecting; the same node id with a different instance is two replicas
+/// sharing a name, which the master refuses.
+pub const INSTANCE_HEADER: &str = "x-replication-instance";
 
 // ---------------------------------------------------------------------------
 // Health — what a node can honestly say about the set it belongs to
@@ -275,16 +328,30 @@ pub const PENDING_HEADER: &str = "x-replication-pending";
 
 /// The replication picture as one node sees it, served by both health routes.
 ///
-/// One struct and one builder behind two doors: `GET /v1/replication` for the
-/// operator (content API key) and `GET /_replication/health` for peers
-/// (replication key). The audiences and credentials differ, the answer does
-/// not — and the peer route is what lets a replica learn the roster at all,
-/// since it holds the replication key and not necessarily the content one.
+/// One struct and one builder behind two doors: `GET /v1/_health/replication`
+/// for the operator (public, no credential) and `GET /_replication/health`
+/// for peers (replication secret). The audiences differ, the answer does not
+/// — and the peer route is what lets a replica learn the roster at all,
+/// since it holds the replication secret and not necessarily the content key.
+///
+/// Two fields exist purely so that an alert can be written against one
+/// value on any node: `status` collapses everything below it into
+/// `healthy` / `degraded` / `halted`, and `issues` lists exactly what a
+/// `halted` node is waiting on a human for. See [`NodeStatus`].
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReplicationHealth {
     /// The protocol this body is written in.
     #[serde(default)]
     pub protocol: u32,
+    /// `"healthy"`, `"degraded"` (converging on its own, or a follower is),
+    /// or `"halted"` (this node, or a follower it knows of, needs a human).
+    #[serde(default)]
+    pub status: String,
+    /// Everything this node is waiting on an operator for. Empty unless
+    /// `status` is `"halted"`; each entry says what happened, to which
+    /// repository where that applies, and since when.
+    #[serde(default)]
+    pub issues: Vec<Issue>,
     /// The node answering this request.
     pub node: NodeHealth,
     /// The write node of this set, as far as the answering node knows.
@@ -361,24 +428,319 @@ pub struct ReplicaPresence {
     pub repositories: Option<usize>,
     /// Repositories the replica says it knows are behind.
     pub pending_repositories: Option<usize>,
+    /// The replica's own [`SyncStatus`], as it last reported it — so the
+    /// master's roster is one place to read every follower's condition.
+    pub sync: Option<String>,
     pub reported_at: Option<i64>,
+    /// The instance token of the process holding the stream. Internal:
+    /// what tells "this replica reconnected" from "another replica claims
+    /// this name". Never serialised.
+    #[serde(skip)]
+    pub instance: Option<String>,
+    /// When a stream under this node id was last refused as a collision.
+    /// Internal; what lets the collision issue expire once the second
+    /// process stops dialling.
+    #[serde(skip)]
+    pub last_collision_at: Option<i64>,
 }
 
 /// A replica's own view of how its following is going.
+///
+/// `state` answers "can this node serve reads" and `sync` answers "is it
+/// keeping up, and will it on its own" — two questions, because a warm
+/// replica cut off from its master is `ready` and `stalled` at once.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FollowerHealth {
     /// `"ready"` once this node holds content worth serving, else
     /// `"bootstrapping"`.
     pub state: String,
+    /// One of [`SyncStatus`]: `"synced"`, `"lagging"`, `"stalled"`, or
+    /// `"halted"`. Alert on `halted`; warn on `stalled`.
+    pub sync: String,
     pub stream_connected: bool,
     pub last_reconcile_at: Option<i64>,
+    /// When a reconcile-and-drain last ended with nothing failed. `null`
+    /// before the first one.
+    pub last_success_at: Option<i64>,
     pub pending_repositories: usize,
-    /// Times this node discarded a local repository and cloned it afresh
-    /// because its history no longer descended from the master's. Each one
-    /// destroyed a local copy, which is why it is counted where a dashboard
-    /// can see it.
-    pub reclones: u64,
+    /// Repositories this replica holds but refuses to sync until an operator
+    /// looks at them — one `replica_ahead` or `history_diverged` issue each.
+    pub locked_repositories: usize,
+    /// Worker passes in a row that ended in failure. `stalled` at
+    /// [`STALLED_AFTER_FAILURES`].
+    pub consecutive_failures: u32,
 }
+
+/// How a replica's following is going, as one word.
+///
+/// The distinction that matters to an alert is the last one: `Stalled` heals
+/// on its own once whatever is failing stops failing (a master that is down,
+/// a network that is flapping), whereas `Halted` never does — something
+/// needs a human, and [`Issue`] says what.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncStatus {
+    /// The last pass succeeded and nothing is pending or locked.
+    Synced,
+    /// Work is pending, or no pass has completed yet, and passes are landing.
+    Lagging,
+    /// [`STALLED_AFTER_FAILURES`] passes in a row have failed.
+    Stalled,
+    /// At least one [`Issue`] is open.
+    Halted,
+}
+
+impl SyncStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SyncStatus::Synced => "synced",
+            SyncStatus::Lagging => "lagging",
+            SyncStatus::Stalled => "stalled",
+            SyncStatus::Halted => "halted",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "synced" => Some(SyncStatus::Synced),
+            "lagging" => Some(SyncStatus::Lagging),
+            "stalled" => Some(SyncStatus::Stalled),
+            "halted" => Some(SyncStatus::Halted),
+            _ => None,
+        }
+    }
+}
+
+/// The one-word verdict on a whole node, for `ReplicationHealth::status`.
+///
+/// On a replica it follows its own [`SyncStatus`] plus its bootstrap gate.
+/// On a master it folds in every roster row: a follower reporting `halted`
+/// makes the master say `halted` too, because the master's health route is
+/// where an operator with one probe looks, and a replica serving stale
+/// content while refusing to sync is exactly the thing that probe must not
+/// hide. A standalone node is `healthy` by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NodeStatus {
+    Healthy,
+    Degraded,
+    Halted,
+}
+
+impl NodeStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NodeStatus::Healthy => "healthy",
+            NodeStatus::Degraded => "degraded",
+            NodeStatus::Halted => "halted",
+        }
+    }
+}
+
+/// Something a node has stopped doing on its own and is waiting on an
+/// operator for. Serialised with a `kind` tag so an alert can match on it;
+/// every variant carries `since` so an operator can tell a fresh problem
+/// from one that has been ignored for a week.
+///
+/// These are the *only* conditions under which replication holds back, and
+/// every one of them exists so that the alternative — a replica acting on
+/// its own guess, up to and including deleting its data — never happens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum Issue {
+    /// This replica holds more history than its upstream announced for the
+    /// repository: the announced head is an ancestor of the local one. The
+    /// local copy is intact and still served; syncing it is suspended until
+    /// the upstream moves past it or an operator removes the local copy.
+    #[serde(rename = "replica_ahead")]
+    ReplicaAhead {
+        collection_id: String,
+        tenant_id: String,
+        local: String,
+        remote: String,
+        since: i64,
+    },
+    /// Neither the local nor the announced head descends from the other — a
+    /// tenant deleted and re-created under the same name, or a forked
+    /// history. Same handling as `replica_ahead`.
+    #[serde(rename = "history_diverged")]
+    HistoryDiverged {
+        collection_id: String,
+        tenant_id: String,
+        local: String,
+        remote: String,
+        since: i64,
+    },
+    /// The upstream states a data-set identity other than the one pinned in
+    /// this replica's `.replication.json`. Nothing is pulled until it does.
+    #[serde(rename = "identity_mismatch")]
+    IdentityMismatch {
+        pinned: String,
+        stated: String,
+        since: i64,
+    },
+    /// A complete upstream listing would have this replica delete more than
+    /// half of what it holds. Refused; updates keep flowing.
+    #[serde(rename = "deletion_refused")]
+    DeletionRefused {
+        would_delete: usize,
+        held: usize,
+        since: i64,
+    },
+    /// This node's own `.replication.json` is gone from `repos_path` — the
+    /// store this process started with is not the store it sees now. Its
+    /// listing is served as incomplete, so no follower infers deletions.
+    #[serde(rename = "identity_file_missing")]
+    IdentityFileMissing { path: String, since: i64 },
+    /// This node's `.replication.json` no longer holds the identity loaded
+    /// at startup. Same consequence as `identity_file_missing`.
+    #[serde(rename = "identity_file_changed")]
+    IdentityFileChanged {
+        path: String,
+        expected: String,
+        found: String,
+        since: i64,
+    },
+    /// Two processes are presenting the same `node_id`. On a master: it
+    /// refused the second one's stream. On a replica: its own stream is
+    /// being refused.
+    #[serde(rename = "node_id_collision")]
+    NodeIdCollision { node_id: String, since: i64 },
+}
+
+impl Issue {
+    fn since(&self) -> i64 {
+        match self {
+            Issue::ReplicaAhead { since, .. }
+            | Issue::HistoryDiverged { since, .. }
+            | Issue::IdentityMismatch { since, .. }
+            | Issue::DeletionRefused { since, .. }
+            | Issue::IdentityFileMissing { since, .. }
+            | Issue::IdentityFileChanged { since, .. }
+            | Issue::NodeIdCollision { since, .. } => *since,
+        }
+    }
+
+    fn set_since(&mut self, value: i64) {
+        match self {
+            Issue::ReplicaAhead { since, .. }
+            | Issue::HistoryDiverged { since, .. }
+            | Issue::IdentityMismatch { since, .. }
+            | Issue::DeletionRefused { since, .. }
+            | Issue::IdentityFileMissing { since, .. }
+            | Issue::IdentityFileChanged { since, .. }
+            | Issue::NodeIdCollision { since, .. } => *since = value,
+        }
+    }
+}
+
+/// The open issues of this node, keyed so that raising the same condition
+/// twice updates one entry rather than appending a second.
+///
+/// One store for every role: a master raises identity-file and collision
+/// issues, a replica raises those plus the follower ones. Whether anything is
+/// open is what turns a node `halted`, and the list is what the health route
+/// shows under `issues`.
+pub struct Issues {
+    inner: Mutex<BTreeMap<String, Issue>>,
+}
+
+impl Issues {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Key for a repository-scoped issue, so a repository has at most one
+    /// lock issue whichever kind it is.
+    pub fn repository_key(collection_id: &str, tenant_id: &str) -> String {
+        format!("repository:{}/{}", collection_id, tenant_id)
+    }
+
+    /// Key for a master-side node id collision, one per colliding name.
+    pub fn collision_key(node_id: &str) -> String {
+        format!("node_id_collision:{}", node_id)
+    }
+
+    /// Opens `issue` under `key`, or refreshes it. `since` is preserved from
+    /// the entry already open under that key, so an issue that keeps being
+    /// re-raised on every pass still reports when it first appeared. Returns
+    /// whether the issue is *new*, so a caller can log the first occurrence
+    /// at error and the repeats at debug.
+    pub fn raise(&self, key: &str, mut issue: Issue) -> bool {
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+
+        let new = match inner.get(key) {
+            Some(existing) => {
+                issue.set_since(existing.since());
+
+                false
+            }
+            None => true,
+        };
+
+        inner.insert(key.to_string(), issue);
+
+        new
+    }
+
+    /// Closes the issue under `key`, if any. Returns whether one was open,
+    /// so a caller can log the recovery exactly once.
+    pub fn clear(&self, key: &str) -> bool {
+        self.inner
+            .lock()
+            .map(|mut inner| inner.remove(key).is_some())
+            .unwrap_or(false)
+    }
+
+    pub fn get(&self, key: &str) -> Option<Issue> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.get(key).cloned())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|inner| inner.is_empty())
+            .unwrap_or(true)
+    }
+
+    /// How many open issues have keys starting with `prefix`.
+    pub fn count_with_prefix(&self, prefix: &str) -> usize {
+        self.inner
+            .lock()
+            .map(|inner| inner.keys().filter(|key| key.starts_with(prefix)).count())
+            .unwrap_or(0)
+    }
+
+    /// Every open issue, oldest first.
+    pub fn all(&self) -> Vec<Issue> {
+        let mut issues: Vec<Issue> = self
+            .inner
+            .lock()
+            .map(|inner| inner.values().cloned().collect())
+            .unwrap_or_default();
+
+        issues.sort_by_key(|issue| issue.since());
+
+        issues
+    }
+}
+
+impl Default for Issues {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Issue keys that are not repository-scoped.
+const ISSUE_IDENTITY_MISMATCH: &str = "identity_mismatch";
+const ISSUE_DELETION_REFUSED: &str = "deletion_refused";
+const ISSUE_IDENTITY_FILE: &str = "identity_file";
+const ISSUE_NODE_ID_COLLISION: &str = "node_id_collision";
 
 // ---------------------------------------------------------------------------
 // ReplicationIdentity — which data set a node serves
@@ -391,6 +753,19 @@ struct IdentityFile {
     identity: String,
     #[serde(flatten)]
     extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// What [`ReplicationIdentity::verify_on_disk`] found wrong.
+#[derive(Debug)]
+pub enum IdentityDrift {
+    Missing {
+        path: String,
+    },
+    Changed {
+        path: String,
+        expected: String,
+        found: String,
+    },
 }
 
 /// The identity of the *data set* a node serves, pinned so that a replica
@@ -482,6 +857,45 @@ impl ReplicationIdentity {
         &self.path
     }
 
+    /// Re-reads the identity file and checks it still says what this process
+    /// loaded at startup.
+    ///
+    /// The identity is loaded once, at boot, from inside `repos_path`. That
+    /// makes it a canary for the store itself: if the directory this node
+    /// serves is unmounted, swapped, or emptied while the process runs, the
+    /// file goes with it — and a listing scanned from what is left would be
+    /// *complete*, *empty*, and, on a master, an instruction to every
+    /// replica to delete everything. Every rescan therefore re-checks the
+    /// file and marks the scan incomplete when it is missing or different,
+    /// which is the one signal replicas never infer deletions from.
+    ///
+    /// A node with no identity in memory (standalone, or a replica that has
+    /// not pinned yet) has nothing to verify and always passes.
+    pub fn verify_on_disk(&self) -> Result<(), IdentityDrift> {
+        let Some(expected) = self.current() else {
+            return Ok(());
+        };
+
+        let path = self.path.display().to_string();
+
+        match Self::read_file(&self.path) {
+            Ok(Some(file)) if file.identity == expected => Ok(()),
+            Ok(Some(file)) => Err(IdentityDrift::Changed {
+                path,
+                expected,
+                found: file.identity,
+            }),
+            Ok(None) => Err(IdentityDrift::Missing { path }),
+            // Unreadable or malformed is treated as missing: either way the
+            // store cannot vouch for itself right now.
+            Err(err) => {
+                tracing::warn!(err = %err, "replication identity file cannot be read");
+
+                Err(IdentityDrift::Missing { path })
+            }
+        }
+    }
+
     /// Stores the master's identity on a replica that has none yet. Written
     /// before it is adopted in memory, so a replica that crashes in between
     /// simply pins again on its next reconcile.
@@ -550,13 +964,18 @@ impl ReplicationIdentity {
     }
 
     fn generate() -> Result<String, String> {
-        let mut bytes = [0_u8; IDENTITY_BYTES];
-
-        getrandom::fill(&mut bytes)
-            .map_err(|err| format!("cannot generate replication identity: {}", err))?;
-
-        Ok(bytes.iter().map(|byte| format!("{:02x}", byte)).collect())
+        generate_hex(IDENTITY_BYTES)
+            .map_err(|err| format!("cannot generate replication identity: {}", err))
     }
+}
+
+/// `bytes` random bytes from the OS, hex-encoded lowercase.
+fn generate_hex(bytes: usize) -> Result<String, String> {
+    let mut buffer = vec![0_u8; bytes];
+
+    getrandom::fill(&mut buffer).map_err(|err| err.to_string())?;
+
+    Ok(buffer.iter().map(|byte| format!("{:02x}", byte)).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -577,6 +996,9 @@ struct IndexInner {
     complete: bool,
     scanned: bool,
     sequence: u64,
+    /// When the last rescan finished, whatever its outcome. Rate-limits the
+    /// rescans an incomplete index keeps asking for.
+    last_scan: Option<Instant>,
 }
 
 /// The repository listing, served from memory.
@@ -597,10 +1019,18 @@ struct IndexInner {
 pub struct RepositoryIndex {
     repos_path: PathBuf,
     inner: Mutex<IndexInner>,
+    /// Held for the duration of a disk walk, so concurrent first-use
+    /// snapshots (every replica polling a master that just booted) run one
+    /// scan and share it rather than each walking the disk.
+    scan_lock: Mutex<()>,
+    /// Re-verified on every rescan — see
+    /// [`ReplicationIdentity::verify_on_disk`].
+    identity: Arc<ReplicationIdentity>,
+    issues: Arc<Issues>,
 }
 
 impl RepositoryIndex {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config, identity: Arc<ReplicationIdentity>, issues: Arc<Issues>) -> Self {
         Self {
             repos_path: config.server.repos_path.clone(),
             inner: Mutex::new(IndexInner {
@@ -608,7 +1038,11 @@ impl RepositoryIndex {
                 complete: false,
                 scanned: false,
                 sequence: 0,
+                last_scan: None,
             }),
+            scan_lock: Mutex::new(()),
+            identity,
+            issues,
         }
     }
 
@@ -653,17 +1087,27 @@ impl RepositoryIndex {
     /// initial scan on first use, and re-runs it while the last one was
     /// incomplete — so a node whose disk is misbehaving keeps probing it
     /// rather than serving an incomplete listing until the next scheduled
-    /// rescan. Call from the blocking pool.
+    /// rescan — but no more often than [`INCOMPLETE_RESCAN_MIN_SECS`], so a
+    /// fault that does not clear cannot turn every probe into a disk walk.
+    /// Call from the blocking pool.
     pub fn snapshot(&self) -> RepositoryScan {
-        let needs_scan = self
-            .inner
-            .lock()
-            .map(|inner| !inner.scanned || !inner.complete)
-            .unwrap_or(true);
+        if self.needs_scan() {
+            // Serialise: whoever gets the lock first scans, and everyone
+            // queued behind finds the fresh result and skips.
+            let _scanning = self.scan_lock.lock();
 
-        if needs_scan {
-            self.rescan();
+            if self.needs_scan() {
+                self.rescan();
+            }
         }
+
+        // The identity canary is cheap (one small file read) and it is the
+        // only thing that can tell a listing served from a complete,
+        // up-to-date index that the store underneath has since vanished. So
+        // it runs on every listing, not only on the slow rescan cadence: a
+        // master answers a replica's poll from memory, and ten minutes is
+        // long enough for every replica to have acted on an empty listing.
+        let identity_intact = self.verify_identity_file();
 
         let Ok(inner) = self.inner.lock() else {
             return RepositoryScan::default();
@@ -685,18 +1129,48 @@ impl RepositoryIndex {
 
         RepositoryScan {
             repositories,
-            complete: inner.complete,
+            complete: inner.complete && identity_intact,
         }
     }
 
+    fn needs_scan(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|inner| {
+                if !inner.scanned {
+                    return true;
+                }
+
+                if inner.complete {
+                    return false;
+                }
+
+                inner
+                    .last_scan
+                    .map(|at| at.elapsed().as_secs() >= INCOMPLETE_RESCAN_MIN_SECS)
+                    .unwrap_or(true)
+            })
+            .unwrap_or(true)
+    }
+
     /// Walks the disk and folds the result into the index. **Blocking.**
+    ///
+    /// The identity file is checked first, every time. A scan that finds
+    /// the file missing or changed is folded in as *incomplete* whatever the
+    /// walk itself found, and the condition is raised as an issue: the store
+    /// under this process is not the store it started with, and nothing
+    /// scanned from it may be used to infer a deletion.
     pub fn rescan(&self) {
         let started_at = match self.inner.lock() {
             Ok(inner) => inner.sequence,
             Err(_) => return,
         };
 
-        let scan = GitReplication::list_repositories(&self.repos_path);
+        let identity_intact = self.verify_identity_file();
+
+        let mut scan = GitReplication::list_repositories(&self.repos_path);
+
+        scan.complete &= identity_intact;
 
         let Ok(mut inner) = self.inner.lock() else {
             return;
@@ -741,12 +1215,82 @@ impl RepositoryIndex {
 
         inner.complete = scan.complete;
         inner.scanned = true;
+        inner.last_scan = Some(Instant::now());
 
         tracing::debug!(
             repositories = inner.heads.len(),
             complete = inner.complete,
             "repository index rescanned"
         );
+    }
+
+    /// Runs [`ReplicationIdentity::verify_on_disk`], keeping the
+    /// `identity_file` issue in step with the result. Returns whether the
+    /// file is intact.
+    fn verify_identity_file(&self) -> bool {
+        let now = chrono::Utc::now().timestamp();
+
+        match self.identity.verify_on_disk() {
+            Ok(()) => {
+                if self.issues.clear(ISSUE_IDENTITY_FILE) {
+                    tracing::info!("replication identity file is back, listing is complete again");
+                }
+
+                true
+            }
+            Err(IdentityDrift::Missing { path }) => {
+                let new = self.issues.raise(
+                    ISSUE_IDENTITY_FILE,
+                    Issue::IdentityFileMissing {
+                        path: path.clone(),
+                        since: now,
+                    },
+                );
+
+                // Loud once, then quiet: this runs on every listing, and a
+                // fault that lasts an hour should not log an error a second.
+                if new {
+                    tracing::error!(
+                        path = %path,
+                        "replication identity file is missing: the repository store is not the one this process started with; \
+                         serving the listing as incomplete so no replica infers deletions from it"
+                    );
+                } else {
+                    tracing::debug!(path = %path, "replication identity file still missing");
+                }
+
+                false
+            }
+            Err(IdentityDrift::Changed {
+                path,
+                expected,
+                found,
+            }) => {
+                let new = self.issues.raise(
+                    ISSUE_IDENTITY_FILE,
+                    Issue::IdentityFileChanged {
+                        path: path.clone(),
+                        expected: expected.clone(),
+                        found: found.clone(),
+                        since: now,
+                    },
+                );
+
+                if new {
+                    tracing::error!(
+                        path = %path,
+                        expected = %expected,
+                        found = %found,
+                        "replication identity file changed under this process; \
+                         serving the listing as incomplete so no replica infers deletions from it"
+                    );
+                } else {
+                    tracing::debug!(path = %path, "replication identity file still changed");
+                }
+
+                false
+            }
+        }
     }
 }
 
@@ -790,8 +1334,15 @@ impl ReplicaRegistry {
     }
 
     /// Records a request from a replica, creating its row on first sight.
-    /// `repositories` and `pending` are whatever it volunteered this time.
-    pub fn note_request(&self, node_id: &str, repositories: Option<usize>, pending: Option<usize>) {
+    /// `repositories`, `pending` and `sync` are whatever it volunteered this
+    /// time.
+    pub fn note_request(
+        &self,
+        node_id: &str,
+        repositories: Option<usize>,
+        pending: Option<usize>,
+        sync: Option<String>,
+    ) {
         let now = chrono::Utc::now().timestamp();
         let mut presence = self.entry(node_id);
 
@@ -799,9 +1350,10 @@ impl ReplicaRegistry {
 
         // Only stamp `reported_at` when something was actually reported, so
         // the timestamp always describes the numbers sitting next to it.
-        if repositories.is_some() || pending.is_some() {
+        if repositories.is_some() || pending.is_some() || sync.is_some() {
             presence.repositories = repositories;
             presence.pending_repositories = pending;
+            presence.sync = sync;
             presence.reported_at = Some(now);
         }
     }
@@ -814,17 +1366,49 @@ impl ReplicaRegistry {
         presence.last_contact_at = Some(now);
     }
 
-    pub fn stream_opened(&self, node_id: &str) {
+    /// Marks a replica's stream open, unless another *process* already
+    /// holds a stream under that node id.
+    ///
+    /// The instance token is what tells the two apart: a replica that
+    /// reconnects after a drop presents the same token and simply replaces
+    /// its old connection, while a second replica configured with the same
+    /// name presents a different one and is refused. Refused rather than
+    /// merged because a roster row shared by two nodes reports the state of
+    /// whichever spoke last, and an operator reading it would never learn
+    /// that the other had gone.
+    pub fn stream_opened(&self, node_id: &str, instance: &str) -> Result<(), StreamCollision> {
         let now = chrono::Utc::now().timestamp();
         let mut presence = self.entry(node_id);
+
+        if presence.stream_connected {
+            if let Some(holder) = &presence.instance {
+                if holder != instance {
+                    presence.last_collision_at = Some(now);
+
+                    return Err(StreamCollision {
+                        node_id: node_id.to_string(),
+                    });
+                }
+            }
+        }
 
         presence.stream_connected = true;
         presence.connected_at = Some(now);
         presence.last_contact_at = Some(now);
+        presence.instance = Some(instance.to_string());
+
+        Ok(())
     }
 
-    pub fn stream_closed(&self, node_id: &str) {
+    /// Marks a replica's stream closed — but only if `instance` is the one
+    /// holding it. A reconnect that replaced an older connection must not be
+    /// marked closed when the older connection's task finally ends.
+    pub fn stream_closed(&self, node_id: &str, instance: &str) {
         let mut presence = self.entry(node_id);
+
+        if presence.instance.as_deref() != Some(instance) {
+            return;
+        }
 
         presence.stream_connected = false;
         presence.last_contact_at = Some(chrono::Utc::now().timestamp());
@@ -859,9 +1443,38 @@ impl ReplicaRegistry {
                 packs_delivered: 0,
                 repositories: None,
                 pending_repositories: None,
+                sync: None,
                 reported_at: None,
+                instance: None,
+                last_collision_at: None,
             })
     }
+
+    /// Closes collision issues whose node id has not been refused for
+    /// [`COLLISION_EXPIRY_SECS`]. Called when health is built, which is the
+    /// one moment the answer matters; nothing else on a master would
+    /// otherwise ever close them, since the surviving replica's stream is
+    /// already open and never re-opens.
+    pub fn expire_collisions(&self, issues: &Issues, now: i64) {
+        for entry in self.replicas.iter() {
+            let Some(last) = entry.value().last_collision_at else {
+                continue;
+            };
+
+            if now - last > COLLISION_EXPIRY_SECS
+                && issues.clear(&Issues::collision_key(entry.key()))
+            {
+                tracing::info!(node_id = %entry.key(), "node id collision cleared");
+            }
+        }
+    }
+}
+
+/// A stream was refused because its node id is already connected from
+/// another process.
+#[derive(Debug)]
+pub struct StreamCollision {
+    pub node_id: String,
 }
 
 impl Default for ReplicaRegistry {
@@ -972,7 +1585,13 @@ pub struct ReplicaStatus {
     /// to. Nothing is pulled while this is false: a replica that cannot vouch
     /// for *who* it is following must not apply what that node hands out.
     identity_verified: AtomicBool,
-    reclones: AtomicU64,
+    /// Worker passes in a row that ended in failure; `stalled` past
+    /// [`STALLED_AFTER_FAILURES`].
+    consecutive_failures: AtomicU32,
+    /// When a pass last ended with nothing failed. `0` for never.
+    last_success_unix: AtomicI64,
+    /// The node's open issues, which are what make it `halted`.
+    issues: Arc<Issues>,
     /// What this node last learned about its master, and how that went.
     ///
     /// A replica caches the master's roster rather than fetching it on demand
@@ -995,7 +1614,7 @@ struct MasterView {
 }
 
 impl ReplicaStatus {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config, issues: Arc<Issues>) -> Self {
         let is_replica = config
             .replication
             .as_ref()
@@ -1012,9 +1631,58 @@ impl ReplicaStatus {
             pending_repositories: AtomicUsize::new(0),
             repositories: AtomicUsize::new(0),
             identity_verified: AtomicBool::new(false),
-            reclones: AtomicU64::new(0),
+            consecutive_failures: AtomicU32::new(0),
+            last_success_unix: AtomicI64::new(0),
+            issues,
             master_view: Mutex::new(MasterView::default()),
         }
+    }
+
+    /// Records how a worker pass ended. A failed pass counts up towards
+    /// `stalled`; a clean one resets the count and stamps `last_success_at`.
+    pub fn note_pass(&self, failed: bool) {
+        if failed {
+            self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.consecutive_failures.store(0, Ordering::Relaxed);
+            self.last_success_unix
+                .store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+        }
+    }
+
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures.load(Ordering::Relaxed)
+    }
+
+    pub fn last_success(&self) -> Option<i64> {
+        match self.last_success_unix.load(Ordering::Relaxed) {
+            0 => None,
+            seconds => Some(seconds),
+        }
+    }
+
+    /// Repositories locked out of replication pending an operator.
+    pub fn locked_repositories(&self) -> usize {
+        self.issues.count_with_prefix("repository:")
+    }
+
+    /// The one-word verdict on how following is going — see [`SyncStatus`].
+    /// Any open issue is `halted`, since every issue is by definition a
+    /// condition this node will not resolve on its own.
+    pub fn sync_status(&self) -> SyncStatus {
+        if !self.issues.is_empty() {
+            return SyncStatus::Halted;
+        }
+
+        if self.consecutive_failures() >= STALLED_AFTER_FAILURES {
+            return SyncStatus::Stalled;
+        }
+
+        if self.pending() > 0 || self.last_success().is_none() {
+            return SyncStatus::Lagging;
+        }
+
+        SyncStatus::Synced
     }
 
     pub fn set_identity_verified(&self, verified: bool) {
@@ -1023,14 +1691,6 @@ impl ReplicaStatus {
 
     pub fn identity_verified(&self) -> bool {
         self.identity_verified.load(Ordering::Relaxed)
-    }
-
-    pub fn note_reclone(&self) {
-        self.reclones.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn reclones(&self) -> u64 {
-        self.reclones.load(Ordering::Relaxed)
     }
 
     pub fn is_replica(&self) -> bool {
@@ -1162,6 +1822,22 @@ impl ReplicaStatus {
 struct SyncPass {
     attempted: usize,
     succeeded: usize,
+    /// Repositories refused because they are locked out pending an operator.
+    /// Neither progress nor failure: they are not retried by this loop, and
+    /// they must not make a pass look stalled when everything else landed.
+    locked: usize,
+}
+
+/// How one repository's sync ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncOutcome {
+    /// The repository is where the upstream said it should be.
+    Synced,
+    /// The repository was left as it is and locked out of replication —
+    /// ahead of, or diverged from, the upstream. An issue was raised.
+    Locked,
+    /// A transient failure; the repository stays pending.
+    Failed,
 }
 
 /// A repository this replica knows it needs to look at.
@@ -1191,6 +1867,10 @@ pub struct ReplicaFollower {
     /// How this node names itself upstream, so the master's roster shows a
     /// name rather than an anonymous row.
     node_id: String,
+    /// A random token for this *process*, sent with the node id so the
+    /// master can tell this replica reconnecting from another replica
+    /// wearing the same name — see [`INSTANCE_HEADER`].
+    instance: String,
     /// Client for the state and health requests: small JSON answers, so a
     /// short read timeout is right.
     transfer_client: Client,
@@ -1279,23 +1959,31 @@ impl ReplicaFollower {
         state: AppState,
         replication: ReplicationConfig,
         master_url: String,
-    ) -> Result<Self, reqwest::Error> {
-        let node_id = replication.node_id(&state.config.server);
+    ) -> Result<Self, String> {
+        let node_id = replication.node_id().to_string();
+        let instance = generate_hex(INSTANCE_BYTES).map_err(|err| {
+            tracing::error!(err = %err, "cannot generate replication instance token");
+
+            err
+        })?;
 
         let transfer_client = Client::builder()
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .read_timeout(Duration::from_secs(STATE_TIMEOUT_SECS))
-            .build()?;
+            .build()
+            .map_err(|err| err.to_string())?;
 
         let pack_client = Client::builder()
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .read_timeout(Duration::from_secs(PACK_READ_TIMEOUT_SECS))
-            .build()?;
+            .build()
+            .map_err(|err| err.to_string())?;
 
         let stream_client = Client::builder()
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .read_timeout(Duration::from_secs(EVENT_READ_TIMEOUT_SECS))
-            .build()?;
+            .build()
+            .map_err(|err| err.to_string())?;
 
         let master_url_display = redact_url(&master_url);
 
@@ -1305,6 +1993,7 @@ impl ReplicaFollower {
             master_url,
             master_url_display,
             node_id,
+            instance,
             transfer_client,
             pack_client,
             stream_client,
@@ -1346,8 +2035,14 @@ impl ReplicaFollower {
 
         let mut reconciled_once = false;
         let mut stalled_passes = 0_u32;
+        // Repositories this process has landed since it started. What the
+        // bootstrap gate's stall rule keys on: a cold node that has landed
+        // *nothing* stays gated however long it stalls.
+        let mut landed_total = 0_usize;
 
         loop {
+            let mut reconcile_failed = false;
+
             if self.full_reconcile_requested.swap(false, Ordering::SeqCst) {
                 match self.reconcile().await {
                     Ok(()) => reconciled_once = true,
@@ -1355,6 +2050,8 @@ impl ReplicaFollower {
                         tracing::warn!(err = %err, "replication reconcile failed, will retry");
 
                         self.state.replica_status.record_master_error(err.clone());
+
+                        reconcile_failed = true;
 
                         // Put the request back so the next pass retries it
                         // rather than waiting for the poll timer to come round.
@@ -1365,7 +2062,18 @@ impl ReplicaFollower {
 
             let pass = self.drain_pending().await;
 
-            if pass.attempted > 0 && pass.succeeded == 0 {
+            landed_total += pass.succeeded;
+
+            // A pass "failed" when the reconcile did, or when it tried to
+            // sync something and nothing landed. Locked repositories are not
+            // attempts: they are waiting on a human, not on a retry.
+            let attempted_unlocked = pass.attempted.saturating_sub(pass.locked);
+            let drain_failed = attempted_unlocked > 0 && pass.succeeded == 0;
+            let pass_failed = reconcile_failed || drain_failed;
+
+            self.state.replica_status.note_pass(pass_failed);
+
+            if drain_failed {
                 stalled_passes += 1;
             } else {
                 stalled_passes = 0;
@@ -1375,21 +2083,35 @@ impl ReplicaFollower {
             // not once it has merely learned what it is missing — a node
             // that knows about a thousand repositories and holds none would
             // answer 404 for all of them. A master that holds nothing leaves
-            // nothing pending, so that case opens at once. The one exception
-            // is a catch-up that has stopped making progress: two passes in
-            // a row with nothing landing means waiting longer will not help,
-            // and the repositories that did land are better served than
-            // refused.
+            // nothing pending, so that case opens at once. Entries that are
+            // locked are not "pending" for this purpose: they are held
+            // repositories an operator has to look at, and holding traffic
+            // for them would never end.
+            //
+            // The one exception is a catch-up that has stopped making
+            // progress *after* landing something: two passes in a row with
+            // nothing new means waiting longer will not help, and the
+            // repositories that did land are better served than refused. A
+            // node that has landed nothing at all never takes that exit — an
+            // empty replica answering 404 for everything is the exact state
+            // the gate exists to prevent, however long the master's packs
+            // keep failing.
             if reconciled_once && !self.state.replica_status.is_bootstrapped() {
                 if self.pending.is_empty() {
                     self.state.replica_status.mark_bootstrapped();
-                } else if stalled_passes >= 2 {
+                } else if stalled_passes >= 2 && landed_total > 0 {
                     tracing::error!(
                         pending = self.pending.len(),
+                        landed = landed_total,
                         "replica catch-up has stalled, serving what it holds while retrying"
                     );
 
                     self.state.replica_status.mark_bootstrapped();
+                } else if stalled_passes >= 2 {
+                    tracing::error!(
+                        pending = self.pending.len(),
+                        "cold replica catch-up has stalled with nothing landed, still refusing reads"
+                    );
                 }
             }
 
@@ -1405,7 +2127,7 @@ impl ReplicaFollower {
             // rather than falling through to the select below — whose `wake`
             // may already hold a permit from a notification that arrived
             // while the pass was running, and would return at once.
-            if pass.attempted > 0 && pass.succeeded == 0 {
+            if drain_failed {
                 sleep(Duration::from_millis(self.replication.reconnect_backoff_ms)).await;
             }
 
@@ -1479,6 +2201,40 @@ impl ReplicaFollower {
                 continue;
             }
 
+            // A locked repository is re-examined only when the upstream has
+            // moved since it was locked. Re-queueing it every poll would
+            // download the same refused pack every poll; leaving it alone
+            // forever would miss the operator fixing the upstream — or
+            // taking the other exit, removing the local copy, which the
+            // index cannot see (nothing announced it) and so is checked on
+            // disk here, one `stat` per locked repository per reconcile.
+            if self.is_locked_at(
+                &repository.collection_id,
+                &repository.tenant_id,
+                &repository.head_sha,
+            ) {
+                let removed_by_operator = !self
+                    .repo_path(&repository.collection_id, &repository.tenant_id)
+                    .join(".git")
+                    .exists();
+
+                if !removed_by_operator {
+                    continue;
+                }
+
+                tracing::info!(
+                    collection_id = %repository.collection_id,
+                    tenant_id = %repository.tenant_id,
+                    "locked repository was removed locally, cloning it afresh from the master"
+                );
+
+                self.unlock(&repository.collection_id, &repository.tenant_id);
+
+                self.state
+                    .repository_index
+                    .remove(&repository.collection_id, &repository.tenant_id);
+            }
+
             stale += 1;
 
             self.pending.insert(
@@ -1498,23 +2254,70 @@ impl ReplicaFollower {
         if !listing.complete {
             tracing::warn!("master listing is incomplete, deletions will not be inferred from it");
         } else {
-            for key in local.keys() {
-                if remote_keys.contains(key) {
-                    continue;
+            let deletions: Vec<(String, String, String)> = local
+                .keys()
+                .filter(|key| !remote_keys.contains(*key))
+                .filter_map(|key| {
+                    key.split_once('/').map(|(collection_id, tenant_id)| {
+                        (
+                            key.clone(),
+                            collection_id.to_string(),
+                            tenant_id.to_string(),
+                        )
+                    })
+                })
+                .collect();
+
+            // The mass-deletion guard. A replica deleting what its master
+            // deleted is ordinary replication; a replica deleting most of
+            // itself because its master's listing went empty is the one
+            // thing this feature must never do on its own. The line between
+            // them is drawn at half: refuse, report, and keep everything.
+            // Nothing clears a refused deletion on its own — a restarted
+            // replica still holds what it held — so an operator who really
+            // is removing most tenants accepts it by turning the guard off
+            // (`replication.deletion_guard = false`) for one restart.
+            let mass_deletion = self.replication.deletion_guard
+                && local.len() >= DELETION_GUARD_MINIMUM_HELD
+                && deletions.len() * 2 > local.len();
+
+            if mass_deletion {
+                let new = self.state.issues.raise(
+                    ISSUE_DELETION_REFUSED,
+                    Issue::DeletionRefused {
+                        would_delete: deletions.len(),
+                        held: local.len(),
+                        since: chrono::Utc::now().timestamp(),
+                    },
+                );
+
+                if new {
+                    tracing::error!(
+                        would_delete = deletions.len(),
+                        held = local.len(),
+                        master = %self.master_url_display,
+                        "master listing would delete more than half of this replica's repositories; \
+                         refusing the deletions and keeping every local copy until an operator intervenes \
+                         (set replication.deletion_guard = false and restart to accept them)"
+                    );
+                } else {
+                    tracing::debug!(
+                        would_delete = deletions.len(),
+                        held = local.len(),
+                        "master listing still asks for a mass deletion, still refusing"
+                    );
+                }
+            } else {
+                if self.state.issues.clear(ISSUE_DELETION_REFUSED) {
+                    tracing::info!(
+                        "master listing no longer asks for a mass deletion, deletions resume"
+                    );
                 }
 
-                let Some((collection_id, tenant_id)) = key.split_once('/') else {
-                    continue;
-                };
-
-                self.pending.insert(
-                    key.clone(),
-                    (
-                        collection_id.to_string(),
-                        tenant_id.to_string(),
-                        SyncTarget::Deleted,
-                    ),
-                );
+                for (key, collection_id, tenant_id) in deletions {
+                    self.pending
+                        .insert(key, (collection_id, tenant_id, SyncTarget::Deleted));
+                }
             }
         }
 
@@ -1629,6 +2432,7 @@ impl ReplicaFollower {
 
         let semaphore = Arc::new(Semaphore::new(self.replication.parallelism));
         let succeeded = Arc::new(AtomicUsize::new(0));
+        let locked = Arc::new(AtomicUsize::new(0));
         let mut tasks = tokio::task::JoinSet::new();
         let mut attempted = 0_usize;
 
@@ -1648,15 +2452,22 @@ impl ReplicaFollower {
 
             let follower = Arc::clone(self);
             let succeeded = succeeded.clone();
+            let locked = locked.clone();
 
             tasks.spawn(async move {
                 let _permit = permit;
 
-                if follower
+                match follower
                     .sync_repository(&collection_id, &tenant_id, target)
                     .await
                 {
-                    succeeded.fetch_add(1, Ordering::Relaxed);
+                    SyncOutcome::Synced => {
+                        succeeded.fetch_add(1, Ordering::Relaxed);
+                    }
+                    SyncOutcome::Locked => {
+                        locked.fetch_add(1, Ordering::Relaxed);
+                    }
+                    SyncOutcome::Failed => {}
                 }
             });
         }
@@ -1668,11 +2479,13 @@ impl ReplicaFollower {
         let pass = SyncPass {
             attempted,
             succeeded: succeeded.load(Ordering::Relaxed),
+            locked: locked.load(Ordering::Relaxed),
         };
 
         tracing::info!(
             repositories = pass.attempted,
             succeeded = pass.succeeded,
+            locked = pass.locked,
             "replication catch-up finished"
         );
 
@@ -1681,65 +2494,44 @@ impl ReplicaFollower {
 
     /// Brings one repository to the state the master reported, or removes it.
     ///
-    /// Returns whether the repository ended up where the master said it
-    /// should be. The worker counts those to tell a pass that made progress
-    /// from one that achieved nothing — a failed sync re-queues itself, so
-    /// the size of the pending set cannot answer that on its own.
+    /// The worker counts the outcomes to tell a pass that made progress from
+    /// one that achieved nothing — a failed sync re-queues itself, so the
+    /// size of the pending set cannot answer that on its own — and to keep
+    /// locked repositories out of both counts.
+    ///
+    /// **A refused pack never destroys anything.** A replica whose history
+    /// is ahead of, or has diverged from, its upstream keeps its copy, keeps
+    /// serving it, locks that one repository out of replication, and raises
+    /// an issue that turns the node `halted`. Discarding and re-cloning was
+    /// the previous behaviour and is exactly what this codebase must not do
+    /// on its own: the replica cannot know whether the upstream or itself is
+    /// the one holding the history that matters, and only a human can. The
+    /// runbook is in REPLICATION.md.
     async fn sync_repository(
         &self,
         collection_id: &str,
         tenant_id: &str,
         target: SyncTarget,
-    ) -> bool {
+    ) -> SyncOutcome {
         let head_sha = match target {
             SyncTarget::Deleted => {
                 self.delete_repository(collection_id, tenant_id).await;
 
-                return true;
+                return SyncOutcome::Synced;
             }
             SyncTarget::At { head_sha } => head_sha,
         };
 
         match self
-            .fetch_and_apply(collection_id, tenant_id, &head_sha, false)
+            .fetch_and_apply(collection_id, tenant_id, &head_sha)
             .await
         {
-            Ok(true) => true,
-            Ok(false) => {
-                // Non-fast-forward: with the master's identity pinned, the
-                // ways this happens are a tenant deleted and re-created
-                // under the same identity (an unrelated history), or this
-                // replica being *ahead* of its master — a master restored
-                // from backup, or a failback after a manual promotion. Either
-                // way the local copy is discarded and cloned afresh, which
-                // destroys it, so this is logged as an error and counted.
-                tracing::error!(
-                    collection_id = %collection_id,
-                    tenant_id = %tenant_id,
-                    "replica history diverged from master, discarding the local copy and re-cloning"
-                );
+            Ok(SyncOutcome::Synced) => {
+                self.unlock(collection_id, tenant_id);
 
-                self.state.replica_status.note_reclone();
-
-                self.delete_repository(collection_id, tenant_id).await;
-
-                match self
-                    .fetch_and_apply(collection_id, tenant_id, &head_sha, true)
-                    .await
-                {
-                    Ok(applied) => applied,
-                    Err(err) => {
-                        tracing::error!(
-                            collection_id = %collection_id,
-                            tenant_id = %tenant_id,
-                            err = %err,
-                            "replication re-clone failed"
-                        );
-
-                        false
-                    }
-                }
+                SyncOutcome::Synced
             }
+            Ok(outcome) => outcome,
             Err(err) => {
                 tracing::warn!(
                     collection_id = %collection_id,
@@ -1758,41 +2550,53 @@ impl ReplicaFollower {
                     ),
                 );
 
-                false
+                SyncOutcome::Failed
             }
         }
     }
 
-    /// Downloads the delta packfile and imports it. Returns `false` when the
-    /// import was refused as non-fast-forward.
+    /// Downloads the delta packfile and imports it.
     ///
-    /// `force_full` skips the `have` parameter, asking for every object
-    /// reachable from HEAD. It is only used for the re-clone path — in normal
-    /// operation an incremental fetch is *always* the right answer, and never
-    /// a gamble: a replica keeps full history (the commit routes read it), so
+    /// An incremental fetch is *always* the right answer, and never a
+    /// gamble: a replica keeps full history (the commit routes read it), so
     /// the delta is by construction a subset of a full clone, no matter how
-    /// far behind the replica has fallen.
+    /// far behind the replica has fallen. A repository absent locally asks
+    /// for everything.
+    ///
+    /// Before any byte is requested, the announced head is related to the
+    /// local one from local objects alone: a replica that is *ahead* already
+    /// holds the announced commit, and finding that out here avoids asking
+    /// the upstream for a pack it cannot build incrementally (it does not
+    /// know the replica's newer head) and that would be refused on arrival.
     async fn fetch_and_apply(
         &self,
         collection_id: &str,
         tenant_id: &str,
         head_sha: &str,
-        force_full: bool,
-    ) -> Result<bool, String> {
+    ) -> Result<SyncOutcome, String> {
         let repo_path = self.repo_path(collection_id, tenant_id);
 
-        let have = if force_full {
-            None
-        } else {
-            let probe_path = repo_path.clone();
+        let probe_path = repo_path.clone();
+        let probe_sha = head_sha.to_string();
 
-            run_blocking(move || Ok(GitReplication::head_sha(&probe_path)))
-                .await
-                .map_err(|err| err.to_string())?
-        };
+        let (have, relation) = run_blocking(move || {
+            Ok((
+                GitReplication::head_sha(&probe_path),
+                GitReplication::relation_to(&probe_path, &probe_sha),
+            ))
+        })
+        .await
+        .map_err(|err| err.to_string())?;
 
-        if have.as_deref() == Some(head_sha) {
-            return Ok(true);
+        match relation {
+            HeadRelation::Same => return Ok(SyncOutcome::Synced),
+            HeadRelation::Ahead { local } => {
+                return Ok(self.lock_ahead(collection_id, tenant_id, &local, head_sha));
+            }
+            HeadRelation::Diverged { local } => {
+                return Ok(self.lock_diverged(collection_id, tenant_id, &local, head_sha));
+            }
+            HeadRelation::Unknown => {}
         }
 
         let (pack_path, pack_head_sha) = self
@@ -1844,22 +2648,119 @@ impl ReplicaFollower {
                     .replication
                     .repository_updated(collection_id, tenant_id, &to);
 
-                Ok(true)
+                Ok(SyncOutcome::Synced)
             }
 
-            PackApply::UpToDate => Ok(true),
+            PackApply::UpToDate => Ok(SyncOutcome::Synced),
 
-            PackApply::NonFastForward { local, remote } => {
-                tracing::warn!(
-                    collection_id = %collection_id,
-                    tenant_id = %tenant_id,
-                    local = %local,
-                    remote = %remote,
-                    "non-fast-forward replication result"
-                );
-
-                Ok(false)
+            PackApply::Ahead { local, remote } => {
+                Ok(self.lock_ahead(collection_id, tenant_id, &local, &remote))
             }
+
+            PackApply::Diverged { local, remote } => {
+                Ok(self.lock_diverged(collection_id, tenant_id, &local, &remote))
+            }
+        }
+    }
+
+    /// Locks a repository out of replication because this replica is ahead
+    /// of its upstream for it. Loud on purpose, and always `Locked`.
+    fn lock_ahead(
+        &self,
+        collection_id: &str,
+        tenant_id: &str,
+        local: &str,
+        remote: &str,
+    ) -> SyncOutcome {
+        tracing::error!(
+            collection_id = %collection_id,
+            tenant_id = %tenant_id,
+            local = %local,
+            remote = %remote,
+            master = %self.master_url_display,
+            "replica is AHEAD of its master for this repository (the announced head is an ancestor of the local one); \
+             keeping and serving the local copy, replication of this repository is suspended until the master moves past it \
+             or an operator removes the local copy — see REPLICATION.md"
+        );
+
+        self.state.issues.raise(
+            &Issues::repository_key(collection_id, tenant_id),
+            Issue::ReplicaAhead {
+                collection_id: collection_id.to_string(),
+                tenant_id: tenant_id.to_string(),
+                local: local.to_string(),
+                remote: remote.to_string(),
+                since: chrono::Utc::now().timestamp(),
+            },
+        );
+
+        SyncOutcome::Locked
+    }
+
+    /// Locks a repository out of replication because its history and the
+    /// upstream's no longer share a line. Loud on purpose, and always
+    /// `Locked`.
+    fn lock_diverged(
+        &self,
+        collection_id: &str,
+        tenant_id: &str,
+        local: &str,
+        remote: &str,
+    ) -> SyncOutcome {
+        tracing::error!(
+            collection_id = %collection_id,
+            tenant_id = %tenant_id,
+            local = %local,
+            remote = %remote,
+            master = %self.master_url_display,
+            "replica history DIVERGED from its master for this repository (neither head descends from the other); \
+             keeping and serving the local copy, replication of this repository is suspended until an operator \
+             decides which history to keep — see REPLICATION.md"
+        );
+
+        self.state.issues.raise(
+            &Issues::repository_key(collection_id, tenant_id),
+            Issue::HistoryDiverged {
+                collection_id: collection_id.to_string(),
+                tenant_id: tenant_id.to_string(),
+                local: local.to_string(),
+                remote: remote.to_string(),
+                since: chrono::Utc::now().timestamp(),
+            },
+        );
+
+        SyncOutcome::Locked
+    }
+
+    /// Clears a repository's lock after it synced. Logged once, since an
+    /// operator who acted on the issue wants to see it close.
+    fn unlock(&self, collection_id: &str, tenant_id: &str) {
+        if self
+            .state
+            .issues
+            .clear(&Issues::repository_key(collection_id, tenant_id))
+        {
+            tracing::info!(
+                collection_id = %collection_id,
+                tenant_id = %tenant_id,
+                "repository converged again, replication lock lifted"
+            );
+        }
+    }
+
+    /// Whether a repository is locked *and* the upstream still announces the
+    /// same head it was locked against. A different head means the upstream
+    /// moved, which is one of the two ways a lock is meant to clear, so the
+    /// repository is worth another look.
+    fn is_locked_at(&self, collection_id: &str, tenant_id: &str, announced: &str) -> bool {
+        match self
+            .state
+            .issues
+            .get(&Issues::repository_key(collection_id, tenant_id))
+        {
+            Some(Issue::ReplicaAhead { remote, .. })
+            | Some(Issue::HistoryDiverged { remote, .. }) => remote == announced,
+            _ => false,
         }
     }
 
@@ -2021,6 +2922,10 @@ impl ReplicaFollower {
     async fn run_event_stream(self: Arc<Self>) {
         let url = format!("{}{}/events", self.master_url, URL_PREFIX);
         let mut backoff_ms = self.replication.reconnect_backoff_ms;
+        // When the master first answered 409 to this node id. A collision
+        // is only reported as an issue once it has outlived the master's
+        // chance to notice this process's *own* previous socket dying.
+        let mut collision_since: Option<Instant> = None;
 
         loop {
             let attempt = self.request(&self.stream_client, &url).send().await;
@@ -2030,6 +2935,11 @@ impl ReplicaFollower {
                     tracing::info!(master = %self.master_url_display, "replication notification stream connected");
 
                     backoff_ms = self.replication.reconnect_backoff_ms;
+                    collision_since = None;
+
+                    if self.state.issues.clear(ISSUE_NODE_ID_COLLISION) {
+                        tracing::info!(node_id = %self.node_id, "node id collision cleared");
+                    }
 
                     self.state.replica_status.set_stream_connected(true);
 
@@ -2040,6 +2950,27 @@ impl ReplicaFollower {
                     self.state.replica_status.set_stream_connected(false);
 
                     tracing::warn!("replication notification stream closed");
+                }
+
+                Ok(response) if response.status() == reqwest::StatusCode::CONFLICT => {
+                    let since = *collision_since.get_or_insert_with(Instant::now);
+
+                    tracing::error!(
+                        node_id = %self.node_id,
+                        master = %self.master_url_display,
+                        "master refused the notification stream: another process is connected under this node id; \
+                         still converging by polling, but every replica needs a unique replication.node_id"
+                    );
+
+                    if since.elapsed().as_secs() >= COLLISION_REPORT_AFTER_SECS {
+                        self.state.issues.raise(
+                            ISSUE_NODE_ID_COLLISION,
+                            Issue::NodeIdCollision {
+                                node_id: self.node_id.clone(),
+                                since: chrono::Utc::now().timestamp(),
+                            },
+                        );
+                    }
                 }
 
                 Ok(response) => {
@@ -2177,12 +3108,21 @@ impl ReplicaFollower {
                     return true;
                 }
 
-                let key = format!("{}/{}", collection_id, tenant_id);
+                // A deletion is never acted on from a hint. The frame asks
+                // for a reconcile, and the listing that reconcile fetches is
+                // what decides — under the mass-deletion guard, which only
+                // exists there. Acting on the frame directly would let a
+                // burst of deletion frames do exactly what the guard refuses
+                // a listing for. One extra state fetch per deletion is the
+                // whole cost; an update frame, which destroys nothing, still
+                // queues its repository directly.
+                tracing::debug!(
+                    collection_id = %collection_id,
+                    tenant_id = %tenant_id,
+                    "repository.deleted frame received, reconciling to confirm it"
+                );
 
-                self.pending
-                    .insert(key, (collection_id, tenant_id, SyncTarget::Deleted));
-
-                self.wake.notify_one();
+                self.request_full_reconcile();
             }
         }
 
@@ -2206,12 +3146,31 @@ impl ReplicaFollower {
         let outcome = self.check_master_identity(stated, may_pin);
 
         match &outcome {
-            Ok(()) => status.set_identity_verified(true),
+            Ok(()) => {
+                status.set_identity_verified(true);
+
+                if self.state.issues.clear(ISSUE_IDENTITY_MISMATCH) {
+                    tracing::info!("master states the pinned identity again, syncing resumes");
+                }
+            }
             Err(err) => {
                 status.set_identity_verified(false);
                 status.record_master_error(err.clone());
 
                 tracing::error!(err = %err, "refusing to sync from this master");
+
+                if let (Some(pinned), Some(stated)) = (self.state.identity.current(), stated) {
+                    if pinned != stated {
+                        self.state.issues.raise(
+                            ISSUE_IDENTITY_MISMATCH,
+                            Issue::IdentityMismatch {
+                                pinned,
+                                stated: stated.to_string(),
+                                since: chrono::Utc::now().timestamp(),
+                            },
+                        );
+                    }
+                }
             }
         }
 
@@ -2286,6 +3245,7 @@ impl ReplicaFollower {
             .get(url)
             .bearer_auth(&self.replication.secret)
             .header(NODE_ID_HEADER, &self.node_id)
+            .header(INSTANCE_HEADER, &self.instance)
             .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
     }
 
@@ -2300,6 +3260,7 @@ impl ReplicaFollower {
         self.request(client, url)
             .header(REPOSITORIES_HEADER, status.repositories().to_string())
             .header(PENDING_HEADER, status.pending().to_string())
+            .header(SYNC_HEADER, status.sync_status().as_str())
     }
 
     fn repo_path(&self, collection_id: &str, tenant_id: &str) -> PathBuf {
@@ -2318,9 +3279,10 @@ impl ReplicaFollower {
 
 /// Builds this node's replication picture.
 ///
-/// `repositories` is passed in rather than counted here because counting means
-/// touching the filesystem, which belongs on the blocking pool — the caller
-/// already has it from `GitReplication::list_repositories`.
+/// `repositories` is passed in rather than counted here because counting can
+/// mean touching the filesystem (the index's first use is a directory scan),
+/// which belongs on the blocking pool — the caller reads it from
+/// `RepositoryIndex::snapshot` there.
 ///
 /// The three roles answer with the same shape, which is the point: one probe
 /// works against every node in a deployment. What differs is where the
@@ -2337,15 +3299,20 @@ impl ReplicaFollower {
 pub fn build_health(state: &AppState, repositories: usize) -> ReplicationHealth {
     let now = chrono::Utc::now().timestamp();
     let server = &state.config.server;
+    let issues = state.issues.all();
 
     let Some(replication) = &state.config.replication else {
         // Standalone: it accepts writes, so it *is* the write node of a set
         // of one. Reporting that uniformly beats a special case a monitor
-        // would have to know about.
+        // would have to know about. It has no node id of its own — the
+        // field only means something to peers, and it has none — so the
+        // bind address stands in.
         let node_id = format!("{}:{}", server.host, server.port);
 
         return ReplicationHealth {
             protocol: PROTOCOL_VERSION,
+            status: NodeStatus::Healthy.as_str().to_string(),
+            issues,
             node: NodeHealth {
                 node_id: node_id.clone(),
                 role: "standalone".to_string(),
@@ -2366,11 +3333,19 @@ pub fn build_health(state: &AppState, repositories: usize) -> ReplicationHealth 
         };
     };
 
-    let node_id = replication.node_id(server);
+    let node_id = replication.node_id().to_string();
 
     if !replication.is_replica() {
+        state.replica_registry.expire_collisions(&state.issues, now);
+
+        let issues = state.issues.all();
+        let replicas = state.replica_registry.roster();
+        let status = master_status(&replicas, issues.is_empty(), now);
+
         return ReplicationHealth {
             protocol: PROTOCOL_VERSION,
+            status: status.as_str().to_string(),
+            issues,
             node: NodeHealth {
                 node_id: node_id.clone(),
                 role: "master".to_string(),
@@ -2384,7 +3359,7 @@ pub fn build_health(state: &AppState, repositories: usize) -> ReplicationHealth 
                 last_contact_at: Some(now),
                 last_error: None,
             },
-            replicas: state.replica_registry.roster(),
+            replicas,
             replica: None,
             observed_at: now,
             replicas_observed_at: Some(now),
@@ -2395,8 +3370,23 @@ pub fn build_health(state: &AppState, repositories: usize) -> ReplicationHealth 
     let (master_node_id, replicas, replicas_observed_at, last_contact_at, last_error) =
         status.master_snapshot();
 
+    let sync = status.sync_status();
+
+    // A replica's verdict is its own: it does not fold in the roster it
+    // caches from the master, which is the master's view and possibly stale.
+    let node_status = match sync {
+        SyncStatus::Halted => NodeStatus::Halted,
+        SyncStatus::Stalled => NodeStatus::Degraded,
+        SyncStatus::Synced | SyncStatus::Lagging if !status.is_bootstrapped() => {
+            NodeStatus::Degraded
+        }
+        SyncStatus::Synced | SyncStatus::Lagging => NodeStatus::Healthy,
+    };
+
     ReplicationHealth {
         protocol: PROTOCOL_VERSION,
+        status: node_status.as_str().to_string(),
+        issues,
         node: NodeHealth {
             node_id,
             role: "replica".to_string(),
@@ -2422,14 +3412,58 @@ pub fn build_health(state: &AppState, repositories: usize) -> ReplicationHealth 
             } else {
                 "bootstrapping".to_string()
             },
+            sync: sync.as_str().to_string(),
             stream_connected: status.stream_connected(),
             last_reconcile_at: status.last_reconcile(),
+            last_success_at: status.last_success(),
             pending_repositories: status.pending(),
-            reclones: status.reclones(),
+            locked_repositories: status.locked_repositories(),
+            consecutive_failures: status.consecutive_failures(),
         }),
         observed_at: now,
         replicas_observed_at,
     }
+}
+
+/// A master's verdict folds in every replica it knows of, so the one probe
+/// an operator points at the master reports the worst thing in the set.
+///
+/// A replica reporting `halted` makes the master `halted`. One reporting
+/// `stalled`, or one whose stream is down and that has not been heard from
+/// for [`REPLICA_SILENT_SECS`], makes it `degraded`. `lagging` is normal
+/// operation and changes nothing. A master's own open issues make it
+/// `halted` regardless of its replicas.
+fn master_status(replicas: &[ReplicaPresence], no_issues: bool, now: i64) -> NodeStatus {
+    if !no_issues {
+        return NodeStatus::Halted;
+    }
+
+    let mut status = NodeStatus::Healthy;
+
+    for replica in replicas {
+        let reported = replica.sync.as_deref().and_then(SyncStatus::parse);
+
+        let verdict = match reported {
+            Some(SyncStatus::Halted) => NodeStatus::Halted,
+            Some(SyncStatus::Stalled) => NodeStatus::Degraded,
+            _ => {
+                let silent = replica
+                    .last_contact_at
+                    .map(|at| now - at > REPLICA_SILENT_SECS)
+                    .unwrap_or(true);
+
+                if !replica.stream_connected && silent {
+                    NodeStatus::Degraded
+                } else {
+                    NodeStatus::Healthy
+                }
+            }
+        };
+
+        status = status.max(verdict);
+    }
+
+    status
 }
 
 /// Removes stale packfile downloads left behind by a previous process.

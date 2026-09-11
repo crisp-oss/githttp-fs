@@ -53,6 +53,12 @@ value = "Bearer your-hook-receiver-secret"
 enabled = true
 delay_secs = 86400
 
+# Opt-in pack-count trigger: a repository holding at least this many packfiles
+# runs its maintenance pass at once instead of after delay_secs. A master's
+# writes land as loose objects, so it rarely matters here; it is what keeps a
+# replica fast (see config.replica.toml).
+# maximum_packs = 32
+
 [replication]
 
 # This node accepts writes and serves replicas.
@@ -70,6 +76,8 @@ secret = "MyReplicationSecret"
 # 127.0.0.1 in production where every replica is local.
 port = 5356
 
-# How this node names itself in the roster at GET /v1/_health/replication.
-# Telemetry only; `secret` is what guards anything. Defaults to "host:port".
+# How this node names itself in the roster at GET /v1/_health/replication and
+# in every log line about it. Required, and unique per deployment: a master
+# refuses a second notification stream claiming a node id that is already
+# connected from another process. Telemetry only; `secret` is what guards.
 node_id = "master-1"

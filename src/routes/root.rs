@@ -65,9 +65,10 @@ pub async fn ping(State(state): State<AppState>) -> Json<serde_json::Value> {
             "last_reconcile_at": state.replica_status.last_reconcile(),
             // Repositories known to be behind and awaiting a pull.
             "pending_repositories": state.replica_status.pending(),
-            // Times this node discarded a local repository and re-cloned it
-            // because its history no longer descended from the master's.
-            "reclones": state.replica_status.reclones(),
+            // One word on whether following is keeping up and will on its
+            // own: "synced", "lagging", "stalled", or "halted". The full
+            // story — what is halted and why — is on /v1/_health/replication.
+            "sync": state.replica_status.sync_status().as_str(),
         }
     }))
 }

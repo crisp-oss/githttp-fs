@@ -1046,6 +1046,15 @@ impl GitMaintenance {
         }
     }
 
+    /// How many packfiles a repository currently holds. One directory read,
+    /// no repository open — cheap enough to run after every write when
+    /// `[maintenance] maximum_packs` asks for a pack-count trigger.
+    pub fn pack_count(repo_path: &Path) -> usize {
+        Self::enumerate_pack_stems(repo_path)
+            .map(|stems| stems.len())
+            .unwrap_or(0)
+    }
+
     /// Lists the packfiles under `.git/objects/pack` as extension-less path
     /// stems (each pack is a family of files — `.pack`, `.idx`, ... —
     /// sharing one stem).
@@ -5138,18 +5147,55 @@ enum HeadProbe {
 
 /// Outcome of applying a replication packfile to a local repository.
 ///
-/// `NonFastForward` is the one interesting variant. githttp-fs history is
-/// append-only — revert and rollback both *add* commits, and nothing ever
-/// rewrites one — so a replica's HEAD is always an ancestor of its master's.
-/// The single way that can break is a tenant being deleted and re-created
-/// under the same identity, which starts a brand-new history with a brand-new
-/// root commit. That is not an error to retry, it is a signal to discard the
-/// local repository and clone it afresh.
+/// githttp-fs history is append-only — revert and rollback both *add*
+/// commits, and nothing ever rewrites one — so in normal operation a
+/// replica's HEAD is always an ancestor of its master's and the answer is
+/// `FastForwarded` or `UpToDate`. The two refusals are told apart because
+/// they mean different things to an operator, even though the replica reacts
+/// to both the same way (it keeps its copy, stops syncing that repository,
+/// and says so):
+///
+/// - `Ahead`: the announced head is an ancestor of the local one. The
+///   replica holds *more* history than the node it follows — a master
+///   restored from a backup, or a chained upstream that restarted behind.
+///   Nothing is wrong with the local copy; the upstream is what is behind.
+/// - `Diverged`: neither head descends from the other. A tenant deleted and
+///   re-created under the same identity (a brand-new root commit), or a
+///   manual promotion that forked history.
+///
+/// Neither is ever resolved by this code discarding the local repository:
+/// the replica locks the repository out of replication and leaves the
+/// decision to a human, who can delete the local copy if a re-clone is what
+/// they want.
 #[derive(Debug)]
 pub enum PackApply {
     FastForwarded { from: Option<String>, to: String },
     UpToDate,
-    NonFastForward { local: String, remote: String },
+    Ahead { local: String, remote: String },
+    Diverged { local: String, remote: String },
+}
+
+/// How a commit the upstream announced relates to this repository's HEAD,
+/// answered from local objects alone — before any pack is requested.
+///
+/// A replica that is *ahead* of its upstream already holds the announced
+/// commit, so it can tell without a download; asking for a pack would make
+/// the upstream (which does not know the replica's newer `have`) send a full
+/// clone that is then refused, on every poll, for as long as the situation
+/// lasts.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HeadRelation {
+    /// The announced commit is not in the local object store: a pack is
+    /// needed to say anything more.
+    Unknown,
+    /// The announced commit is HEAD.
+    Same,
+    /// The announced commit is a strict ancestor of HEAD.
+    Ahead { local: String },
+    /// The announced commit is held locally but is neither HEAD nor one of
+    /// its ancestors (it can only have arrived through an earlier pack whose
+    /// ref move never happened, or a hand-edited repository).
+    Diverged { local: String },
 }
 
 /// Git-level replication primitives: enumerate repositories, export a
@@ -5343,8 +5389,9 @@ impl GitReplication {
     /// *un*reachable. So no concurrent write or repack can remove anything
     /// this walk needs. A repack running concurrently can still invalidate
     /// libgit2's view of the pack directory mid-build, which surfaces as a
-    /// transient error — the caller retries once rather than holding a lock
-    /// across what may be a multi-second full-clone build.
+    /// transient error — the replica simply retries on its next pass rather
+    /// than this side holding a lock across what may be a multi-second
+    /// full-clone build.
     ///
     /// An unknown `have` (a replica reporting a commit this repository has
     /// never held) is ignored rather than rejected, degrading to a full
@@ -5482,9 +5529,23 @@ impl GitReplication {
             }
 
             if !repo.graph_descendant_of(new_oid, local_oid)? {
-                return Ok(PackApply::NonFastForward {
-                    local: local_oid.to_string(),
-                    remote: new_head.to_string(),
+                // Not a fast-forward. Which kind decides what the operator
+                // is told, so both directions are checked; the objects just
+                // imported are left in place either way (they are
+                // unreachable garbage that maintenance reclaims), and the ref
+                // is never moved.
+                let ahead = repo.graph_descendant_of(local_oid, new_oid)?;
+
+                return Ok(if ahead {
+                    PackApply::Ahead {
+                        local: local_oid.to_string(),
+                        remote: new_head.to_string(),
+                    }
+                } else {
+                    PackApply::Diverged {
+                        local: local_oid.to_string(),
+                        remote: new_head.to_string(),
+                    }
                 });
             }
         }
@@ -5502,6 +5563,42 @@ impl GitReplication {
             from: local_head.map(|oid| oid.to_string()),
             to: new_head.to_string(),
         })
+    }
+
+    /// Relates `remote_sha` to this repository's HEAD using local objects
+    /// only. See [`HeadRelation`] for why this runs *before* a pack is asked
+    /// for. A repository that does not exist or has no HEAD yet answers
+    /// `Unknown`: it needs whatever the upstream has.
+    pub fn relation_to(repo_path: &Path, remote_sha: &str) -> HeadRelation {
+        let Ok(repo) = Repository::open(repo_path) else {
+            return HeadRelation::Unknown;
+        };
+
+        let Some(local_oid) = repo.head().ok().and_then(|head| head.target()) else {
+            return HeadRelation::Unknown;
+        };
+
+        let Ok(remote_oid) = Oid::from_str(remote_sha) else {
+            return HeadRelation::Unknown;
+        };
+
+        if repo.find_commit(remote_oid).is_err() {
+            return HeadRelation::Unknown;
+        }
+
+        if remote_oid == local_oid {
+            return HeadRelation::Same;
+        }
+
+        match repo.graph_descendant_of(local_oid, remote_oid) {
+            Ok(true) => HeadRelation::Ahead {
+                local: local_oid.to_string(),
+            },
+            Ok(false) => HeadRelation::Diverged {
+                local: local_oid.to_string(),
+            },
+            Err(_) => HeadRelation::Unknown,
+        }
     }
 
     /// The branch reference HEAD points at.

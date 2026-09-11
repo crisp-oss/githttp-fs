@@ -24,6 +24,11 @@
 //!   writes are never touched (no wasted wake-ups scanning idle tenants),
 //!   and repos that write constantly are packed at most once per
 //!   `delay_secs`, not after every burst.
+//! - **An opt-in pack-count trigger (`maximum_packs`)** short-circuits that
+//!   delay when a repository already holds too many packs. It exists for
+//!   replicas, where every replicated delta lands as one more packfile and
+//!   object lookups slow down with each one; a master's writes are loose
+//!   objects, so on a master it simply never fires.
 //! - **In-memory only, doesn't survive restarts** — losing a pending timer
 //!   is harmless: the next write simply re-arms it. Persisting the schedule
 //!   would add state for no correctness benefit.
@@ -83,13 +88,43 @@ impl MaintenanceScheduler {
 
         let delay_secs = self.config.maintenance.delay_secs;
         let destructive_prune = self.config.maintenance.destructive_prune;
+        let maximum_packs = self.config.maintenance.maximum_packs;
         let pending = self.pending.clone();
         let task_tenant_key = tenant_key.to_string();
 
         tracing::debug!(tenant = %task_tenant_key, delay_secs = delay_secs, "maintenance scheduled");
 
         let task = tokio::spawn(async move {
-            sleep(Duration::from_secs(delay_secs)).await;
+            // The pack-count trigger is checked inside the task rather than
+            // by the caller, so the directory read never sits on a write
+            // handler's path. A repository at or over the threshold runs its
+            // pass now; a failing pass re-arms on the next write and runs
+            // again at once, which is loud (one error per write) by design.
+            let delay = match maximum_packs {
+                Some(maximum_packs) => {
+                    let count_path = repo_path.clone();
+
+                    let packs = run_blocking(move || Ok(GitMaintenance::pack_count(&count_path)))
+                        .await
+                        .unwrap_or(0);
+
+                    if packs >= maximum_packs {
+                        tracing::info!(
+                            tenant = %task_tenant_key,
+                            packs = packs,
+                            maximum_packs = maximum_packs,
+                            "pack count reached maximum, running maintenance now"
+                        );
+
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs(delay_secs)
+                    }
+                }
+                None => Duration::from_secs(delay_secs),
+            };
+
+            sleep(delay).await;
 
             // Take the tenant write lock so maintenance never runs concurrently
             // with a write — packing must see a frozen object store.

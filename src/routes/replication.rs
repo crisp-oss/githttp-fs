@@ -37,9 +37,9 @@ use crate::{
     error::AppError,
     git::GitReplication,
     replication::{
-        self, ReplicationEvent, ReplicationHealth, RepositoryEntry, RepositoryListing,
-        EVENT_HEARTBEAT_SECS, HEAD_SHA_HEADER, NODE_ID_HEADER, PENDING_HEADER, PROTOCOL_HEADER,
-        PROTOCOL_VERSION, REPOSITORIES_HEADER,
+        self, Issue, ReplicationEvent, ReplicationHealth, RepositoryEntry, RepositoryListing,
+        EVENT_HEARTBEAT_SECS, HEAD_SHA_HEADER, INSTANCE_HEADER, NODE_ID_HEADER, PENDING_HEADER,
+        PROTOCOL_HEADER, PROTOCOL_VERSION, REPOSITORIES_HEADER, SYNC_HEADER,
     },
     state::AppState,
     util::run_blocking,
@@ -89,12 +89,12 @@ pub async fn replication_state(
     // The state poll is a replica's regular heartbeat, so it is where the
     // roster learns that this peer is alive and how far behind it says it is —
     // no extra request, and the numbers are as fresh as its last pass.
-    let (node_id, repositories, pending) = peer_identity(&headers);
+    let peer = peer_identity(&headers);
 
-    if let Some(node_id) = &node_id {
+    if let Some(node_id) = &peer.node_id {
         state
             .replica_registry
-            .note_request(node_id, repositories, pending);
+            .note_request(node_id, peer.repositories, peer.pending, peer.sync);
     }
 
     let identity = state.identity.current();
@@ -161,7 +161,7 @@ pub async fn replication_pack(
     Query(query): Query<PackQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let (peer_node_id, _, _) = peer_identity(&headers);
+    let peer_node_id = peer_identity(&headers).node_id;
 
     let collection_id = validate::collection_id(&collection_id)?.to_string();
     let tenant_id = validate::tenant_id(&tenant_id)?.to_string();
@@ -266,24 +266,65 @@ pub async fn replication_pack(
 /// knowing they exist. Frames carry identities and shas, never content —
 /// a replica reacts by asking what the state is, so a lost frame costs
 /// nothing beyond latency.
-pub async fn replication_events(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let (sender, receiver) = mpsc::channel::<Result<Vec<u8>, std::io::Error>>(EVENT_CHANNEL_DEPTH);
-
-    let mut notifications = state.replication.subscribe();
-    let (peer_node_id, repositories, pending) = peer_identity(&headers);
+pub async fn replication_events(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let peer = peer_identity(&headers);
+    let peer_node_id = peer.node_id.clone();
 
     // Presence is the lifetime of this connection, which is why it is marked
     // open here and closed when the task below ends: an open socket is a fact,
     // where a timeout would only ever be a guess.
+    //
+    // A node id already connected from a *different process* is refused
+    // with `409`: two replicas sharing a name would share a roster row and
+    // hide each other. The same process reconnecting (same instance token)
+    // replaces its old connection. A peer that sends an id but no instance
+    // token is an older build; it is let through without the check rather
+    // than locked out of a feature it predates.
     if let Some(node_id) = &peer_node_id {
         state
             .replica_registry
-            .note_request(node_id, repositories, pending);
-        state.replica_registry.stream_opened(node_id);
+            .note_request(node_id, peer.repositories, peer.pending, peer.sync);
+
+        let instance = peer.instance.as_deref().unwrap_or("");
+
+        if let Err(collision) = state.replica_registry.stream_opened(node_id, instance) {
+            tracing::error!(
+                node_id = %collision.node_id,
+                "refusing notification stream: another process is already connected under this node id; \
+                 every replica needs a unique replication.node_id"
+            );
+
+            state.issues.raise(
+                &replication::Issues::collision_key(&collision.node_id),
+                Issue::NodeIdCollision {
+                    node_id: collision.node_id.clone(),
+                    since: chrono::Utc::now().timestamp(),
+                },
+            );
+
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": format!(
+                        "node id '{}' is already connected from another process",
+                        collision.node_id
+                    )
+                })),
+            )
+                .into_response();
+        }
+
+        if state
+            .issues
+            .clear(&replication::Issues::collision_key(node_id))
+        {
+            tracing::info!(node_id = %node_id, "node id collision cleared");
+        }
     }
+
+    let (sender, receiver) = mpsc::channel::<Result<Vec<u8>, std::io::Error>>(EVENT_CHANNEL_DEPTH);
+
+    let mut notifications = state.replication.subscribe();
 
     tracing::info!(
         connected_replicas = state.replication.connected_replicas(),
@@ -293,12 +334,13 @@ pub async fn replication_events(
 
     let registry = state.replica_registry.clone();
     let stream_peer = peer_node_id.clone();
+    let stream_instance = peer.instance.clone().unwrap_or_default();
 
     let own_node_id = state
         .config
         .replication
         .as_ref()
-        .map(|replication| replication.node_id(&state.config.server))
+        .map(|replication| replication.node_id().to_string())
         .unwrap_or_default();
 
     let own_identity = state.identity.current();
@@ -361,7 +403,7 @@ pub async fn replication_events(
         }
 
         if let Some(node_id) = &stream_peer {
-            registry.stream_closed(node_id);
+            registry.stream_closed(node_id, &stream_instance);
         }
 
         tracing::info!(
@@ -375,18 +417,30 @@ pub async fn replication_events(
         [(header::CONTENT_TYPE, "application/x-ndjson")],
         Body::from_stream(ReceiverStream::new(receiver)),
     )
+        .into_response()
 }
 
-/// Reads the identity a peer volunteered, and the two numbers only it can
-/// know, off the request headers.
+/// What a peer said about itself on a request's headers. Everything is
+/// optional — see [`peer_identity`].
+struct PeerHeaders {
+    node_id: Option<String>,
+    instance: Option<String>,
+    repositories: Option<usize>,
+    pending: Option<usize>,
+    sync: Option<String>,
+}
+
+/// Reads the identity a peer volunteered, and the numbers only it can know,
+/// off the request headers.
 ///
 /// Everything here is optional. A peer that sends no id — or one that fails
 /// `validate::node_id`, which bounds what is stored in the roster and echoed
 /// into logs — stays out of the roster entirely rather than being rejected:
 /// identity is telemetry, and the Bearer key is what actually gates the
 /// surface, so a missing or malformed header must never fail a request that
-/// is otherwise perfectly valid.
-fn peer_identity(headers: &HeaderMap) -> (Option<String>, Option<usize>, Option<usize>) {
+/// is otherwise perfectly valid. The one exception is a node id that
+/// *collides*, which the events route refuses — see there.
+fn peer_identity(headers: &HeaderMap) -> PeerHeaders {
     let header = |name: &str| {
         headers
             .get(name)
@@ -405,7 +459,17 @@ fn peer_identity(headers: &HeaderMap) -> (Option<String>, Option<usize>, Option<
         }
     });
 
-    (node_id, number(REPOSITORIES_HEADER), number(PENDING_HEADER))
+    // The instance token and sync word are bounded the same way the node id
+    // is, since both land in memory and in log lines.
+    let bounded = |name: &str| header(name).filter(|value| validate::node_id(value).is_ok());
+
+    PeerHeaders {
+        node_id,
+        instance: bounded(INSTANCE_HEADER),
+        repositories: number(REPOSITORIES_HEADER),
+        pending: number(PENDING_HEADER),
+        sync: bounded(SYNC_HEADER),
+    }
 }
 
 /// GET /_replication/health
@@ -420,12 +484,12 @@ pub async fn replication_health(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
-    let (node_id, repositories, pending) = peer_identity(&headers);
+    let peer = peer_identity(&headers);
 
-    if let Some(node_id) = &node_id {
+    if let Some(node_id) = &peer.node_id {
         state
             .replica_registry
-            .note_request(node_id, repositories, pending);
+            .note_request(node_id, peer.repositories, peer.pending, peer.sync);
     }
 
     Ok((StatusCode::OK, Json(health_for(&state).await?)))

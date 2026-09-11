@@ -36,7 +36,8 @@ use crate::config::Config;
 use crate::hooks::HookQueue;
 use crate::maintenance::MaintenanceScheduler;
 use crate::replication::{
-    ReplicaRegistry, ReplicaStatus, ReplicationIdentity, ReplicationNotifier, RepositoryIndex,
+    Issues, ReplicaRegistry, ReplicaStatus, ReplicationIdentity, ReplicationNotifier,
+    RepositoryIndex,
 };
 
 /// A cloneable handle to the per-tenant write lock.
@@ -79,6 +80,11 @@ pub struct AppState {
     /// (replica), from `.replication.json`. Empty on a standalone node and
     /// on a replica that has not paired yet.
     pub identity: Arc<ReplicationIdentity>,
+    /// Everything this node has stopped doing on its own and is waiting on
+    /// an operator for: a locked repository, a refused mass deletion, a
+    /// vanished identity file, a node id collision. Any entry makes the
+    /// node `halted` on the health routes. Empty on a standalone node.
+    pub issues: Arc<Issues>,
     /// Lazily-created mutex per tenant to serialize git write operations.
     /// Keyed as `"collection_id/tenant_id"` — the same composite key used for
     /// hook queues and maintenance slots, so all three subsystems agree on
@@ -93,17 +99,24 @@ impl AppState {
     /// to stop the process rather than surface as a half-built state.
     pub fn new(config: Config, identity: ReplicationIdentity) -> Self {
         let config = Arc::new(config);
-        let repository_index = Arc::new(RepositoryIndex::new(&config));
+        let identity = Arc::new(identity);
+        let issues = Arc::new(Issues::new());
+        let repository_index = Arc::new(RepositoryIndex::new(
+            &config,
+            identity.clone(),
+            issues.clone(),
+        ));
 
         Self {
             started_at: chrono::Utc::now().timestamp(),
             hook_queue: Arc::new(HookQueue::new(config.clone())),
             maintenance: Arc::new(MaintenanceScheduler::new(config.clone())),
             replication: Arc::new(ReplicationNotifier::new(&config, repository_index.clone())),
-            replica_status: Arc::new(ReplicaStatus::new(&config)),
+            replica_status: Arc::new(ReplicaStatus::new(&config, issues.clone())),
             replica_registry: Arc::new(ReplicaRegistry::new()),
             repository_index,
-            identity: Arc::new(identity),
+            identity,
+            issues,
             config,
             repo_locks: Arc::new(DashMap::new()),
         }

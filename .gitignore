@@ -9,3 +9,5 @@ dev/repositories/*/*
 !dev/repositories/*/.gitkeep
 
 .claude/
+
+NOTES.local.md

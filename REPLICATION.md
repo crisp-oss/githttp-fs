@@ -57,16 +57,19 @@ role = "master" # or "replica"
 secret = "a-peer-only-secret"
 # host = "127.0.0.1"        # defaults to server.host
 # port = 5356                 # defaults to 5356
-# node_id = "master-eu"      # defaults to host:port
+node_id = "master-eu"        # required, unique per deployment
 
 # Replica-only:
 # master_url = "http://master.internal:5356"
 # poll_interval_secs = 60
 # parallelism = 4
 # reconnect_backoff_ms = 1000
+# deletion_guard = true      # refuse listings that would delete > half of what this replica holds
 ```
 
-`master_url` is required for `role = "replica"` and rejected for a master. `node_id` is observability telemetry, not authentication: it is limited to 64 characters from `[A-Za-z0-9._:-]` plus IPv6 brackets. Invalid peer-supplied IDs are treated as absent.
+`master_url` is required for `role = "replica"` and rejected for a master. `node_id` is required and must be unique across the deployment: a master refuses a notification stream (`409 Conflict`) from a process presenting a node id that another process already holds a stream under. It is observability telemetry, not authentication: it is limited to 64 characters from `[A-Za-z0-9._:-]` plus IPv6 brackets. Invalid peer-supplied IDs are treated as absent.
+
+Each replica process also generates a random instance token at startup and sends it as `X-Replication-Instance` on every request. The same node id with the same token is a replica reconnecting after a drop, and replaces its own connection; the same node id with a different token is a second replica wearing the same name, which is the collision the master refuses. Only the stream is refused — `state` and `pack` stay served, so a misnamed replica keeps converging while its operator is told.
 
 The default polling interval bounds normal eventual-consistency delay. `parallelism` bounds the number of repositories pulled at once. A dropped event stream is re-dialed with exponential backoff, capped at 60 seconds.
 
@@ -102,7 +105,9 @@ The identity is a 64-character lowercase hexadecimal value.
 | Paired replica | Serves its pinned identity to downstream replicas. |
 | Standalone | Has no replication identity file. |
 
-Before every reconciliation, a paired replica compares the upstream identity to its pinned identity. A mismatch stops synchronization: it is reported as an unreachable master in health output and logged with both identities, node IDs, and the identity-file path. This prevents a bad `master_url` or a rebuilt, empty master from silently causing a replica to delete and re-clone its data.
+Before every reconciliation, a paired replica compares the upstream identity to its pinned identity. A mismatch stops synchronization: it is reported as an unreachable master and an `identity_mismatch` issue in health output, and logged with both identities, node IDs, and the identity-file path. This prevents a bad `master_url` or a rebuilt, empty master from silently causing a replica to delete its data.
+
+The file is also a canary for the store itself. Every node re-reads it on every rescan of its repository index and compares it to the identity loaded at startup. If `repos_path` was unmounted, swapped, or emptied under the running process, the file is gone or different, and the node then serves its listing as **incomplete** — the one kind of listing a replica never infers deletions from — and raises an `identity_file_missing` or `identity_file_changed` issue. Without that check an empty-but-readable store would scan as a complete, empty listing, which is an instruction to every replica to delete everything.
 
 To intentionally pair a replica with a different data set: stop it, delete `<repos_path>/.replication.json`, and restart it. A present but malformed or invalid identity file is a startup error; it is never silently regenerated.
 
@@ -187,7 +192,7 @@ The response never completes. It is newline-delimited JSON, with a `hello` frame
 
 `hello` is sent once per stream session, establishes the protocol version, and allows identity mismatch detection before work is queued. The `identity` can be `null` only when the serving node is an unpaired replica.
 
-Frames never carry content. `repository.updated` and `repository.deleted` are hints to reconcile; heartbeats are sent every 20 seconds while idle to keep intermediaries from closing the connection and to make liveness visible.
+Frames never carry content. `repository.updated` and `repository.deleted` are hints to reconcile; heartbeats are sent every 20 seconds while idle to keep intermediaries from closing the connection and to make liveness visible. An update frame queues its repository for a pull directly. A deletion frame is never acted on by itself: it triggers a full reconcile, and the listing that reconcile fetches is what decides, under the mass-deletion guard — so a burst of deletion frames can never do what the guard would refuse a listing for.
 
 Notifications use a broadcast channel. A slow subscriber is disconnected rather than buffered indefinitely; it reconnects and performs a full reconciliation, which safely recovers every missed frame. Replication notifications never use the webhook queue, so a slow replica cannot delay webhook delivery or content writes.
 
@@ -199,6 +204,9 @@ Every role—master, replica, and standalone—answers the content API endpoint.
 
 ```json
 {
+  "protocol": 1,
+  "status": "healthy",
+  "issues": [],
   "node": {
     "node_id": "master-eu",
     "role": "master",
@@ -221,6 +229,7 @@ Every role—master, replica, and standalone—answers the content API endpoint.
       "packs_delivered": 12,
       "repositories": 26,
       "pending_repositories": 0,
+      "sync": "synced",
       "reported_at": 1789120589
     }
   ],
@@ -229,11 +238,44 @@ Every role—master, replica, and standalone—answers the content API endpoint.
 }
 ```
 
+### Status, and what to alert on
+
+`status` is the one field a monitor needs, and it is present on every role:
+
+| `status` | Meaning | Action |
+|---|---|---|
+| `healthy` | Nothing is wrong that will not fix itself within a poll interval. | None. |
+| `degraded` | Converging, but not well: a replica is `stalled` (three consecutive failed passes), a replica's stream is down and it has been silent for over two minutes, or a cold replica is still bootstrapping. | Warn. Usually a master or network outage in progress. |
+| `halted` | An `issue` is open and nothing will close it but a person. | Page. Read `issues`. |
+
+On a replica, `status` follows its own follower state. On a master, it folds in every roster row: a replica reporting `halted` makes the master `halted`, a `stalled` or silent one makes it `degraded`, so one probe against the master covers the whole set. `lagging` is normal operation and never degrades anything.
+
+`issues` lists every condition the node has stopped acting on by itself. Each entry carries a `kind`, the repository it concerns where that applies, and `since` (when it first appeared — an issue re-raised on every pass keeps its original timestamp):
+
+| `kind` | Raised by | Meaning |
+|---|---|---|
+| `replica_ahead` | replica | The announced head for this repository is an *ancestor* of the local one: this replica holds more history than its upstream. Local copy kept and served; sync of this repository suspended. |
+| `history_diverged` | replica | Neither head descends from the other for this repository. Same handling. |
+| `identity_mismatch` | replica | The upstream states an identity other than the pinned one. Nothing is pulled. |
+| `deletion_refused` | replica | A complete listing would delete more than half of this replica's repositories. Refused; updates continue. |
+| `identity_file_missing` | any | This node's own `.replication.json` is gone from `repos_path`. Listing served as incomplete. |
+| `identity_file_changed` | any | This node's `.replication.json` holds a different identity than the one loaded at startup. Listing served as incomplete. |
+| `node_id_collision` | master, replica | Two processes present the same `node_id`. The master refused the second stream; the replica's own stream is being refused. |
+
+The follower's own verdict is `replica.sync`, sent to the master as `X-Replication-Sync` on every state poll so the roster's `sync` column stays current:
+
+| `sync` | Meaning |
+|---|---|
+| `synced` | Last pass succeeded; nothing pending, nothing locked. |
+| `lagging` | Work is pending, or no pass has completed yet. Normal. |
+| `stalled` | Three consecutive passes failed. Heals when whatever is failing stops. |
+| `halted` | At least one issue is open. |
+
 `node.role` is `master`, `replica`, or `standalone`. On a master (and standalone node), `master` describes the answering node and is reachable by construction. On a replica, `master.reachable` means its last upstream contact succeeded; it is independent of `stream_connected`, because polling can converge with the stream down.
 
 The master observes `stream_connected`, `connected_at`, `last_contact_at`, and `packs_delivered`. The replica reports its own `repositories` and `pending_repositories`. Disconnected replica rows remain in the roster, preserving their last contact information. `replicas_observed_at` is current on a master and records the cached-upstream observation time on a replica.
 
-A replica's own follower state is additionally exposed in the API ping response as `replica`: `state` (`ready` or `bootstrapping`), `stream_connected`, `last_reconcile_at`, `pending_repositories`, and `reclones`.
+A replica's health additionally carries a `replica` object with `state` (`ready` or `bootstrapping`), `sync`, `stream_connected`, `last_reconcile_at`, `last_success_at`, `pending_repositories`, `locked_repositories`, and `consecutive_failures`. The API ping response (`GET /v1`) exposes the short form of it: `state`, `sync`, `stream_connected`, `last_reconcile_at`, and `pending_repositories`.
 
 ## Reconciliation algorithm
 
@@ -241,19 +283,31 @@ A replica reconciles at startup, after a stream hint/reconnect, and every `poll_
 
 1. Fetch `state` and validate its protocol, identity, repository identifiers, and HEAD SHAs.
 2. Pin the upstream identity on first successful state response, or reject the response if it differs from the already pinned identity.
-3. Build the pending set from upstream repositories whose local HEAD differs or whose local repository is absent.
-4. For each pending repository, request a pack with the local HEAD as `have` (or without it for an absent repository).
-5. Import the pack, validate that the announced pack HEAD can fast-forward the local ref, and only then advance the ref.
-6. If the upstream state was `complete`, delete local repositories absent from it. If it was incomplete, skip this deletion phase entirely.
+3. Build the pending set from upstream repositories whose local HEAD differs or whose local repository is absent — skipping any repository that is locked (see below) unless the upstream announces a different head than the one it was locked against.
+4. For each pending repository, relate the announced head to the local one from local objects alone. If the replica already holds it as an ancestor of its HEAD, the replica is ahead: lock the repository without requesting anything. Otherwise request a pack with the local HEAD as `have` (or without it for an absent repository).
+5. Import the pack, validate that the announced pack HEAD fast-forwards the local ref, and only then advance the ref. A pack that does not fast-forward is classified as ahead or diverged and the repository is locked; the ref never moves and the local copy is never removed.
+6. If the upstream state was `complete`, compute the local repositories absent from it. If they number more than half of what this replica holds (and it holds at least two), refuse the whole deletion phase and raise `deletion_refused`; otherwise delete them. If the listing was incomplete, skip this phase entirely.
 7. Refresh the cached upstream health roster after successful reconciliation.
 
 The local ref is the cursor; the protocol stores no separate synchronization checkpoint. Thus restarts and missed events are harmless: the next state comparison recomputes the same work.
 
-### Fast-forward and re-clone rules
+### Fast-forward, locking, and the no-wipe rule
 
-An incremental pack is always no larger than a full clone in object-set terms: it is the set reachable from upstream HEAD minus objects reachable from local HEAD. Therefore replicas do not use a distance or size heuristic to choose a re-clone.
+An incremental pack is always no larger than a full clone in object-set terms: it is the set reachable from upstream HEAD minus objects reachable from local HEAD. Therefore replicas never need a distance or size heuristic, and never need a re-clone in normal operation.
 
-A replica re-clones only when the local history is not an ancestor of the announced upstream HEAD. This can happen when a repository was deleted and recreated with the same collection/tenant coordinates, or after manual restoration/promotion that leaves the replica ahead. The local repository is discarded, a full pack is fetched, the event is logged as an error, and the replica increments its `reclones` count.
+**A replica never deletes a repository on its own initiative.** When the announced head does not fast-forward the local ref, the replica cannot know whether the upstream or itself holds the history that matters — and the two cases in which it happens point in opposite directions:
+
+- **Ahead** (`replica_ahead`): the announced head is an ancestor of the local one. The replica holds more history than its upstream — a master restored from a backup, a chained upstream that restarted while behind, a failback after a manual promotion. The *upstream* is what is behind. This is detected from local objects before any pack is requested, since the replica already holds the announced commit.
+- **Diverged** (`history_diverged`): neither head descends from the other. A tenant deleted and re-created under the same coordinates, or a forked history after two nodes accepted writes.
+
+In both cases the local copy is kept and keeps being served, the repository is **locked** out of replication, an issue is raised (the node becomes `halted`), and one error line names both heads. Nothing else changes: other repositories keep syncing.
+
+A lock is re-examined only when the upstream announces a *different* head than the one it was locked against, so a refused pack is not fetched again on every poll. It lifts by itself the moment a sync of that repository succeeds. There are two ways to get there:
+
+1. **Keep the master's history.** Stop nothing. On the replica, delete the repository directory (`<repos_path>/<collection_id>/<tenant_id>/`); the next reconcile finds it absent and clones it in full. This is the manual form of what the old automatic re-clone did, now with a human deciding it.
+2. **Keep the replica's history.** Restore or promote so that the upstream's head moves past the replica's (or replace the upstream's copy with the replica's). The next reconcile sees a new announced head, retries, fast-forwards, and lifts the lock.
+
+The same rule guards the deletion phase: a complete listing that would delete more than half of a replica's repositories is refused outright (`deletion_refused`) rather than applied, because a master genuinely removing most of its tenants in one poll interval is rare and a master whose store was swapped or emptied is not. Updates keep flowing while it is refused, and nothing clears the refusal on its own — a restarted replica still holds what it held, so it would refuse again. If the deletion really is intended, set `replication.deletion_guard = false`, restart the replica once, and turn the guard back on; or, since the guard counts deletions relative to what the replica holds, delete the tenants in smaller batches. A `repository.deleted` frame on the notification stream never deletes anything by itself: it triggers a reconcile, and the listing is what decides, so the guard applies to hinted deletions too.
 
 The replica advances to `X-Replication-Head-Sha`, not merely the SHA from an earlier state or event. The pack is built for the response's pinned HEAD and may already include a newer commit than the one that triggered the request.
 
@@ -267,7 +321,7 @@ Replicas do not have working trees; they serve reads directly from Git's object 
 - Replicas never enqueue content webhooks. When the master was unavailable, repair a webhook receiver afterward with the content API's hook replay endpoint.
 - After each successful apply, a replica publishes a replication notification so downstream replicas can chain from it.
 
-Replicas arm ordinary maintenance after an apply because every sync adds a pack. `maintenance.destructive_prune = true` is safe on replicas: any pruned unreachable object can be fetched again.
+Replicas arm ordinary maintenance after an apply because every sync adds a pack. `maintenance.destructive_prune = true` is safe on replicas: any pruned unreachable object can be fetched again. Set `maintenance.maximum_packs` on a replica: with it, a repository that reaches that many packs runs its pass immediately rather than after `delay_secs`, which is what keeps a busy replicated tenant from carrying hundreds of packs — each one another index libgit2 consults on every object lookup — for a day at a time.
 
 ## Failure handling and operator guidance
 
@@ -278,7 +332,10 @@ Replicas arm ordinary maintenance after an apply because every sync adds a pack.
 | State says `complete: false` | Updates named in state may apply; deletion inference is skipped. | Repair upstream filesystem/repository access. |
 | Identity mismatch | Synchronization halts; master is shown unreachable. | Verify the intended upstream. To intentionally re-pair, stop node, delete `.replication.json`, restart. |
 | Pack construction/import transient failure | Replica retries on a later reconciliation. | Check logs and storage health; concurrent repacks can cause transient upstream errors. |
-| Non-fast-forward | Local copy is discarded and fully cloned; `reclones` increments. | Investigate tenant recreation, restoration, or manual promotion. |
+| Replica ahead / history diverged | Local copy kept and served; that repository locked out of sync; `replica_ahead` / `history_diverged` issue; `status: halted`. | Decide which history to keep — see [the no-wipe rule](#fast-forward-locking-and-the-no-wipe-rule). Delete the local directory to take the master's; move the master past the replica to keep the replica's. |
+| Deletion refused | Listing would delete more than half the replica's repositories; deletions refused, updates continue; `deletion_refused` issue. | Verify the master's store is intact. If the deletion is intended, set `replication.deletion_guard = false`, restart the replica, then turn the guard back on. |
+| Identity file missing/changed | The node serves its listing as incomplete; `identity_file_*` issue; `status: halted`. | Check the mount under `repos_path`. Restore the store, or if the store is deliberately new, restart the node. |
+| Node id collision | Master refuses the second stream (`409`); polling still converges; `node_id_collision` issue on both sides once it persists. | Give every replica a unique `replication.node_id`. |
 | Cold replica | Content reads return `503` until first catch-up drains. | Probe `GET /v1/_health/status` (reports `status: "bootstrapping"`) and `GET /v1/_health/replication`; do not treat cold `404`s as valid. |
 
 Use `GET /v1/_health/replication` for normal monitoring. It works on every role, needs no credential, and does not expose the peer-only replication secret. `GET /v1/_health/status` is the cheaper companion probe — no I/O — reporting this node's version, role, and whether it accepts writes.

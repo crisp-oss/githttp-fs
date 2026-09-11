@@ -44,11 +44,15 @@ batch_read_maximum_files = 100
 [maintenance]
 
 # A replica needs maintenance more than a master does: every applied delta
-# writes a fresh packfile, so packs accumulate one per sync. `destructive_prune`
+# writes a fresh packfile, so packs accumulate one per sync, and libgit2 checks
+# every pack index on every object lookup. `maximum_packs` runs the pass as soon
+# as a repository reaches that many packs instead of waiting a day; a busy
+# tenant polled every 10 s would otherwise carry thousands. `destructive_prune`
 # is also unambiguously safe here — anything it drops can be fetched again.
 enabled = true
 delay_secs = 86400
 destructive_prune = true
+maximum_packs = 32
 
 [replication]
 
@@ -69,6 +73,8 @@ master_url = "http://127.0.0.1:5356"
 # this port against this node's own server.port.
 port = 5366
 
+# Required, and unique across the deployment: the master refuses a stream from
+# a second process claiming a name that is already connected (409).
 node_id = "replica-1"
 
 # Short so convergence is visible while developing; the default is 60.
