@@ -26,7 +26,7 @@ sequenceDiagram
     R->>R: Import objects, fast-forward ref atomically
     R->>M: GET /_replication/events
     M-->>R: hello, updates, deletions, heartbeats
-    Note over R,M: Events prompt reconciliation; polling remains authoritative
+    Note over R,M: Events prompt reconciliation, polling remains authoritative
 ```
 
 ## Topology, listeners, and authentication

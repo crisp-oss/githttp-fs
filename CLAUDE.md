@@ -864,6 +864,18 @@ reminder that "write-shaped" and "write" are different questions on this API.
 
 After applying code changes, always run `cargo fmt` before `cargo build`.
 
+## Documentation files
+
+Each documentation file has one audience, and they must not grow into copies of each other:
+
+- **`README.md` — keep it minimal.** It is written for a human landing on the repository, so it covers only what that reader needs: what githttp-fs is, how to install and run it, and the reference list of configuration keys. Design rationale, operational notes, and long-form explanation do not belong there. When a README passage grows past what a newcomer needs, move it into `CONSIDERATIONS.md` and leave a one-line link behind rather than a summary.
+- **`CONSIDERATIONS.md`** — design and operational notes for someone already running githttp-fs: how read-only replicas behave, why the two health routes are public, and the files githttp-fs reserves inside a tenant repository.
+- **`REPLICATION.md`** — the replication peer protocol specification, for operators and for maintainers of the replication implementation.
+- **`CLAUDE.md`** — this file: the complete API surface and the reasoning behind every design decision, written for whoever works on the code.
+- **`CHANGELOG.md`** — release notes only, written at release time (see [Changelog](#changelog) below).
+
+Mermaid diagrams are rendered by GitHub, so they must parse there. Never use a semicolon inside a `sequenceDiagram` message or note: mermaid treats it as a statement separator, and the text after it is parsed as its own statement, which fails to render.
+
 ## Release procedure
 
 To bump the version to `vX.Y.Z`:
