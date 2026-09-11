@@ -265,7 +265,7 @@ Any request to the bare server root `/` (any method, no auth required) is answer
 {
   "status": "healthy",
   "name": "githttp-fs",
-  "version": "1.10.2",
+  "version": "1.11.0",
   "role": "master",
   "writable": true,
   "started_at": "2026-06-16T10:00:00Z",
