@@ -64,7 +64,7 @@ jobs:
         with:
           tag_name: ${{ steps.current_tag.outputs.tag }}
           name: githttp-fs ${{ steps.current_tag.outputs.tag }}
-          body: "⚠️ Changelog not yet provided."
+          body: "[See changelog](https://github.com/crisp-oss/githttp-fs/blob/master/CHANGELOG.md#${{ steps.current_tag.outputs.tag }}) for ${{ steps.current_tag.outputs.tag }}."
           files: ./${{ steps.current_tag.outputs.tag }}-*.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

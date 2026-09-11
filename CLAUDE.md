@@ -871,9 +871,62 @@ To bump the version to `vX.Y.Z`:
 1. Update `version` in `Cargo.toml`
 2. Update the version in `README.md`
 3. Update the version in `debian/rules`
-4. Run `cargo build` to regenerate `Cargo.lock`
-5. Commit all changes with message `vX.Y.Z`
-6. Tag the commit with `vX.Y.Z`
+4. Document every change since the previous tag in `CHANGELOG.md` (see [Changelog](#changelog) below)
+5. Run `cargo build` to regenerate `Cargo.lock`
+6. Commit all changes with message `vX.Y.Z`
+7. Tag the commit with `vX.Y.Z`
+
+## Changelog
+
+`CHANGELOG.md` is the single place where changes are recorded, and it is the source of truth for release notes: the GitHub release created by the build workflow only links to it. **Every release must document all of its changes there, and the changelog is only ever written at release time** — never while a feature or fix is being developed. Changes are documented as part of the version bump (step 4 above), in the same `vX.Y.Z` commit, by reviewing everything that landed since the previous tag:
+
+```sh
+git log --oneline $(git describe --tags --abbrev=0)..HEAD
+```
+
+Do not add a changelog section for an unreleased version, and do not add entries to it while working on changes: a section only exists once its version number has been decided and the release is being cut. Entries describe what the change means to an API user or operator (a new route, a new parameter, a changed response, a new config key), not the commit messages; housekeeping commits with no user-visible effect (Pawfile bumps, formatting passes, comment-only changes) are not listed. Entries for a version that was released with no notes are filled in from its commits in the same way.
+
+### Format
+
+Newest version first. Each version is a `## vX.Y.Z` heading holding one or more of the four sections below, in this order, each omitted when empty. Entries are `*` bullets written in the past tense, with route paths, parameters, config keys and event names in backticks.
+
+```markdown
+Changelog
+=========
+
+## v1.12.0
+
+### Breaking Changes
+
+* ⚠️ The `position` field of the read file route is now `null` instead of `-1` when the file is not listed in its parent directory's order index.
+
+### New Features
+
+* Added `include_size` option to file listing route, reporting each file's size in bytes.
+* Added `GET /v1/:collection_id/:tenant_id/order/*path` route to read a directory's stored file order.
+
+### Changes
+
+* Hook replays now also re-dispatch one `order.updated` event per directory holding an order index, after all file events.
+* Updated all dependencies to latest.
+
+### Bug Fixes
+
+* Fixed a recursive folder move leaving a stale entry in the source directory's order index.
+
+## v1.11.0
+
+### New Features
+
+* Added read-only replication, configured with a new `[replication]` section.
+```
+
+The four sections mean:
+
+- **Breaking Changes** — anything an existing API client, hook receiver, or deployment must adapt to: a removed or renamed route, parameter, response field, event, or config key, or a changed default. Each entry starts with `⚠️`. A release with breaking changes may open with a bold **⚠️** paragraph telling operators what to do before upgrading.
+- **New Features** — new routes, parameters, events, or config keys.
+- **Changes** — behaviour changes that are not breaking, performance and security improvements, dependency updates.
+- **Bug Fixes** — fixes to behaviour that did not match its documentation.
 
 ## Docker
 
