@@ -224,6 +224,76 @@ pub const HEAD_SHA_HEADER: &str = "x-replication-head-sha";
 const INCOMING_DIRECTORY: &str = ".replication-incoming";
 
 // ---------------------------------------------------------------------------
+// Timestamps on the wire
+// ---------------------------------------------------------------------------
+
+/// Serde adapters that put a unix-seconds `i64` on the wire as an RFC 3339
+/// date-time (`2026-06-16T10:00:00Z`) and read one back.
+///
+/// Every timestamp this API emits is RFC 3339 — `committed_at` on the commit
+/// routes set the convention — and the health and replication bodies follow
+/// it rather than leaking the integer the atomics hold internally. Whole
+/// seconds only, matching `committed_at` (git times are whole seconds too),
+/// so the two spell identical instants identically.
+///
+/// Internally everything stays `i64`: atomics cannot hold a `DateTime`, and a
+/// single conversion at the edge beats threading chrono through every
+/// status struct.
+pub mod rfc3339 {
+    use chrono::{DateTime, SecondsFormat, Utc};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    /// `unix` seconds as an RFC 3339 string with a `Z` suffix.
+    pub fn format(unix: i64) -> String {
+        DateTime::<Utc>::from_timestamp(unix, 0)
+            .map(|at| at.to_rfc3339_opts(SecondsFormat::Secs, true))
+            .unwrap_or_default()
+    }
+
+    /// The inverse of [`format`], tolerant of any RFC 3339 offset.
+    pub fn parse(raw: &str) -> Option<i64> {
+        DateTime::parse_from_rfc3339(raw)
+            .ok()
+            .map(|at| at.timestamp())
+    }
+
+    pub fn serialize<S: Serializer>(unix: &i64, serializer: S) -> Result<S::Ok, S::Error> {
+        format(*unix).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i64, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+
+        parse(&raw).ok_or_else(|| serde::de::Error::custom("expected an RFC 3339 date-time"))
+    }
+
+    /// The same for `Option<i64>`: `null` stays `null`.
+    pub mod option {
+        use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+        pub fn serialize<S: Serializer>(
+            unix: &Option<i64>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            unix.map(super::format).serialize(serializer)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<i64>, D::Error> {
+            let raw = Option::<String>::deserialize(deserializer)?;
+
+            match raw {
+                None => Ok(None),
+                Some(raw) => super::parse(&raw)
+                    .map(Some)
+                    .ok_or_else(|| serde::de::Error::custom("expected an RFC 3339 date-time")),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------
 
@@ -362,12 +432,14 @@ pub struct ReplicationHealth {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replica: Option<FollowerHealth>,
     /// When this answer was built.
+    #[serde(with = "rfc3339")]
     pub observed_at: i64,
     /// When `replicas` was last true. On a master that is `observed_at` — it
     /// watches those connections itself. On a replica it is when the master
     /// last told it, so a roster served while the master is down is visibly
     /// stale rather than quietly wrong. `null` when a replica has never
     /// reached its master.
+    #[serde(default, with = "rfc3339::option")]
     pub replicas_observed_at: Option<i64>,
 }
 
@@ -396,7 +468,8 @@ pub struct MasterHealth {
     /// Whether the master is reachable from the answering node. Always
     /// `true` on the master: it is answering, so it is up.
     pub reachable: bool,
-    /// Last successful contact with the master, as a unix timestamp.
+    /// Last successful contact with the master.
+    #[serde(default, with = "rfc3339::option")]
     pub last_contact_at: Option<i64>,
     /// Why the last attempt failed, when it did. `null` while healthy.
     pub last_error: Option<String>,
@@ -420,8 +493,10 @@ pub struct ReplicaPresence {
     /// property that removes the need for a circuit breaker anywhere else in
     /// this feature.
     pub stream_connected: bool,
+    #[serde(default, with = "rfc3339::option")]
     pub connected_at: Option<i64>,
     /// Last request of any kind from this replica.
+    #[serde(default, with = "rfc3339::option")]
     pub last_contact_at: Option<i64>,
     pub packs_delivered: u64,
     /// Repositories the replica says it holds.
@@ -431,6 +506,7 @@ pub struct ReplicaPresence {
     /// The replica's own [`SyncStatus`], as it last reported it — so the
     /// master's roster is one place to read every follower's condition.
     pub sync: Option<String>,
+    #[serde(default, with = "rfc3339::option")]
     pub reported_at: Option<i64>,
     /// The instance token of the process holding the stream. Internal:
     /// what tells "this replica reconnected" from "another replica claims
@@ -458,9 +534,11 @@ pub struct FollowerHealth {
     /// `"halted"`. Alert on `halted`; warn on `stalled`.
     pub sync: String,
     pub stream_connected: bool,
+    #[serde(default, with = "rfc3339::option")]
     pub last_reconcile_at: Option<i64>,
     /// When a reconcile-and-drain last ended with nothing failed. `null`
     /// before the first one.
+    #[serde(default, with = "rfc3339::option")]
     pub last_success_at: Option<i64>,
     pub pending_repositories: usize,
     /// Repositories this replica holds but refuses to sync until an operator
@@ -556,6 +634,7 @@ pub enum Issue {
         tenant_id: String,
         local: String,
         remote: String,
+        #[serde(with = "rfc3339")]
         since: i64,
     },
     /// Neither the local nor the announced head descends from the other — a
@@ -567,6 +646,7 @@ pub enum Issue {
         tenant_id: String,
         local: String,
         remote: String,
+        #[serde(with = "rfc3339")]
         since: i64,
     },
     /// The upstream states a data-set identity other than the one pinned in
@@ -575,6 +655,7 @@ pub enum Issue {
     IdentityMismatch {
         pinned: String,
         stated: String,
+        #[serde(with = "rfc3339")]
         since: i64,
     },
     /// A complete upstream listing would have this replica delete more than
@@ -583,13 +664,18 @@ pub enum Issue {
     DeletionRefused {
         would_delete: usize,
         held: usize,
+        #[serde(with = "rfc3339")]
         since: i64,
     },
     /// This node's own `.replication.json` is gone from `repos_path` — the
     /// store this process started with is not the store it sees now. Its
     /// listing is served as incomplete, so no follower infers deletions.
     #[serde(rename = "identity_file_missing")]
-    IdentityFileMissing { path: String, since: i64 },
+    IdentityFileMissing {
+        path: String,
+        #[serde(with = "rfc3339")]
+        since: i64,
+    },
     /// This node's `.replication.json` no longer holds the identity loaded
     /// at startup. Same consequence as `identity_file_missing`.
     #[serde(rename = "identity_file_changed")]
@@ -597,13 +683,18 @@ pub enum Issue {
         path: String,
         expected: String,
         found: String,
+        #[serde(with = "rfc3339")]
         since: i64,
     },
     /// Two processes are presenting the same `node_id`. On a master: it
     /// refused the second one's stream. On a replica: its own stream is
     /// being refused.
     #[serde(rename = "node_id_collision")]
-    NodeIdCollision { node_id: String, since: i64 },
+    NodeIdCollision {
+        node_id: String,
+        #[serde(with = "rfc3339")]
+        since: i64,
+    },
 }
 
 impl Issue {

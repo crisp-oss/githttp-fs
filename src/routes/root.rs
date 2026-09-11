@@ -61,8 +61,11 @@ pub async fn ping(State(state): State<AppState>) -> Json<serde_json::Value> {
             // still converging, just with more lag.
             "stream_connected": state.replica_status.stream_connected(),
             // When this node last compared its whole repository set against
-            // the master, as a unix timestamp. Null before the first pass.
-            "last_reconcile_at": state.replica_status.last_reconcile(),
+            // the master, as an RFC 3339 date-time. Null before the first pass.
+            "last_reconcile_at": state
+                .replica_status
+                .last_reconcile()
+                .map(crate::replication::rfc3339::format),
             // Repositories known to be behind and awaiting a pull.
             "pending_repositories": state.replica_status.pending(),
             // One word on whether following is keeping up and will on its

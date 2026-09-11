@@ -249,7 +249,7 @@ On a **replica** the body gains a `replica` object, and only there — a master 
   "replica": {
     "state": "ready",
     "stream_connected": true,
-    "last_reconcile_at": 1789055975,
+    "last_reconcile_at": "2026-06-16T10:00:00Z",
     "pending_repositories": 0,
     "sync": "synced"
   }
@@ -268,12 +268,12 @@ Any request to the bare server root `/` (any method, no auth required) is answer
   "version": "1.10.2",
   "role": "master",
   "writable": true,
-  "started_at": 1789055975,
+  "started_at": "2026-06-16T10:00:00Z",
   "uptime_secs": 4210
 }
 ```
 
-`status` is `"healthy"`, or `"bootstrapping"` on a replica that holds no content yet and is therefore refusing content reads. `role` is `"master"`, `"replica"`, or `"standalone"` (no `[replication]` section) — the same three values the replication status reports. `writable` says whether a write sent to this node would be accepted at all, so a failover-aware client can read it once instead of learning it from a `423`. `started_at` is a unix timestamp and `uptime_secs` is the seconds since.
+`status` is `"healthy"`, or `"bootstrapping"` on a replica that holds no content yet and is therefore refusing content reads. `role` is `"master"`, `"replica"`, or `"standalone"` (no `[replication]` section) — the same three values the replication status reports. `writable` says whether a write sent to this node would be accepted at all, so a failover-aware client can read it once instead of learning it from a `423`. `started_at` is an RFC 3339 date-time, like every timestamp on this API, and `uptime_secs` is the seconds since.
 
 The response is always `200`, including while bootstrapping: the status code answers "is this process alive enough to reply", and *what* it can serve is the body's job to say. Collapsing the two would force a caller that only wants the version to interpret a `503`, and would hide the one state a bootstrapping node most needs to report.
 
@@ -533,6 +533,8 @@ Replication is a single-writer, pull-based Git-object replication system. `GET /
 
 A replica **never destroys its own data on its own**. A repository whose history is ahead of, or diverged from, its master's is kept, served, locked out of replication, and reported as an issue; a listing that would delete more than half of a replica's repositories is refused and reported. Recovery is an operator's decision — see the runbook in [REPLICATION.md](REPLICATION.md).
 
+**Promotion is a config swap.** Any replica becomes the master by setting `role = "master"`, removing `master_url`, adding `[hooks]`, and restarting: its repositories are complete object stores and its `.replication.json` already holds the data-set identity, so the other replicas follow it by changing `master_url` alone. The step-by-step runbook, including how the old master comes back and how lost writes surface as `replica_ahead` issues, is in [REPLICATION.md](REPLICATION.md#promotion-making-a-replica-the-master).
+
 The complete status schema, peer endpoints, identity pairing, reconciliation algorithm, replication safety properties, and operational failure modes are documented in [REPLICATION.md](REPLICATION.md).
 
 ## Configuration (`config.toml`)
@@ -684,6 +686,8 @@ Log verbosity priority: `RUST_LOG` env var → `log_level` in config → `"info"
 - **Stale `.git/index.lock` cleanup** — removed at startup across all repos, and before each maintenance index refresh (removed if older than 30 s). The write path itself no longer touches the index, so a stale lock can never block writes.
 - **The health surface is public, and it is the only thing on `/v1` that is** — `GET /v1/_health/status` and `GET /v1/_health/replication` take no `Authorization` header, because their audience is exactly the set of callers that does not hold the product's API key: a load balancer picking a node, a rollout probe, a failover-aware client asking which node takes writes, monitoring covering a whole deployment. Requiring `server.api_key` there turns a health probe into a secret-distribution problem and copies the content credential into every monitor, for an answer that reveals nothing about content. `GET /v1` stays the *authenticated* probe and remains the way to verify a key. What keeps the exemption honest is what these routes may say: neither names a tenant, opens a repository, or resolves a path, so the public surface is metadata about the process and the node set, never about the data. `status` goes further and performs no I/O at all — config plus atomics — so an anonymous caller cannot make this node do work by polling it; `replication` does describe topology (peer node ids, the master's URL with credentials stripped, the data-set identity, a repository count), which is not a credential but is a reason to keep the content port off the public internet. They are **nested outside both middleware layers** rather than exempted inside them, so neither the API-key guard nor the replica read-only guard ever sees them — that ordering is load-bearing in `build_router`, and it is also what removes the read-only guard's old hand-written exception list: a cold replica answering `503` to every content read still answers both of these, which is how an operator finds out why. The `_health` prefix takes one segment, so only those two exact paths are reserved and `/v1/_health/{tenant_id}/...` still routes to the ordinary tenant routes.
 - **Replication is pull-based and read-only** — replicas copy Git objects from their configured master, serve exact Git-backed reads once caught up, and never accept content writes. See [REPLICATION.md](REPLICATION.md) for the protocol, safety invariants, configuration, and operations guidance.
+- **Promotion is a config swap, by design** — a replica becomes the master by flipping `role`, removing `master_url`, adding `[hooks]`, and restarting. Three properties make that sufficient, and each is a constraint the rest of the code has to keep: every write is built from HEAD's tree and the object database (the working tree is only mirrored afterwards, and delete/move tolerate a file that was never mirrored), so a repository that was only ever pulled is writable as-is; a replica keeps *full* history, not a shallow copy, so the commit routes work on the promoted node; and `.replication.json` holds the same data-set identity on every node of a set, so followers re-point with a `master_url` change and never re-pair. The shipped `config.toml` is standalone precisely so that becoming a master is always something an operator chose.
+- **Every timestamp on the wire is RFC 3339** — `started_at`, every `*_at` in the health bodies, and every issue's `since` are emitted as `2026-06-16T10:00:00Z`, the spelling `committed_at` set. Internally they stay unix `i64` (atomics cannot hold a `DateTime`) and are converted once at the edge by the `replication::rfc3339` serde adapter, which also parses them back when a replica caches its master's health.
 - **`git2` compiled with `vendored-libgit2`** — libgit2 is bundled in the binary; no system dependency needed.
 
 ## Webhook payloads
@@ -802,12 +806,14 @@ cargo run -- -c /etc/githttp-fs.toml
 RUST_LOG=debug cargo run                     # overrides log_level in config
 ```
 
+`config.toml` is a **standalone** node (no `[replication]` section) and is the file the Docker image and the Debian package install as `/etc/githttp-fs.toml`, so the shipped default opens no replication listener and holds no replication secret.
+
 ### Running a master and a replica side by side
 
-The repo ships two dev configs so both roles can run at once on one machine:
+The repo ships two further dev configs so both roles can run at once on one machine:
 
 ```sh
-cargo run                                    # master:  api :5355, replication :5356
+cargo run -- -c config.master.toml           # master:  api :5355, replication :5356
 cargo run -- -c config.replica.toml          # replica: api :5365, replication :5366
 ```
 

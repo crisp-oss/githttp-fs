@@ -95,7 +95,7 @@ pub async fn health_status(State(state): State<AppState>) -> impl IntoResponse {
         // answers `423` to every write, so a failover-aware client can read
         // this once instead of discovering it from a rejection.
         "writable": !replica_status.is_replica(),
-        "started_at": state.started_at,
+        "started_at": crate::replication::rfc3339::format(state.started_at),
         "uptime_secs": (now - state.started_at).max(0),
     }))
 }

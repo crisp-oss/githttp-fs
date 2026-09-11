@@ -1,0 +1,87 @@
+# githttp-fs — development config for the MASTER node of a replicated pair.
+#
+# Runs alongside config.replica.toml, which follows this node:
+#
+#   cargo run -- -c config.master.toml    # master:  api :5355, replication :5356
+#   cargo run -- -c config.replica.toml   # replica: api :5365, replication :5366
+#
+# Both nodes share `server.api_key`, so the same client credential reads from
+# either one — which is the point of a replica, and what lets you test failover
+# by pointing a client at :5365 and killing the master.
+#
+# This is NOT the file the packages ship as /etc/githttp-fs.toml — that is
+# config.toml, a standalone node. A master is something an operator sets up on
+# purpose, with a secret of their own.
+
+[server]
+
+host = "0.0.0.0"
+port = 5355
+
+api_key = "MySecretAPIKey"
+
+# Each node needs its own store: they are separate copies of the same content,
+# not two processes sharing one directory.
+repos_path = "./dev/repositories/master"
+log_level = "debug"
+
+[limits]
+
+allowed_extensions = ["html", "txt", "toml", "json", "md", "mdx"]
+
+batch_read_maximum_files = 100
+
+[hooks]
+
+url = "https://webhook.site/c086f90d-e2d6-40dc-a925-38179cc33e8d"
+
+events = [
+  "file.created",
+  "file.updated",
+  "file.deleted",
+  "file.moved",
+  "order.updated",
+  "order.deleted"
+]
+
+retry_attempts = 5
+retry_backoff_ms = 2000
+
+[hooks.auth]
+
+header = "Authorization"
+value = "Bearer your-hook-receiver-secret"
+
+[maintenance]
+
+enabled = true
+delay_secs = 86400
+
+# Opt-in pack-count trigger: a repository holding at least this many packfiles
+# runs its maintenance pass at once instead of after delay_secs. A master's
+# writes land as loose objects, so it rarely matters here; it is what keeps a
+# replica fast (see config.replica.toml).
+# maximum_packs = 32
+
+[replication]
+
+# This node accepts writes and serves replicas.
+role = "master"
+
+# Guards the replication server, and is what a replica presents to reach it.
+# Called `secret` rather than `api_key` because no caller of the product's API
+# ever holds it: it authenticates githttp-fs to githttp-fs.
+secret = "MyReplicationSecret"
+
+# The replication protocol gets its own HTTP server on its own port, serving
+# /_replication and nothing else. That is deliberate: a proxy pointed at the
+# content port (5355) cannot reach it, so publishing the API cannot publish
+# replication by accident. `host` defaults to server.host — set it to
+# 127.0.0.1 in production where every replica is local.
+port = 5356
+
+# How this node names itself in the roster at GET /v1/_health/replication and
+# in every log line about it. Required, and unique per deployment: a master
+# refuses a second notification stream claiming a node id that is already
+# connected from another process. Telemetry only; `secret` is what guards.
+node_id = "master-1"

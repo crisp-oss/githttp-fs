@@ -1,8 +1,8 @@
 # githttp-fs — development config for the REPLICA node.
 #
-# Follows the master described by config.toml. Start the master first:
+# Follows the master described by config.master.toml. Start the master first:
 #
-#   cargo run                             # master: api :5355, replication :5356
+#   cargo run -- -c config.master.toml    # master:  api :5355, replication :5356
 #   cargo run -- -c config.replica.toml   # replica: api :5365, replication :5366
 #
 # Watch it converge:

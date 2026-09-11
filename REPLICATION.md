@@ -13,7 +13,7 @@ Replication is deliberately separate from webhook delivery. Webhooks project fil
 - **One repository is atomic:** objects are imported before its ref is advanced. An interrupted pull leaves the local repository entirely at either its prior HEAD or its new HEAD.
 - **Chains are supported:** a caught-up replica exposes the same replication listener and may act as another replica's upstream.
 
-The protocol intentionally has no automatic write failover or history merge. Promoting a node is a manual operational decision: two nodes accepting writes would create divergent histories that this service does not merge.
+The protocol intentionally has no automatic write failover or history merge. Promoting a node is a manual operational decision: two nodes accepting writes would create divergent histories that this service does not merge. It is, however, designed to be a **config swap and a restart, nothing more** — see [Promotion](#promotion-making-a-replica-the-master).
 
 ```mermaid
 sequenceDiagram
@@ -217,26 +217,28 @@ Every role—master, replica, and standalone—answers the content API endpoint.
     "node_id": "master-eu",
     "url": null,
     "reachable": true,
-    "last_contact_at": 1789120589,
+    "last_contact_at": "2026-06-16T10:03:09Z",
     "last_error": null
   },
   "replicas": [
     {
       "node_id": "replica-1",
       "stream_connected": true,
-      "connected_at": 1789120539,
-      "last_contact_at": 1789120589,
+      "connected_at": "2026-06-16T10:02:19Z",
+      "last_contact_at": "2026-06-16T10:03:09Z",
       "packs_delivered": 12,
       "repositories": 26,
       "pending_repositories": 0,
       "sync": "synced",
-      "reported_at": 1789120589
+      "reported_at": "2026-06-16T10:03:09Z"
     }
   ],
-  "observed_at": 1789120599,
-  "replicas_observed_at": 1789120589
+  "observed_at": "2026-06-16T10:03:19Z",
+  "replicas_observed_at": "2026-06-16T10:03:09Z"
 }
 ```
+
+Every timestamp in this body — and in every other body on this API — is an RFC 3339 date-time in UTC, the same spelling as `committed_at` on the commit routes.
 
 ### Status, and what to alert on
 
@@ -322,6 +324,24 @@ Replicas do not have working trees; they serve reads directly from Git's object 
 - After each successful apply, a replica publishes a replication notification so downstream replicas can chain from it.
 
 Replicas arm ordinary maintenance after an apply because every sync adds a pack. `maintenance.destructive_prune = true` is safe on replicas: any pruned unreachable object can be fetched again. Set `maintenance.maximum_packs` on a replica: with it, a repository that reaches that many packs runs its pass immediately rather than after `delay_secs`, which is what keeps a busy replicated tenant from carrying hundreds of packs — each one another index libgit2 consults on every object lookup — for a day at a time.
+
+## Promotion: making a replica the master
+
+When the master is lost, any replica can become the new master by **swapping its configuration and restarting**. No data step is involved, because everything a master needs is already on the replica's disk:
+
+- Its repositories are complete Git object stores with a HEAD. The write path builds every commit from HEAD's tree and the object database, and merely mirrors files into the working tree afterwards as a courtesy — and the delete and move paths tolerate a file that was never mirrored. A promoted node's working trees fill in file by file as writes land, and nothing reads them.
+- Its `.replication.json` holds the data-set identity it pinned from the old master. Serving that same identity as a master is exactly what lets every other replica follow the promoted node **without re-pairing**, and what lets the old master come back as a replica of it.
+
+The procedure, in order:
+
+1. **Make sure the old master takes no more writes.** Stop it, or cut it off from clients. Two nodes accepting writes fork history, and nothing here merges a fork. Do this first, before anything else.
+2. **Choose the replica to promote.** Read `GET /v1/_health/replication` on each candidate: prefer `replica.sync` of `synced`, the newest `replica.last_success_at`, `pending_repositories` of `0`, and no `issues`. Whatever it holds at that moment is what the new master starts from — writes the old master accepted after this replica's last successful pass are lost unless recovered from the old master by hand (step 5).
+3. **Swap its config and restart.** In `[replication]`: set `role = "master"` and **remove `master_url`** (a master with a `master_url` is rejected at startup, so flipping `role` alone fails on purpose). Keep `secret`, `node_id`, `host`, `port` and `repos_path` exactly as they are. Add what a master reads and a replica did not need: `[hooks]` and `limits.allowed_extensions`, copied from the old master's config. `poll_interval_secs`, `parallelism`, `reconnect_backoff_ms` and `deletion_guard` are replica-only and ignored on a master. Restart. The node comes up as a master, keeps its identity, serves its listing, and accepts writes at once.
+4. **Repoint the other replicas.** Change `master_url` on each to the promoted node's **replication** listener and restart them. Their pinned identity matches, so they continue where they were. A replica that happened to be *ahead* of the promoted node for some repository (it pulled a commit from the old master that the promoted node never got) locks that repository as `replica_ahead` and keeps serving it; resolve it per [the no-wipe rule](#fast-forward-locking-and-the-no-wipe-rule) — delete its local copy to take the new master's history, or re-apply the missing writes on the new master through the API so its head moves past.
+5. **Bring the old master back as a replica, if at all.** Never as a master. Swap its config to `role = "replica"` with `master_url` pointing at the promoted node, drop `[hooks]`, and restart. Its `.replication.json` holds the same identity, so it pairs without ceremony. Every repository that received a write after the promoted replica's last pull comes up `replica_ahead` — that list *is* the set of lost writes, with both heads named in `issues`. Recover them by reading the files from the old node's content API (it serves its local copy while locked) and re-writing them on the new master, then remove the old node's local copies so they re-clone.
+6. **Replay webhooks.** No hooks fired for anything committed while there was no master, and none fire for the promoted node's existing content. Reconcile downstream mirrors with `POST /v1/:collection_id/:tenant_id/batch/replay/hook` on the new master.
+
+Do not delete `.replication.json` on any node during a promotion: it is what makes the swap need no re-pairing, and deleting it on the promoted node would generate a fresh identity that every replica then refuses.
 
 ## Failure handling and operator guidance
 
