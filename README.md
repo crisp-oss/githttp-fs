@@ -151,9 +151,10 @@ Use the sample [config.toml](https://github.com/crisp-oss/githttp-fs/blob/master
 * `destructive_prune` (type: _boolean_, allowed: `true`, `false`, default: `false`) — Whether the maintenance repack may permanently drop unreachable Git objects (garbage left behind by interrupted writes); commit history and past file versions are never affected either way, but with the default `false` maintenance retains every object and can never destroy data
 * `maximum_packs` (type: _number_, allowed: `2` or more, no default) — Opt-in pack-count trigger: when a repository holds at least this many packfiles, its maintenance pass runs immediately on the next write (or replicated pack apply) instead of after `delay_secs`. Meant for replicas, where every replicated delta arrives as one more pack and object lookups slow down with each; a master's writes land as loose objects, so on a master it rarely fires. Unset means the timer alone decides
 
-### Considerations
+### Read more
 
-How read-only replicas behave, why two health routes are public, and the one file githttp-fs reserves inside a tenant repository: see [CONSIDERATIONS.md](CONSIDERATIONS.md).
+* [CONSIDERATIONS.md](CONSIDERATIONS.md) — how read-only replicas behave, why two health routes are public, and the one file githttp-fs reserves inside a tenant repository
+* [REPLICATION.md](REPLICATION.md) — the replication peer protocol: wire formats, reconciliation, safety guarantees, failure handling, and the promotion runbook
 
 ## :fire: Report A Vulnerability
 
