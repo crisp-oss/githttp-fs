@@ -45,7 +45,7 @@
 //! reverts reuse existing blob oids outright (no content rehash).
 
 use chrono::{DateTime, Utc};
-use git2::build::TreeUpdateBuilder;
+use git2::build::{CheckoutBuilder, TreeUpdateBuilder};
 use git2::{
     Delta, DiffFindOptions, DiffFormat, DiffOptions, FileMode, Oid, Repository, Signature, Sort,
 };
@@ -5475,11 +5475,10 @@ impl GitReplication {
     /// therefore a permanently divergent history — from its master. A replica
     /// only ever holds commits it was handed.
     ///
-    /// The working tree is deliberately not checked out. Reads are answered
-    /// from HEAD's tree throughout this codebase, so a replica needs only the
-    /// object store; mirroring files on every sync would cost disk and time
-    /// for nobody's benefit. The visible consequence is that `git status`
-    /// inside a replica repository reports every file as deleted.
+    /// The working tree is mirrored onto HEAD once the ref has moved, so a
+    /// replica repository looks on disk exactly like a master one — see
+    /// [`GitReplication::mirror_working_tree`] for why that is worth the
+    /// walk, and why a failure to do it never fails the sync.
     pub fn apply_pack(
         repo_path: &Path,
         pack_path: &Path,
@@ -5559,10 +5558,86 @@ impl GitReplication {
             &format!("replication: fast-forward to {}", new_head),
         )?;
 
+        // The ref has moved, so the repository is already correct as far as
+        // every read path is concerned; the working tree is the courtesy
+        // that follows, and it is deliberately not allowed to fail the
+        // apply.
+        Self::mirror_repository(repo_path, &repo);
+
         Ok(PackApply::FastForwarded {
             from: local_head.map(|oid| oid.to_string()),
             to: new_head.to_string(),
         })
+    }
+
+    /// Checks a replicated repository's working tree out to HEAD.
+    ///
+    /// A replica needs only the object store to answer reads — HEAD's tree is
+    /// authoritative everywhere in this codebase — but a master keeps its
+    /// working tree mirrored so that a human can `ls` a tenant and see its
+    /// files, and a replica that did not would be the odd one out: the same
+    /// content, present on one node and invisible on the other, with `git
+    /// status` reporting every file as deleted.
+    ///
+    /// It is a full checkout rather than a diff of the two commits, which
+    /// would be the cheaper mirror (the write path mirrors file by file for
+    /// exactly that reason). A checkout *converges*: whatever the working
+    /// tree held before — nothing at all, because this node predates this
+    /// behaviour, or a half-written state left by a killed process — one pass
+    /// makes it HEAD, where a delta would faithfully apply one commit's worth
+    /// of changes on top of a tree that was never correct. Its cost is a
+    /// `stat` walk of the tenant per landed pack, paid on a node that just
+    /// wrote a packfile, and nothing is written when nothing differs.
+    ///
+    /// Untracked files are removed, because a replica's working tree is
+    /// wholly server-owned: anything there that HEAD does not name is a file
+    /// the upstream deleted, and leaving it would make the directory listing
+    /// a human reads disagree with every API response.
+    ///
+    /// Failure is logged and swallowed. The working tree is a courtesy on
+    /// every node, so a checkout that cannot run (a permission problem, a
+    /// file held open) must not turn a correctly applied pack into a sync
+    /// failure that is retried forever.
+    pub fn mirror_working_tree(repo_path: &Path) {
+        let Ok(repo) = Repository::open(repo_path) else {
+            return;
+        };
+
+        Self::mirror_repository(repo_path, &repo);
+    }
+
+    /// The body of [`GitReplication::mirror_working_tree`], for callers that
+    /// already hold the repository open.
+    fn mirror_repository(repo_path: &Path, repo: &Repository) {
+        // Nothing to mirror before the first pack lands a ref.
+        if repo.head().ok().and_then(|head| head.target()).is_none() {
+            return;
+        }
+
+        if let Err(err) = GitLocks::cleanup_stale_index_lock(repo_path) {
+            tracing::warn!(
+                path = %repo_path.display(),
+                err = %err,
+                "cannot clear stale index lock before mirroring the working tree"
+            );
+        }
+
+        let mut checkout = CheckoutBuilder::new();
+
+        // `force` writes over whatever is on disk, and `remove_untracked`
+        // takes away what HEAD no longer names — together they are what make
+        // the pass converge from any prior state. The index is updated as
+        // well (libgit2's default), which is what keeps `git status` clean
+        // between maintenance passes.
+        checkout.force().remove_untracked(true);
+
+        if let Err(err) = repo.checkout_head(Some(&mut checkout)) {
+            tracing::warn!(
+                path = %repo_path.display(),
+                err = %err,
+                "cannot mirror the working tree onto HEAD"
+            );
+        }
     }
 
     /// Relates `remote_sha` to this repository's HEAD using local objects
