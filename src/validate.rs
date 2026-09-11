@@ -226,3 +226,60 @@ pub fn file_or_folder_path(raw: &str) -> Result<&str, AppError> {
 
     Ok(path)
 }
+
+// Replication peers label themselves with a node id; the default is
+// `host:port`, so the character set has to admit what an address can hold
+// (dots, colons, IPv6 brackets) on top of the tenant-id alphabet.
+const MAX_NODE_ID_LEN: usize = 64;
+
+// A replication identity is 32 random bytes, hex-encoded lowercase.
+const IDENTITY_LEN: usize = 64;
+
+/// Replication node identifiers are self-asserted labels that end up in log
+/// lines, health bodies, and a roster kept in memory for the life of the
+/// process. Bounding their length and alphabet keeps a peer from filling that
+/// roster or injecting control characters into logs.
+pub fn node_id(raw: &str) -> Result<&str, AppError> {
+    let valid_length = !raw.is_empty() && raw.len() <= MAX_NODE_ID_LEN;
+
+    let valid_chars = raw.bytes().all(|byte| {
+        matches!(
+            byte,
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b':' | b'[' | b']'
+        )
+    });
+
+    if valid_length && valid_chars {
+        Ok(raw)
+    } else {
+        Err(AppError::InvalidOperation {
+            reason: format!(
+                "node id must be 1-{} characters of [A-Za-z0-9._:-] (IPv6 brackets allowed): {}",
+                MAX_NODE_ID_LEN, raw
+            ),
+        })
+    }
+}
+
+/// A replication data-set identity: exactly 64 lowercase hexadecimal
+/// characters, the encoding `replication::ReplicationIdentity` generates.
+/// Strict on purpose — this value is pinned on disk and compared byte for
+/// byte, so two spellings of one identity must not be able to exist.
+pub fn replication_identity(raw: &str) -> Result<&str, AppError> {
+    let valid_length = raw.len() == IDENTITY_LEN;
+
+    let valid_chars = raw
+        .bytes()
+        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+
+    if valid_length && valid_chars {
+        Ok(raw)
+    } else {
+        Err(AppError::InvalidOperation {
+            reason: format!(
+                "replication identity must be {} lowercase hexadecimal characters",
+                IDENTITY_LEN
+            ),
+        })
+    }
+}

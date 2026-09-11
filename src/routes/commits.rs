@@ -206,6 +206,14 @@ pub async fn revert_commit(
 
     // Enqueued while the tenant write lock is still held, so per-tenant hook
     // order always matches commit order.
+    // Announced to replicas under the same lock. Unlike the hook job
+    // this is a latency hint rather than a source of truth: a replica
+    // reacts by pulling, so a dropped announcement costs nothing but
+    // the wait for its next reconcile.
+    state
+        .replication
+        .repository_updated(&collection_id, &tenant_id, &new_commit_sha);
+
     state.hook_queue.enqueue(
         &lock_key,
         HookJob::new(
@@ -300,6 +308,14 @@ pub async fn rollback_commit(
     if !file_changes.is_empty() {
         // Enqueued while the tenant write lock is still held, so per-tenant
         // hook order always matches commit order.
+        // Announced to replicas under the same lock. Unlike the hook job
+        // this is a latency hint rather than a source of truth: a replica
+        // reacts by pulling, so a dropped announcement costs nothing but
+        // the wait for its next reconcile.
+        state
+            .replication
+            .repository_updated(&collection_id, &tenant_id, &new_commit_sha);
+
         state.hook_queue.enqueue(
             &lock_key,
             HookJob::new(

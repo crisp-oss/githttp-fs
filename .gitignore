@@ -5,6 +5,7 @@
 
 target/
 
-dev/repositories/*
+dev/repositories/*/*
+!dev/repositories/*/.gitkeep
 
 .claude/

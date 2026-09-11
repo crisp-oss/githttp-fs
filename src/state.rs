@@ -35,6 +35,9 @@ use tokio::sync::Mutex;
 use crate::config::Config;
 use crate::hooks::HookQueue;
 use crate::maintenance::MaintenanceScheduler;
+use crate::replication::{
+    ReplicaRegistry, ReplicaStatus, ReplicationIdentity, ReplicationNotifier, RepositoryIndex,
+};
 
 /// A cloneable handle to the per-tenant write lock.
 /// Read operations do not acquire this lock.
@@ -48,10 +51,34 @@ pub type RepoLock = Arc<Mutex<()>>;
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    /// When this process started, as a unix timestamp. Recorded once here
+    /// rather than measured per request so the public status route can report
+    /// an uptime without reaching for the clock's origin every time.
+    pub started_at: i64,
     /// Per-tenant ordered hook delivery queues.
     pub hook_queue: Arc<HookQueue>,
     /// Per-tenant background maintenance timers.
     pub maintenance: Arc<MaintenanceScheduler>,
+    /// Fan-out of commit notifications to connected replicas. Present on
+    /// every node but inert unless `[replication]` is configured, so write
+    /// handlers can announce unconditionally without branching.
+    pub replication: Arc<ReplicationNotifier>,
+    /// What this node reports about its own replication state, read by the
+    /// ping route and the read-only guard. Inert on a non-replica.
+    pub replica_status: Arc<ReplicaStatus>,
+    /// The replicas that have introduced themselves to this node, and what it
+    /// has observed of them. Only a master ever populates it; on a replica it
+    /// stays empty, since a replica's roster comes from its master rather
+    /// than from its own observations.
+    pub replica_registry: Arc<ReplicaRegistry>,
+    /// Every repository this node holds with its HEAD sha, kept current by
+    /// the notifier on each commit and deletion so the replication routes
+    /// never have to open every repository per request.
+    pub repository_index: Arc<RepositoryIndex>,
+    /// The data-set identity this node generated (master) or pinned
+    /// (replica), from `.replication.json`. Empty on a standalone node and
+    /// on a replica that has not paired yet.
+    pub identity: Arc<ReplicationIdentity>,
     /// Lazily-created mutex per tenant to serialize git write operations.
     /// Keyed as `"collection_id/tenant_id"` — the same composite key used for
     /// hook queues and maintenance slots, so all three subsystems agree on
@@ -61,12 +88,22 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(config: Config) -> Self {
+    /// `identity` is loaded (or generated) by `main` before the state exists,
+    /// because reading `.replication.json` can fail and a failure there has
+    /// to stop the process rather than surface as a half-built state.
+    pub fn new(config: Config, identity: ReplicationIdentity) -> Self {
         let config = Arc::new(config);
+        let repository_index = Arc::new(RepositoryIndex::new(&config));
 
         Self {
+            started_at: chrono::Utc::now().timestamp(),
             hook_queue: Arc::new(HookQueue::new(config.clone())),
             maintenance: Arc::new(MaintenanceScheduler::new(config.clone())),
+            replication: Arc::new(ReplicationNotifier::new(&config, repository_index.clone())),
+            replica_status: Arc::new(ReplicaStatus::new(&config)),
+            replica_registry: Arc::new(ReplicaRegistry::new()),
+            repository_index,
+            identity: Arc::new(identity),
             config,
             repo_locks: Arc::new(DashMap::new()),
         }

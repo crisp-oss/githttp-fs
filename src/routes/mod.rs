@@ -19,14 +19,21 @@
 //!    guarantees hook delivery order equals commit order.
 //! 5. **Arm background maintenance** for the repository (no-op when a pass
 //!    is already pending).
+//! 6. **Announce the new HEAD to replicas** (`state.replication`), also
+//!    under the lock. Unlike the hook job this carries no ordering
+//!    guarantee and needs none — a replica reacts by asking what the
+//!    current state is, so the announcement is a latency hint, never a
+//!    source of truth. It is inert unless `[replication]` is configured.
 //!
 //! Read handlers skip steps 2, 4, and 5 — they never lock, because they only
 //! read immutable git objects reachable from HEAD.
 
 pub mod commits;
 pub mod files;
+pub mod health;
 pub mod order;
 pub mod replay;
+pub mod replication;
 pub mod root;
 pub mod tenant;
 

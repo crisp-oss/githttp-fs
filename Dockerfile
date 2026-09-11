@@ -41,4 +41,8 @@ COPY --from=build /app/config.toml /etc/githttp-fs.toml
 
 CMD [ "githttp-fs", "-c", "/etc/githttp-fs.toml" ]
 
-EXPOSE 5355
+# Expose for master ports
+EXPOSE 5355 5356
+
+# Expose for replica ports
+EXPOSE 5365 5366

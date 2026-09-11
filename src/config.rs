@@ -7,7 +7,8 @@
 //! TOML configuration types and startup validation.
 //!
 //! The structs here mirror the sections of `config.toml` one-to-one
-//! (`[server]`, `[limits]`, `[hooks]`, `[hooks.auth]`, `[maintenance]`)
+//! (`[server]`, `[limits]`, `[hooks]`, `[hooks.auth]`, `[maintenance]`,
+//! `[replication]`)
 //! and are deserialised by serde. Two conventions run through the whole
 //! module:
 //!
@@ -20,6 +21,7 @@
 //! - **Optional sections have safe defaults.** `[hooks]` omitted means "no
 //!   webhooks" (writes still work, nothing is delivered). `[maintenance]`
 //!   omitted means "enabled, 24 h delay" via the `Default` impl.
+//!   `[replication]` omitted means "standalone node".
 
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -41,6 +43,10 @@ pub struct Config {
     pub hooks: Option<HooksConfig>,
     #[serde(default)]
     pub maintenance: MaintenanceConfig,
+    /// Read-only replication. Absent means this node is standalone: it
+    /// serves no replication surface and follows no master, which is
+    /// exactly how every deployment behaved before the feature existed.
+    pub replication: Option<ReplicationConfig>,
 }
 
 impl Config {
@@ -58,6 +64,10 @@ impl Config {
         }
 
         self.maintenance.collect_errors(&mut errors);
+
+        if let Some(replication) = &self.replication {
+            replication.collect_errors(&mut errors, &self.server);
+        }
 
         if errors.is_empty() {
             Ok(())
@@ -204,6 +214,188 @@ impl ServerConfig {
                 self.repos_path.display(),
                 create_err
             ));
+        }
+    }
+}
+
+/// Which side of a replication pair this node is.
+///
+/// The two roles are not symmetric in what they *serve* — a replica serves
+/// the replication surface too, so replicas can chain off one another — but
+/// only a replica runs a follower that pulls from somewhere else.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationRole {
+    #[serde(rename = "master")]
+    Master,
+    #[serde(rename = "replica")]
+    Replica,
+}
+
+/// Read-only replication.
+///
+/// The section is optional, and its absence is the historical behaviour:
+/// no replication routes are mounted, no follower runs, nothing changes.
+///
+/// `api_key` is deliberately separate from `server.api_key`. The
+/// replication surface hands out whole repositories as packfiles and, on a
+/// master, a live notification stream — a different grant with a different
+/// blast radius from the content API, so it gets a credential that can be
+/// rotated and network-restricted on its own.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ReplicationConfig {
+    pub role: ReplicationRole,
+    /// Guards the replication server on this node, and is sent as the Bearer
+    /// token when this node is a replica pulling from its master.
+    ///
+    /// Named `secret` rather than `api_key` because it is not an API key in
+    /// the sense `server.api_key` is: no caller of the product's API ever
+    /// holds it, it is never handed to an application, and it authenticates
+    /// githttp-fs to githttp-fs. Two keys in one config file called the same
+    /// thing is an invitation to paste the wrong one.
+    pub secret: String,
+    /// How this node names itself to its peers, so an operator reading the
+    /// health route sees meaningful names instead of anonymous rows.
+    ///
+    /// This is **telemetry, not authentication** — `api_key` is what guards
+    /// the replication surface. A node id only ever labels a row in a
+    /// roster, so a node that lies about its own can mislead a dashboard and
+    /// nothing more. Keeping it out of the auth path is what lets it stay
+    /// optional and self-asserted, which preserves the property that a
+    /// replica needs no registration on its master: it joins by connecting.
+    ///
+    /// Defaults to `"host:port"`, which is deterministic across restarts (so
+    /// a roster row survives a reboot instead of forking into two) and is
+    /// usually already meaningful. Override it where the bind address is not
+    /// how peers see this node — behind NAT, in a container, or when several
+    /// nodes share a host.
+    pub node_id: Option<String>,
+    /// Base URL of the master's **replication server** — its `[replication]
+    /// host`/`port`, not the content API's. Required on a replica, rejected
+    /// on a master (a master that names a master is a config mistake worth
+    /// failing at startup rather than silently ignoring).
+    pub master_url: Option<String>,
+    /// Address the replication server binds. Defaults to `server.host`.
+    ///
+    /// Set it to `127.0.0.1` where every replica is local, or to a private
+    /// interface address where they are not: the separate port already keeps
+    /// this surface off whatever proxies the content API, and binding narrowly
+    /// closes the gap the rest of the way.
+    pub host: Option<String>,
+    /// Port the replication server binds. Defaults to 5356.
+    #[serde(default = "default_replication_port")]
+    pub port: u16,
+    /// How often a replica runs a full reconcile pass against the master's
+    /// repository listing. This is the *convergence* path: notifications are
+    /// disposable hints, so this interval — not the notification stream — is
+    /// what bounds how long a replica can stay wrong.
+    #[serde(default = "default_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// How many repositories a replica syncs concurrently during catch-up.
+    /// Repositories are independent, so this fans out freely; the bound
+    /// exists to stop a returning replica from stampeding its master.
+    #[serde(default = "default_replication_parallelism")]
+    pub parallelism: usize,
+    /// Base delay before a replica re-dials a dropped notification stream.
+    /// Backoff doubles up to a minute.
+    #[serde(default = "default_reconnect_backoff_ms")]
+    pub reconnect_backoff_ms: u64,
+}
+
+fn default_poll_interval_secs() -> u64 {
+    60
+}
+
+fn default_replication_parallelism() -> usize {
+    4
+}
+
+fn default_reconnect_backoff_ms() -> u64 {
+    1_000
+}
+
+fn default_replication_port() -> u16 {
+    5356
+}
+
+impl ReplicationConfig {
+    pub fn is_replica(&self) -> bool {
+        self.role == ReplicationRole::Replica
+    }
+
+    /// This node's id, falling back to `host:port` when unset.
+    pub fn node_id(&self, server: &ServerConfig) -> String {
+        match &self.node_id {
+            Some(node_id) => node_id.clone(),
+            None => format!("{}:{}", server.host, server.port),
+        }
+    }
+
+    /// Address the replication server binds, falling back to `server.host`.
+    pub fn host(&self, server: &ServerConfig) -> String {
+        self.host.clone().unwrap_or_else(|| server.host.clone())
+    }
+
+    fn collect_errors(&self, errors: &mut Vec<String>, server: &ServerConfig) {
+        if self.secret.trim().is_empty() {
+            errors.push("replication.secret must not be empty".to_string());
+        }
+
+        // Caught here rather than left to a confusing "address already in
+        // use" on the second bind — and the whole point of the split is that
+        // these are two different doors.
+        if self.port == server.port {
+            errors.push(format!(
+                "replication.port ({}) must differ from server.port",
+                self.port
+            ));
+        }
+
+        // Held to the same rule peers apply on receipt (`validate::node_id`),
+        // so a node never announces a name its master would discard and show
+        // as anonymous.
+        if let Some(node_id) = &self.node_id {
+            if let Err(err) = crate::validate::node_id(node_id) {
+                errors.push(format!("replication.node_id is invalid: {}", err));
+            }
+        }
+
+        match (self.role, &self.master_url) {
+            (ReplicationRole::Replica, None) => {
+                errors
+                    .push("replication.master_url is required when role is 'replica'".to_string());
+            }
+            (ReplicationRole::Master, Some(_)) => {
+                errors.push(
+                    "replication.master_url must not be set when role is 'master'".to_string(),
+                );
+            }
+            _ => {}
+        }
+
+        if let Some(url) = &self.master_url {
+            match reqwest::Url::parse(url) {
+                Ok(parsed) if parsed.scheme() == "http" || parsed.scheme() == "https" => {}
+                Ok(parsed) => errors.push(format!(
+                    "replication.master_url scheme '{}' is invalid; must be http or https",
+                    parsed.scheme()
+                )),
+                Err(_) => errors.push(format!(
+                    "replication.master_url '{}' is not a valid URL",
+                    url
+                )),
+            }
+        }
+
+        if self.poll_interval_secs < 1 {
+            errors.push("replication.poll_interval_secs must be at least 1".to_string());
+        }
+
+        if self.parallelism < 1 {
+            errors.push("replication.parallelism must be at least 1".to_string());
+        }
+
+        if self.reconnect_backoff_ms < 1 {
+            errors.push("replication.reconnect_backoff_ms must be at least 1".to_string());
         }
     }
 }

@@ -21,22 +21,27 @@ src/
   middleware.rs    — Bearer API key guard (axum middleware)
   seek.rs          — SeekOptions: line-based content windowing for file reads
   order.rs         — per-directory file order index: format, path rules, validation
+  replication.rs   — read-only replication: data-set identity, repository index, change notifier, replica follower, catch-up
   routes/
     mod.rs         — shared request types (AuthorRequest)
     files.rs       — GET/PUT/DELETE/POST on /:collection_id/:tenant_id/files and /:collection_id/:tenant_id/files/*path (POST dispatching on the /move and /reorder suffixes), plus POST /:collection_id/:tenant_id/batch/files/read and GET /:collection_id/:tenant_id/count/files
     order.rs       — GET/PUT/DELETE on /:collection_id/:tenant_id/order and /:collection_id/:tenant_id/order/*path
     replay.rs      — POST /:collection_id/:tenant_id/batch/replay/hook (webhook replay for downstream reconciliation)
+    health.rs      — public (unauthenticated) GET /_health/{status,replication}
+    replication.rs — GET /_replication/{state,health,events,:collection_id/:tenant_id/pack}
     commits.rs     — commit list, commit detail, revert / point-in-time rollback
     tenant.rs      — DELETE /:collection_id/:tenant_id
 ```
 
 ## HTTP API
 
-All routes are prefixed `/v1` and require `Authorization: Bearer <api_key>`.
+All routes are prefixed `/v1` and require `Authorization: Bearer <api_key>` — except the two `/v1/_health/*` routes, which are deliberately public (see [Public health routes](#public-health-routes)).
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/v1` | Check that the API key is valid (`200` with body `{ "pong": true }`, or `401`) |
+| `GET` | `/v1/_health/status` | **No auth.** Basic server status: name, version, role, whether this node accepts writes, uptime |
+| `GET` | `/v1/_health/replication` | **No auth.** Replication status: this node's role, the master's health, and every replica following it. Answers on every node, including a standalone one |
 | `DELETE` | `/v1/:collection_id/:tenant_id` | Delete entire tenant repository |
 | `GET` | `/v1/:collection_id/:tenant_id/files?prefix_path=&maximum_depth=&include_hidden_files=&file_name_starts_with=&include_date_from=&include_date_to=&include_date_type=&apply_order_index=&implicit_order_default_index=&page=&per_page=` | List tracked files as a tree; optional `apply_order_index` (default `false`) orders every level by that directory's stored file order index, and optional `implicit_order_default_index` (a number, unset by default) sets the index an entry the order index does not name is treated as holding — `0` or `-1` lifts every unordered entry *above* the ordered ones, unset leaves them behind them; optional `prefix_path` scopes the listing to a sub-directory (e.g. `?prefix_path=/docs`); optional `maximum_depth` limits how many directory levels deep the listing goes; optional `include_hidden_files` (default `false`) includes dot-prefixed entries; optional `file_name_starts_with` narrows the listing to files *and directories* whose leaf name begins with the given prefix, case-insensitively (a matched directory brings its contents along); it accepts either a bare string or a JSON-array string of prefixes (e.g. `?file_name_starts_with=["intro", "readme"]`), matching an entry whose name begins with *any* of them; optional `include_date_from`/`include_date_to` (RFC 3339 date-times) narrow the listing to files whose git date falls in the half-open window `[from, to)`, and `include_date_type` (`updated` default, or `created`) selects which date is compared; `page`/`per_page` paginate over the root-level entries of the listing (default 100, max 500) |
 | `GET` | `/v1/:collection_id/:tenant_id/count/files?prefix_path=&maximum_depth=&include_hidden_files=&restrict_file_extensions=` | Count files and directories; `prefix_path`, `maximum_depth`, and `include_hidden_files` carry the same semantics as on the file listing route; optional `restrict_file_extensions` (a stringified JSON array, e.g. `["md", "mdx"]`) narrows the file count to files with one of those extensions |
@@ -55,6 +60,24 @@ All routes are prefixed `/v1` and require `Authorization: Bearer <api_key>`.
 | `GET` | `/v1/:collection_id/:tenant_id/commits/:sha` | Commit detail with per-file diffs and snapshots |
 | `POST` | `/v1/:collection_id/:tenant_id/commits/:sha/revert` | Revert a commit |
 | `POST` | `/v1/:collection_id/:tenant_id/commits/:sha/rollback` | Roll the files that commit touched back to the state they had *at* it (point-in-time rollback) |
+
+### Public health routes
+
+`GET /v1/_health/status` and `GET /v1/_health/replication` are the only routes on the content API that take no `Authorization` header. They exist to be readable by things that do not hold — and should not need — the product's API key: a load balancer choosing between nodes, a rollout probe waiting for a new version to answer, a client discovering which node of a replicated set accepts writes, an operator dashboard covering a whole deployment. `GET /v1` remains the *authenticated* probe, and is still the way to verify that a key works.
+
+Neither route names a tenant, opens a repository, or resolves a path, so the public surface stays metadata about the *process and the node set*, never about content. `status` additionally performs no I/O at all — every field is read from the config or from an atomic already in memory — so an anonymous caller cannot make the node do work by polling it. `replication` does describe topology (peer node ids, the master's URL with credentials stripped, the data-set identity, a repository count); none of it is a credential, but a deployment that treats internal hostnames as sensitive should keep the content port off the public internet.
+
+They are nested *outside* both middleware layers rather than exempted inside them, so the API-key guard and the replica read-only guard never see them. A consequence worth having: a cold replica that is answering `503` to every content read still answers both of these, which is how an operator finds out why.
+
+`_health` is the one collection id this API reserves. Only the two exact paths above are taken — `/v1/_health/{tenant_id}/...` still routes to the ordinary tenant routes — so the sole collision is a collection named `_health` holding a tenant named `status` or `replication`.
+
+### Replication API (internal — a second server on its own port)
+
+When `[replication]` is configured, githttp-fs binds a separate peer-only listener (default port `5356`) protected by `Authorization: Bearer <replication.secret>`. It serves `/_replication/{state,health,events,:collection_id/:tenant_id/pack}` and is exposed by masters and replicas so replicas can chain. A replica's `master_url` points to this listener, never the content API port.
+
+`state` and `pack` provide convergence; `events` is a disposable latency hint and `health` is observability. Operators should use `GET /v1/_health/replication`, which serves the identical body without any credential.
+
+See [REPLICATION.md](REPLICATION.md) for the complete peer protocol: authentication, wire formats, versioning, reconciliation, identity pairing, replica behavior, failure handling, and implementation constraints.
 
 ### Request bodies
 
@@ -219,7 +242,44 @@ One assumption the `create` direction makes about the receiver: since its replay
 ```
 Touches no tenant or repository state — safe as a credential probe or liveness check for monitors that hold the key.
 
+On a **replica** the body gains a `replica` object, and only there — a master and a standalone node answer exactly the body above, as they always have:
+```json
+{
+  "pong": true,
+  "replica": {
+    "state": "ready",
+    "stream_connected": true,
+    "last_reconcile_at": 1789055975,
+    "pending_repositories": 0,
+    "reclones": 0
+  }
+}
+```
+
+`state` is `"ready"` or `"bootstrapping"`; `stream_connected` says whether the live notification channel to the master is up (`false` means this node is converging on its poll interval alone); `last_reconcile_at` is when it last compared its whole repository set against the master (`null` before the first pass); `pending_repositories` counts repositories known to be behind; `reclones` counts the times this node discarded a local repository and cloned it afresh because its history no longer descended from the master's (each one destroyed a local copy, so it is worth a dashboard's attention). This is the one route the replica read-only guard always lets through, so a node refusing every other request can still explain why.
+
 Any request to the bare server root `/` (any method, no auth required) is answered with a `308 Permanent Redirect` to `/v1`.
+
+**GET** `/v1/_health/status` — basic server status (no auth)
+```json
+{
+  "status": "healthy",
+  "name": "githttp-fs",
+  "version": "1.10.2",
+  "role": "master",
+  "writable": true,
+  "started_at": 1789055975,
+  "uptime_secs": 4210
+}
+```
+
+`status` is `"healthy"`, or `"bootstrapping"` on a replica that holds no content yet and is therefore refusing content reads. `role` is `"master"`, `"replica"`, or `"standalone"` (no `[replication]` section) — the same three values the replication status reports. `writable` says whether a write sent to this node would be accepted at all, so a failover-aware client can read it once instead of learning it from a `423`. `started_at` is a unix timestamp and `uptime_secs` is the seconds since.
+
+The response is always `200`, including while bootstrapping: the status code answers "is this process alive enough to reply", and *what* it can serve is the body's job to say. Collapsing the two would force a caller that only wants the version to interpret a `503`, and would hide the one state a bootstrapping node most needs to report.
+
+**GET** `/v1/_health/replication` — replication status (no auth)
+
+Byte-identical to what peers read from `/_replication/health` with the replication secret — one struct, one builder, two doors. See [REPLICATION.md](REPLICATION.md) for the full schema.
 
 **GET** `/files` — file listing (tree rooted at the optional `?prefix_path=` folder, or the repo root if omitted)
 ```json
@@ -467,6 +527,12 @@ A rename inside `:sha` rolls back as a rename — one `file.moved` hook, preserv
 
 When no path needs to move (the repository already holds that state), the whole request is a no-op: no commit, no hook, and `commit_sha` is current HEAD. Rolling back *to* the initial commit is legal, unlike reverting it — with no parent, its change set is simply its whole tree.
 
+### Replication
+
+Replication is a single-writer, pull-based Git-object replication system. `GET /v1/_health/replication` is the operator-facing status endpoint — public, like its `status` sibling — and is available on master, replica, and standalone nodes; its replica-only state explains bootstrap progress, stream connectivity, pending repositories, and re-clones.
+
+The complete status schema, peer endpoints, identity pairing, reconciliation algorithm, replication safety properties, and operational failure modes are documented in [REPLICATION.md](REPLICATION.md).
+
 ## Configuration (`config.toml`)
 
 ```toml
@@ -505,6 +571,37 @@ retry_backoff_ms = 2000
 [hooks.auth]          # optional
 header = "Authorization"
 value = "Bearer hook-secret"
+
+[replication]         # optional; omit entirely for a standalone node
+# "master" (serve replicas) or "replica" (follow a master).
+role = "master"
+# Guards the replication server on this node, and is sent as the Bearer token
+# when this node is a replica. Called `secret`, not `api_key`: no caller of the
+# product's API ever holds it — it authenticates githttp-fs to githttp-fs.
+secret = "your-replication-secret"
+# The replication server's own listener. Port defaults to 5356; host defaults
+# to server.host. Set host to 127.0.0.1 (or a private interface) where that
+# suits — the separate port already keeps this surface off whatever proxies
+# the content API, and binding narrowly closes the gap the rest of the way.
+# host = "127.0.0.1"
+# port = 5356
+# How this node names itself to its peers, so the health route shows names
+# rather than anonymous rows. Telemetry, not authentication — `secret` is what
+# guards the surface. Defaults to "host:port". At most 64 characters from
+# [A-Za-z0-9._:-] plus IPv6 brackets; a peer discards anything else and shows
+# the sender as anonymous.
+# node_id = "master-eu"
+# Replica only (required there, rejected on a master). Points at the master's
+# REPLICATION port, not its content port:
+# master_url = "http://master.internal:5356"
+# How often a replica compares its whole repository set against the master's.
+# This is the convergence path — notifications are only a latency hint — so
+# this interval is what bounds how stale a replica can be.
+# poll_interval_secs = 60
+# How many repositories a replica pulls concurrently while catching up.
+# parallelism = 4
+# Base delay before re-dialling a dropped notification stream (doubles to 60s).
+# reconnect_backoff_ms = 1000
 
 [maintenance]         # optional; these are the defaults
 enabled = true
@@ -570,6 +667,8 @@ Log verbosity priority: `RUST_LOG` env var → `log_level` in config → `"info"
 - **Timestamps are named `committed_at`** — follows the `*_at` suffix convention (Stripe, GitHub API, Rails); unambiguous about what the value represents.
 - **`/move` URL suffix on POST** — axum's wildcard router cannot match a fixed suffix after `*path`, so the handler is registered on `POST /*path` and enforces the `/move` suffix internally, returning 400 otherwise.
 - **Stale `.git/index.lock` cleanup** — removed at startup across all repos, and before each maintenance index refresh (removed if older than 30 s). The write path itself no longer touches the index, so a stale lock can never block writes.
+- **The health surface is public, and it is the only thing on `/v1` that is** — `GET /v1/_health/status` and `GET /v1/_health/replication` take no `Authorization` header, because their audience is exactly the set of callers that does not hold the product's API key: a load balancer picking a node, a rollout probe, a failover-aware client asking which node takes writes, monitoring covering a whole deployment. Requiring `server.api_key` there turns a health probe into a secret-distribution problem and copies the content credential into every monitor, for an answer that reveals nothing about content. `GET /v1` stays the *authenticated* probe and remains the way to verify a key. What keeps the exemption honest is what these routes may say: neither names a tenant, opens a repository, or resolves a path, so the public surface is metadata about the process and the node set, never about the data. `status` goes further and performs no I/O at all — config plus atomics — so an anonymous caller cannot make this node do work by polling it; `replication` does describe topology (peer node ids, the master's URL with credentials stripped, the data-set identity, a repository count), which is not a credential but is a reason to keep the content port off the public internet. They are **nested outside both middleware layers** rather than exempted inside them, so neither the API-key guard nor the replica read-only guard ever sees them — that ordering is load-bearing in `build_router`, and it is also what removes the read-only guard's old hand-written exception list: a cold replica answering `503` to every content read still answers both of these, which is how an operator finds out why. The `_health` prefix takes one segment, so only those two exact paths are reserved and `/v1/_health/{tenant_id}/...` still routes to the ordinary tenant routes.
+- **Replication is pull-based and read-only** — replicas copy Git objects from their configured master, serve exact Git-backed reads once caught up, and never accept content writes. See [REPLICATION.md](REPLICATION.md) for the protocol, safety invariants, configuration, and operations guidance.
 - **`git2` compiled with `vendored-libgit2`** — libgit2 is bundled in the binary; no system dependency needed.
 
 ## Webhook payloads
@@ -687,6 +786,58 @@ cargo run                                    # uses config.toml in cwd
 cargo run -- -c /etc/githttp-fs.toml
 RUST_LOG=debug cargo run                     # overrides log_level in config
 ```
+
+### Running a master and a replica side by side
+
+The repo ships two dev configs so both roles can run at once on one machine:
+
+```sh
+cargo run                                    # master:  api :5355, replication :5356
+cargo run -- -c config.replica.toml          # replica: api :5365, replication :5366
+```
+
+Each node has its own store — `dev/repositories/master` and
+`dev/repositories/slave` — because they are separate copies of the same
+content, not two processes sharing a directory. Both are tracked by a
+`.gitkeep` with everything inside them gitignored. They share
+`server.api_key`, so one client credential reads from either node, which is
+what makes failover testable: point a client at `:5365` and kill the master.
+
+```sh
+# Write to the master, read it back from the replica a moment later
+curl -X PUT localhost:5355/v1/docs/acme/files/intro.md \
+  -H 'Authorization: Bearer MySecretAPIKey' -H 'Content-Type: application/json' \
+  -d '{"author":{"name":"V","email":"v@example.com"},"content":"# Hello"}'
+curl localhost:5365/v1/docs/acme/files/intro.md -H 'Authorization: Bearer MySecretAPIKey'
+
+# Who is following whom, and how far behind (no credential needed)
+curl localhost:5355/v1/_health/replication
+
+# What each node is running, and which of them takes writes
+curl localhost:5355/v1/_health/status
+curl localhost:5365/v1/_health/status
+
+# Writes to the replica answer 423
+curl -X PUT localhost:5365/v1/docs/acme/files/x.md -H 'Authorization: Bearer MySecretAPIKey' \
+  -H 'Content-Type: application/json' -d '{"author":{"name":"V","email":"v@example.com"},"content":"x"}'
+```
+
+The replica config carries only what a read-only node actually reads, so the
+two files are not near-copies of each other. It sets `poll_interval_secs = 10`
+(rather than the default 60) so convergence is visible while developing, and
+`destructive_prune = true`, which is safe on a replica since anything dropped
+can be fetched again. Three things are deliberately absent:
+
+- **`[hooks]`** — hook delivery belongs to the node that accepted the commit,
+  and nothing on a replica enqueues one.
+- **`limits.allowed_extensions`** — read only on file writes and move
+  destinations, all of which answer `423` on a replica before a handler runs.
+- **a second `api_key`** — it shares the master's, so one client credential
+  reads from either node.
+
+`limits.batch_read_maximum_files` *is* kept, because `POST /batch/files/read`
+is the one write-shaped route a replica serves and that key caps it — a useful
+reminder that "write-shaped" and "write" are different questions on this API.
 
 ## Development workflow
 

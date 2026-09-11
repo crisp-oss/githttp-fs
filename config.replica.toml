@@ -1,0 +1,75 @@
+# githttp-fs — development config for the REPLICA node.
+#
+# Follows the master described by config.toml. Start the master first:
+#
+#   cargo run                             # master: api :5355, replication :5356
+#   cargo run -- -c config.replica.toml   # replica: api :5365, replication :5366
+#
+# Watch it converge:
+#
+#   curl -s localhost:5365/v1/_health/replication
+#
+# This file carries only what a read-only node actually reads. Everything the
+# master needs in order to *write* is left out rather than copied across, and
+# the notes below say why — so a reader can tell "deliberately absent" from
+# "forgotten".
+
+[server]
+
+host = "0.0.0.0"
+port = 5365
+
+# The same key as the master, so one client credential reads from either node.
+api_key = "MySecretAPIKey"
+
+repos_path = "./dev/repositories/slave"
+log_level = "debug"
+
+[limits]
+
+# The only limit a replica reads. POST /batch/files/read is the one
+# write-shaped route it serves, and this caps it.
+#
+# `allowed_extensions` is deliberately absent: it is checked on file writes and
+# move destinations only, and every write to this node answers 423 before a
+# handler runs. Setting it here would be decoration.
+batch_read_maximum_files = 100
+
+# No [hooks] section, deliberately. Hook delivery belongs to the node that
+# accepted the commit; nothing on a replica ever enqueues one, so naming a
+# receiver here would describe behaviour that does not exist. While the master
+# is down, no hooks fire at all — reconcile downstream afterwards with
+# POST /v1/:collection_id/:tenant_id/batch/replay/hook on the master.
+
+[maintenance]
+
+# A replica needs maintenance more than a master does: every applied delta
+# writes a fresh packfile, so packs accumulate one per sync. `destructive_prune`
+# is also unambiguously safe here — anything it drops can be fetched again.
+enabled = true
+delay_secs = 86400
+destructive_prune = true
+
+[replication]
+
+role = "replica"
+
+# Must match the master's `secret`.
+secret = "MyReplicationSecret"
+
+# The master's REPLICATION port (5356), not its content port (5355). This node
+# dials out to it; the master never connects inward, which is why a replica
+# needs no inbound exposure and no entry in the master's config.
+master_url = "http://127.0.0.1:5356"
+
+# This node's own replication server — a replica serves the surface too, so
+# another replica can follow it. Set explicitly because the default (5356) would
+# collide with the master's while both run on one machine, and that collision is
+# a runtime bind failure rather than a config error: validation only compares
+# this port against this node's own server.port.
+port = 5366
+
+node_id = "replica-1"
+
+# Short so convergence is visible while developing; the default is 60.
+poll_interval_secs = 10

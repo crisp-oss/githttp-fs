@@ -824,6 +824,14 @@ pub async fn write_file(
 
     // Enqueued while the tenant write lock is still held, so per-tenant hook
     // order always matches commit order.
+    // Announced to replicas under the same lock. Unlike the hook job
+    // this is a latency hint rather than a source of truth: a replica
+    // reacts by pulling, so a dropped announcement costs nothing but
+    // the wait for its next reconcile.
+    state
+        .replication
+        .repository_updated(&collection_id, &tenant_id, &commit_sha);
+
     state.hook_queue.enqueue(
         &lock_key,
         HookJob::new(
@@ -954,6 +962,14 @@ pub async fn delete_file(
 
     // Enqueued while the tenant write lock is still held, so per-tenant hook
     // order always matches commit order.
+    // Announced to replicas under the same lock. Unlike the hook job
+    // this is a latency hint rather than a source of truth: a replica
+    // reacts by pulling, so a dropped announcement costs nothing but
+    // the wait for its next reconcile.
+    state
+        .replication
+        .repository_updated(&collection_id, &tenant_id, &commit_sha);
+
     state.hook_queue.enqueue(
         &lock_key,
         HookJob::new(
@@ -1166,6 +1182,14 @@ async fn move_file(
 
     // Enqueued while the tenant write lock is still held, so per-tenant hook
     // order always matches commit order.
+    // Announced to replicas under the same lock. Unlike the hook job
+    // this is a latency hint rather than a source of truth: a replica
+    // reacts by pulling, so a dropped announcement costs nothing but
+    // the wait for its next reconcile.
+    state
+        .replication
+        .repository_updated(&collection_id, &tenant_id, &commit_sha);
+
     state.hook_queue.enqueue(
         &lock_key,
         HookJob::new(
@@ -1341,6 +1365,14 @@ async fn reorder_file(
     // Enqueued while the tenant write lock is still held, so per-tenant hook
     // order always matches commit order. The change lands on the index's own
     // path, which is what `HookJob::new` classifies into an order event.
+    // Announced to replicas under the same lock. Unlike the hook job
+    // this is a latency hint rather than a source of truth: a replica
+    // reacts by pulling, so a dropped announcement costs nothing but
+    // the wait for its next reconcile.
+    state
+        .replication
+        .repository_updated(&collection_id, &tenant_id, &commit_sha);
+
     state.hook_queue.enqueue(
         &lock_key,
         HookJob::new(

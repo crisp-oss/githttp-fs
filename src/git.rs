@@ -56,6 +56,7 @@ use std::path::{Path, PathBuf};
 use crate::error::AppError;
 use crate::order;
 use crate::seek::SeekFilter;
+use crate::validate;
 
 /// A node in the repository file tree returned by the list endpoint.
 /// Serialises with a `"type"` discriminant field so clients can distinguish
@@ -5095,5 +5096,427 @@ impl GitTenant {
         tracing::info!(tenant_id = %tenant_id, "tenant repository deleted");
 
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GitReplication — packfile export/import for read-only replicas
+// ---------------------------------------------------------------------------
+
+/// One repository as seen by the replication surface: its identity plus the
+/// commit its HEAD currently points at.
+#[derive(Debug, Serialize)]
+pub struct RepositoryHead {
+    pub collection_id: String,
+    pub tenant_id: String,
+    pub head_sha: String,
+}
+
+/// What one scan of `repos_root` found, and whether it found everything.
+///
+/// `complete` is the field a replica's safety rests on: it may only infer
+/// deletions — repositories it holds and the master does not — from a scan
+/// that describes the master's *entire* set. A directory that could not be
+/// read or a repository that could not be opened therefore flips it to
+/// `false` rather than being silently left out, because an omission a
+/// replica cannot tell from a deletion would make it delete live tenants.
+#[derive(Debug, Default)]
+pub struct RepositoryScan {
+    pub repositories: Vec<RepositoryHead>,
+    pub complete: bool,
+}
+
+/// What probing one tenant directory for its HEAD found.
+enum HeadProbe {
+    At(String),
+    /// No `.git`, or a repository with no commit yet — nothing to list.
+    NotARepository,
+    /// A `.git` is there but could not be opened or read: the repository
+    /// exists and its state is unknown, which is not the same as absent.
+    Unreadable,
+}
+
+/// Outcome of applying a replication packfile to a local repository.
+///
+/// `NonFastForward` is the one interesting variant. githttp-fs history is
+/// append-only — revert and rollback both *add* commits, and nothing ever
+/// rewrites one — so a replica's HEAD is always an ancestor of its master's.
+/// The single way that can break is a tenant being deleted and re-created
+/// under the same identity, which starts a brand-new history with a brand-new
+/// root commit. That is not an error to retry, it is a signal to discard the
+/// local repository and clone it afresh.
+#[derive(Debug)]
+pub enum PackApply {
+    FastForwarded { from: Option<String>, to: String },
+    UpToDate,
+    NonFastForward { local: String, remote: String },
+}
+
+/// Git-level replication primitives: enumerate repositories, export a
+/// packfile of the objects a replica is missing, import one back.
+///
+/// Everything here works on the object database directly. libgit2's network
+/// transports are deliberately not used (this build compiles git2 without
+/// the `https`/`ssh` features, so they are not even present) — packfiles
+/// travel over the same axum/reqwest stack as the rest of the API, which
+/// keeps replication inside the existing auth, TLS, and tracing story
+/// instead of standing up a second protocol.
+pub struct GitReplication;
+
+impl GitReplication {
+    /// Reads a repository's HEAD commit sha, or `None` when the repository
+    /// does not exist, cannot be opened, or has no commit yet.
+    ///
+    /// Deliberately total rather than fallible: every caller treats "no
+    /// usable HEAD" the same way ("this repository needs a full clone"), and
+    /// a replica scanning thousands of directories must not abort its whole
+    /// reconcile because one of them is mid-creation.
+    pub fn head_sha(repo_path: &Path) -> Option<String> {
+        match Self::probe_head(repo_path) {
+            HeadProbe::At(head_sha) => Some(head_sha),
+            HeadProbe::NotARepository | HeadProbe::Unreadable => None,
+        }
+    }
+
+    /// Like [`Self::head_sha`], but tells "not a repository" apart from "a
+    /// repository I could not read" — the scan needs that distinction to
+    /// report whether it is complete.
+    fn probe_head(repo_path: &Path) -> HeadProbe {
+        if !repo_path.join(".git").exists() {
+            return HeadProbe::NotARepository;
+        }
+
+        let repo = match Repository::open(repo_path) {
+            Ok(repo) => repo,
+            Err(err) => {
+                tracing::warn!(path = %repo_path.display(), err = %err, "repository cannot be opened");
+
+                return HeadProbe::Unreadable;
+            }
+        };
+
+        let probe = match repo.head() {
+            Ok(head) => match head.target() {
+                Some(head_oid) => HeadProbe::At(head_oid.to_string()),
+                None => HeadProbe::Unreadable,
+            },
+            // An initialised repository with no commit yet: a replica whose
+            // first import was interrupted before the ref moved. There is
+            // nothing to list, and nothing is wrong.
+            Err(err) if err.code() == git2::ErrorCode::UnbornBranch => HeadProbe::NotARepository,
+            Err(err) => {
+                tracing::warn!(path = %repo_path.display(), err = %err, "repository HEAD cannot be read");
+
+                HeadProbe::Unreadable
+            }
+        };
+
+        probe
+    }
+
+    /// Enumerates every repository under `repos_root` with its HEAD sha.
+    ///
+    /// This is the whole-state snapshot both sides of a reconcile compare:
+    /// the master serves it from `GET /_replication/state`, and a replica
+    /// runs the same walk over its own disk. Only names the API could have
+    /// created are considered — anything the identifier validators reject
+    /// (the dot-prefixed `.replication.json` and `.replication-incoming/`
+    /// among them) is not a tenant and is skipped without comment. A
+    /// directory that is not a repository is skipped too. But a directory
+    /// that cannot be *read*, or a repository that cannot be *opened*, marks
+    /// the scan incomplete rather than being dropped: a replica must never
+    /// mistake "the master could not describe this" for "the master no
+    /// longer has this".
+    ///
+    /// Cost is one directory scan plus one ref read per repository, which is
+    /// why callers go through `replication::RepositoryIndex` rather than
+    /// calling this on every request.
+    pub fn list_repositories(repos_root: &Path) -> RepositoryScan {
+        let mut scan = RepositoryScan {
+            repositories: Vec::new(),
+            complete: true,
+        };
+
+        let collections = match std::fs::read_dir(repos_root) {
+            Ok(collections) => collections,
+            Err(err) => {
+                tracing::warn!(
+                    path = %repos_root.display(),
+                    err = %err,
+                    "repositories root cannot be read, listing is incomplete"
+                );
+
+                scan.complete = false;
+
+                return scan;
+            }
+        };
+
+        for collection_entry in collections {
+            let Ok(collection_entry) = collection_entry else {
+                scan.complete = false;
+
+                continue;
+            };
+
+            let Some(collection_id) =
+                Self::scannable_name(&collection_entry, validate::collection_id)
+            else {
+                continue;
+            };
+
+            let collection_path = collection_entry.path();
+
+            if !collection_path.is_dir() {
+                continue;
+            }
+
+            let tenants = match std::fs::read_dir(&collection_path) {
+                Ok(tenants) => tenants,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %collection_path.display(),
+                        err = %err,
+                        "collection directory cannot be read, listing is incomplete"
+                    );
+
+                    scan.complete = false;
+
+                    continue;
+                }
+            };
+
+            for tenant_entry in tenants {
+                let Ok(tenant_entry) = tenant_entry else {
+                    scan.complete = false;
+
+                    continue;
+                };
+
+                let Some(tenant_id) = Self::scannable_name(&tenant_entry, validate::tenant_id)
+                else {
+                    continue;
+                };
+
+                let tenant_path = tenant_entry.path();
+
+                if !tenant_path.is_dir() {
+                    continue;
+                }
+
+                match Self::probe_head(&tenant_path) {
+                    HeadProbe::At(head_sha) => scan.repositories.push(RepositoryHead {
+                        collection_id: collection_id.clone(),
+                        tenant_id,
+                        head_sha,
+                    }),
+                    HeadProbe::NotARepository => {}
+                    HeadProbe::Unreadable => scan.complete = false,
+                }
+            }
+        }
+
+        scan
+    }
+
+    /// A directory entry's name, if it is one this API could have created.
+    fn scannable_name(
+        entry: &std::fs::DirEntry,
+        validator: fn(&str) -> Result<&str, AppError>,
+    ) -> Option<String> {
+        let name = entry.file_name();
+        let name = name.to_str()?;
+
+        validator(name).ok().map(str::to_string)
+    }
+
+    /// Builds a packfile holding every object reachable from `head_sha` but
+    /// not from `have`, handing each chunk to `on_chunk` as it is produced.
+    /// Returning `false` from `on_chunk` aborts the build (the receiver hung
+    /// up), which surfaces here as a git error.
+    ///
+    /// **No tenant write lock is taken, and none is needed.** The walk reads
+    /// objects reachable from a commit that already exists, and two
+    /// properties make those objects immortal: history is append-only, so a
+    /// commit reachable from the HEAD we were given stays reachable from
+    /// every later HEAD; and maintenance only ever drops objects that are
+    /// *un*reachable. So no concurrent write or repack can remove anything
+    /// this walk needs. A repack running concurrently can still invalidate
+    /// libgit2's view of the pack directory mid-build, which surfaces as a
+    /// transient error — the caller retries once rather than holding a lock
+    /// across what may be a multi-second full-clone build.
+    ///
+    /// An unknown `have` (a replica reporting a commit this repository has
+    /// never held) is ignored rather than rejected, degrading to a full
+    /// pack. That is the honest answer: we cannot compute a delta against a
+    /// history we do not have, and refusing would strand the replica.
+    pub fn build_pack<F>(
+        repo_path: &Path,
+        tenant_id: &str,
+        head_sha: &str,
+        have: Option<&str>,
+        mut on_chunk: F,
+    ) -> Result<usize, AppError>
+    where
+        F: FnMut(&[u8]) -> bool,
+    {
+        let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
+
+        let head_oid = Oid::from_str(head_sha).map_err(|_err| AppError::CommitNotFound {
+            sha: head_sha.to_string(),
+        })?;
+
+        let mut revwalk = repo.revwalk()?;
+
+        revwalk.push(head_oid)?;
+
+        if let Some(have) = have {
+            match Oid::from_str(have) {
+                Ok(have_oid) if repo.find_commit(have_oid).is_ok() => {
+                    tracing::trace!(tenant_id = %tenant_id, have = %have, "hiding replica head from pack walk");
+
+                    revwalk.hide(have_oid)?;
+                }
+                _ => {
+                    tracing::debug!(
+                        tenant_id = %tenant_id,
+                        have = %have,
+                        "replica reported an unknown commit, sending a full pack"
+                    );
+                }
+            }
+        }
+
+        let mut packbuilder = repo.packbuilder()?;
+
+        packbuilder.insert_walk(&mut revwalk)?;
+
+        let object_count = packbuilder.object_count();
+
+        // `foreach` streams the pack out chunk by chunk as it is written,
+        // rather than materialising the whole thing in memory the way
+        // `write_buf` would. A full clone of a large tenant is exactly the
+        // case where that difference matters.
+        packbuilder.foreach(|chunk| on_chunk(chunk))?;
+
+        tracing::debug!(
+            tenant_id = %tenant_id,
+            head = %head_sha,
+            objects = object_count,
+            "replication pack built"
+        );
+
+        Ok(object_count)
+    }
+
+    /// Imports `pack_path` into the repository at `repo_path` and moves HEAD
+    /// to `new_head`, initialising the repository first when it does not
+    /// exist yet.
+    ///
+    /// The order of operations is the feature's whole crash-safety story:
+    /// objects are written and indexed first, and only once they are all
+    /// present does the ref move. An interrupted apply therefore leaves the
+    /// repository at its previous commit, never at a torn state — so a
+    /// replica needs no persisted sync cursor at all. Its own on-disk refs
+    /// *are* the cursor, which cannot lie the way a checkpoint file can.
+    /// Objects from a half-finished apply are unreachable garbage that the
+    /// replica's own maintenance pass reclaims.
+    ///
+    /// A fresh repository is initialised **without** the `"chore: initialize"`
+    /// root commit that [`GitUtils::open_or_init_repo`] creates: that commit
+    /// is generated locally and would give the replica a different root — and
+    /// therefore a permanently divergent history — from its master. A replica
+    /// only ever holds commits it was handed.
+    ///
+    /// The working tree is deliberately not checked out. Reads are answered
+    /// from HEAD's tree throughout this codebase, so a replica needs only the
+    /// object store; mirroring files on every sync would cost disk and time
+    /// for nobody's benefit. The visible consequence is that `git status`
+    /// inside a replica repository reports every file as deleted.
+    pub fn apply_pack(
+        repo_path: &Path,
+        pack_path: &Path,
+        new_head: &str,
+    ) -> Result<PackApply, AppError> {
+        let repo = if repo_path.join(".git").exists() {
+            Repository::open(repo_path)?
+        } else {
+            tracing::info!(path = %repo_path.display(), "initialising replica repository");
+
+            std::fs::create_dir_all(repo_path)?;
+
+            Repository::init(repo_path)?
+        };
+
+        let new_oid = Oid::from_str(new_head).map_err(|_err| AppError::CommitNotFound {
+            sha: new_head.to_string(),
+        })?;
+
+        // Stream the pack straight from disk into the object database. The
+        // download landed in a temporary file precisely so this step never
+        // has to hold the whole transfer in memory.
+        {
+            let odb = repo.odb()?;
+            let mut packwriter = odb.packwriter()?;
+            let mut pack_file = std::fs::File::open(pack_path)?;
+
+            std::io::copy(&mut pack_file, &mut packwriter)?;
+
+            packwriter.commit()?;
+        }
+
+        // Finding the announced commit proves the pack was complete: libgit2
+        // would have rejected a truncated or corrupt pack above, but a pack
+        // that simply did not contain what the master promised would not be
+        // caught until a read failed much later.
+        repo.find_commit(new_oid)
+            .map_err(|_err| AppError::CommitNotFound {
+                sha: new_head.to_string(),
+            })?;
+
+        let local_head = repo.head().ok().and_then(|head| head.target());
+
+        if let Some(local_oid) = local_head {
+            if local_oid == new_oid {
+                return Ok(PackApply::UpToDate);
+            }
+
+            if !repo.graph_descendant_of(new_oid, local_oid)? {
+                return Ok(PackApply::NonFastForward {
+                    local: local_oid.to_string(),
+                    remote: new_head.to_string(),
+                });
+            }
+        }
+
+        let head_reference = Self::head_reference_name(&repo)?;
+
+        repo.reference(
+            &head_reference,
+            new_oid,
+            true,
+            &format!("replication: fast-forward to {}", new_head),
+        )?;
+
+        Ok(PackApply::FastForwarded {
+            from: local_head.map(|oid| oid.to_string()),
+            to: new_head.to_string(),
+        })
+    }
+
+    /// The branch reference HEAD points at.
+    ///
+    /// Read from the local repository rather than taken from the master,
+    /// because the branch name is not part of this API's surface: every read
+    /// path resolves content through `repo.head()`, so a replica whose
+    /// libgit2 defaulted to `main` while its master defaulted to `master`
+    /// still serves byte-identical results.
+    fn head_reference_name(repo: &Repository) -> Result<String, AppError> {
+        let head = repo.find_reference("HEAD")?;
+
+        Ok(head
+            .symbolic_target()?
+            .unwrap_or("refs/heads/master")
+            .to_string())
     }
 }

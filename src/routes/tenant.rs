@@ -53,6 +53,14 @@ pub async fn delete_tenant(
     // point the task can only be sleeping or waiting, and aborts cleanly.
     state.maintenance.cancel(&lock_key);
 
+    // Announced to replicas under the same lock, so a follower removes its
+    // own copy rather than serving a tenant that no longer exists. A replica
+    // that misses this frame still converges: its next reconcile finds the
+    // repository absent from the master's listing and deletes it then.
+    state
+        .replication
+        .repository_deleted(&collection_id, &tenant_id);
+
     // The lock entry is intentionally retained (see AppState::get_repo_lock):
     // removing it would allow two aliased mutexes for the same repository.
 

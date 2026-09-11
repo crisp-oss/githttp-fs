@@ -1,3 +1,14 @@
+# githttp-fs — development config for the MASTER node.
+#
+# Runs alongside config.replica.toml, which follows this node:
+#
+#   cargo run                             # master: api :5355, replication :5356
+#   cargo run -- -c config.replica.toml   # replica: api :5365, replication :5366
+#
+# Both nodes share `server.api_key`, so the same client credential reads from
+# either one — which is the point of a replica, and what lets you test failover
+# by pointing a client at :5365 and killing the master.
+
 [server]
 
 host = "0.0.0.0"
@@ -5,7 +16,9 @@ port = 5355
 
 api_key = "MySecretAPIKey"
 
-repos_path = "./dev/repositories"
+# Each node needs its own store: they are separate copies of the same content,
+# not two processes sharing one directory.
+repos_path = "./dev/repositories/master"
 log_level = "debug"
 
 [limits]
@@ -39,3 +52,24 @@ value = "Bearer your-hook-receiver-secret"
 
 enabled = true
 delay_secs = 86400
+
+[replication]
+
+# This node accepts writes and serves replicas.
+role = "master"
+
+# Guards the replication server, and is what a replica presents to reach it.
+# Called `secret` rather than `api_key` because no caller of the product's API
+# ever holds it: it authenticates githttp-fs to githttp-fs.
+secret = "MyReplicationSecret"
+
+# The replication protocol gets its own HTTP server on its own port, serving
+# /_replication and nothing else. That is deliberate: a proxy pointed at the
+# content port (5355) cannot reach it, so publishing the API cannot publish
+# replication by accident. `host` defaults to server.host — set it to
+# 127.0.0.1 in production where every replica is local.
+port = 5356
+
+# How this node names itself in the roster at GET /v1/_health/replication.
+# Telemetry only; `secret` is what guards anything. Defaults to "host:port".
+node_id = "master-1"
