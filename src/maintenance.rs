@@ -88,6 +88,7 @@ impl MaintenanceScheduler {
 
         let delay_secs = self.config.maintenance.delay_secs;
         let destructive_prune = self.config.maintenance.destructive_prune;
+        let checkout_files = self.config.server.checkout_files;
         let maximum_packs = self.config.maintenance.maximum_packs;
         let pending = self.pending.clone();
         let task_tenant_key = tenant_key.to_string();
@@ -132,8 +133,10 @@ impl MaintenanceScheduler {
 
             let repo_path_for_task = repo_path.clone();
 
-            match run_blocking(move || GitMaintenance::run(&repo_path_for_task, destructive_prune))
-                .await
+            match run_blocking(move || {
+                GitMaintenance::run(&repo_path_for_task, destructive_prune, checkout_files)
+            })
+            .await
             {
                 Ok(report) => {
                     tracing::info!(

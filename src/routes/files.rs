@@ -797,6 +797,7 @@ pub async fn write_file(
     } = body;
 
     let repo_path_for_maintenance = repo_path.clone();
+    let checkout_files = state.config.server.checkout_files;
 
     let (commit_sha, file_change) = run_blocking(move || {
         git::GitFiles::write_file(
@@ -806,6 +807,7 @@ pub async fn write_file(
             message.as_deref(),
             &author.name,
             &author.email,
+            checkout_files,
         )
     })
     .await?;
@@ -922,6 +924,7 @@ pub async fn delete_file(
     };
 
     let tenant_id_for_task = tenant_id.clone();
+    let checkout_files = state.config.server.checkout_files;
 
     let (commit_sha, file_changes) = if recurse_directory {
         run_blocking(move || {
@@ -932,6 +935,7 @@ pub async fn delete_file(
                 message.as_deref(),
                 &author.name,
                 &author.email,
+                checkout_files,
             )
         })
         .await?
@@ -944,6 +948,7 @@ pub async fn delete_file(
                 message.as_deref(),
                 &author.name,
                 &author.email,
+                checkout_files,
             )
         })
         .await?
@@ -1140,6 +1145,7 @@ async fn move_file(
     }
 
     let tenant_id_for_task = tenant_id.clone();
+    let checkout_files = state.config.server.checkout_files;
 
     let (commit_sha, file_changes) = if recurse_directory {
         run_blocking(move || {
@@ -1151,6 +1157,7 @@ async fn move_file(
                 message.as_deref(),
                 &author.name,
                 &author.email,
+                checkout_files,
             )
         })
         .await?
@@ -1164,6 +1171,7 @@ async fn move_file(
                 message.as_deref(),
                 &author.name,
                 &author.email,
+                checkout_files,
             )
         })
         .await?
@@ -1334,6 +1342,7 @@ async fn reorder_file(
 
     let repo_path_for_maintenance = repo_path.clone();
     let tenant_id_for_task = tenant_id.clone();
+    let checkout_files = state.config.server.checkout_files;
 
     let (commit_sha, change) = run_blocking(move || {
         git::GitOrder::reorder_entry(
@@ -1347,6 +1356,7 @@ async fn reorder_file(
             message.as_deref(),
             &author.name,
             &author.email,
+            checkout_files,
         )
     })
     .await?;

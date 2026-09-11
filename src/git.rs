@@ -671,6 +671,81 @@ impl GitUtils {
 }
 
 // ---------------------------------------------------------------------------
+// WorkingTree — the best-effort on-disk mirror of HEAD
+// ---------------------------------------------------------------------------
+
+/// The working tree as this codebase treats it: a *courtesy copy* of HEAD
+/// kept on disk so a human can `ls` a tenant repository, and nothing else.
+///
+/// Every read resolves content from HEAD's tree and the object database, and
+/// every commit tree is derived from HEAD's tree plus the intended change, so
+/// nothing here can decide the outcome of an operation. That is what lets the
+/// whole mirror be switched off with `server.checkout_files = false`, which is
+/// worth real disk: git compresses blobs, so for markdown the files on disk
+/// are several times larger than the `.git` holding their entire history, and
+/// each one occupies at least a filesystem block.
+///
+/// Gathering the three operations here rather than repeating them at each
+/// site is what makes that switch a single `if` instead of a dozen, and it
+/// also puts the "a file that is already gone is not an error" rule — the
+/// working tree may always have diverged from HEAD, which is HEAD's
+/// prerogative — in one place.
+struct WorkingTree<'a> {
+    root: &'a Path,
+    enabled: bool,
+}
+
+impl<'a> WorkingTree<'a> {
+    fn new(root: &'a Path, enabled: bool) -> Self {
+        Self { root, enabled }
+    }
+
+    /// Writes a file, creating its parent directories.
+    fn write(&self, relative_path: impl AsRef<Path>, content: &[u8]) -> Result<(), AppError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let absolute_path = self.root.join(relative_path);
+
+        if let Some(parent_dir) = absolute_path.parent() {
+            std::fs::create_dir_all(parent_dir)?;
+        }
+
+        std::fs::write(&absolute_path, content)?;
+
+        Ok(())
+    }
+
+    /// Removes a file. Already absent is success: the working tree had
+    /// diverged from HEAD, and HEAD is what counts.
+    fn remove_file(&self, relative_path: impl AsRef<Path>) -> Result<(), AppError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        match std::fs::remove_file(self.root.join(relative_path)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(AppError::Io(err)),
+        }
+    }
+
+    /// Removes a directory and everything under it, with the same tolerance.
+    fn remove_directory(&self, relative_path: impl AsRef<Path>) -> Result<(), AppError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        match std::fs::remove_dir_all(self.root.join(relative_path)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(AppError::Io(err)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GitLocks — stale lock file detection and cleanup
 // ---------------------------------------------------------------------------
 
@@ -830,7 +905,10 @@ impl GitMaintenance {
     ///    loose objects, at most one pack).
     /// 3. **Index refresh** — the on-disk index is reset to HEAD so
     ///    `git status` stays meaningful for humans (the write path never
-    ///    touches the index).
+    ///    touches the index). Skipped when `checkout_files` is off: with no
+    ///    files on disk there is nothing for the index to be meaningful
+    ///    *against*, so writing one would only add a file the node was asked
+    ///    not to keep.
     ///
     /// Must be called while holding the tenant write lock. That lock is also
     /// why pruning needs no grace period, unlike `git gc` with its two-week
@@ -844,7 +922,11 @@ impl GitMaintenance {
     /// does not invalidate the mapping (POSIX unlink semantics), and on a
     /// missed lookup libgit2 rescans the pack directory and finds the new
     /// consolidated pack.
-    pub fn run(repo_path: &Path, destructive_prune: bool) -> Result<MaintenanceReport, AppError> {
+    pub fn run(
+        repo_path: &Path,
+        destructive_prune: bool,
+        checkout_files: bool,
+    ) -> Result<MaintenanceReport, AppError> {
         // The tenant may have been deleted while the timer was armed.
         if !repo_path.join(".git").exists() {
             tracing::debug!(path = %repo_path.display(), "repository gone, skipping maintenance");
@@ -882,15 +964,20 @@ impl GitMaintenance {
             )?
         };
 
-        // Refresh the on-disk index to HEAD. Clean a stale index.lock first —
-        // this is the only code path left that writes the index.
-        GitLocks::cleanup_stale_index_lock(repo_path)?;
+        // Refresh the on-disk index to HEAD, so `git status` compares the
+        // files on disk against the commit they came from. A node keeping no
+        // files has nothing to compare, so it keeps no index either. Clean a
+        // stale index.lock first — this is the only code path left that writes
+        // the index.
+        if checkout_files {
+            GitLocks::cleanup_stale_index_lock(repo_path)?;
 
-        let head_tree = repo.head()?.peel_to_commit()?.tree()?;
-        let mut index = repo.index()?;
+            let head_tree = repo.head()?.peel_to_commit()?.tree()?;
+            let mut index = repo.index()?;
 
-        index.read_tree(&head_tree)?;
-        index.write()?;
+            index.read_tree(&head_tree)?;
+            index.write()?;
+        }
 
         Ok(report)
     }
@@ -2271,6 +2358,7 @@ impl GitFiles {
         commit_message: Option<&str>,
         author_name: &str,
         author_email: &str,
+        checkout_files: bool,
     ) -> Result<(String, Option<FileChange>), AppError> {
         tracing::debug!(path = %file_path, author_name = %author_name, author_email = %author_email, "writing file");
 
@@ -2327,13 +2415,7 @@ impl GitFiles {
 
         tracing::debug!(path = %file_path, is_new_file = is_new_file, "staging file write");
 
-        let absolute_path = repo_path.join(file_path);
-
-        if let Some(parent_dir) = absolute_path.parent() {
-            std::fs::create_dir_all(parent_dir)?;
-        }
-
-        std::fs::write(&absolute_path, content)?;
+        WorkingTree::new(repo_path, checkout_files).write(file_path, content.as_bytes())?;
 
         tracing::trace!(path = %file_path, "building updated tree");
 
@@ -2403,6 +2485,7 @@ impl GitFiles {
         commit_message: Option<&str>,
         author_name: &str,
         author_email: &str,
+        checkout_files: bool,
     ) -> Result<(String, Vec<FileChange>), AppError> {
         tracing::debug!(tenant_id = %tenant_id, path = %file_path, author_name = %author_name, author_email = %author_email, "deleting file");
 
@@ -2433,15 +2516,7 @@ impl GitFiles {
 
         tracing::trace!(tenant_id = %tenant_id, path = %file_path, "building updated tree without path");
 
-        // A file already missing from the working tree just means the working
-        // tree had diverged from HEAD; there is nothing left to clean up.
-        let absolute_path = repo_path.join(file_path);
-
-        match std::fs::remove_file(&absolute_path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(AppError::Io(err)),
-        }
+        WorkingTree::new(repo_path, checkout_files).remove_file(file_path)?;
 
         // The commit tree is HEAD's tree minus this single entry — O(path
         // depth) instead of the O(repository size) an index round-trip costs.
@@ -2464,6 +2539,7 @@ impl GitFiles {
             &mut tree_update,
             parent_directory,
             leaf_name,
+            checkout_files,
         )?);
 
         let tree_id = tree_update.create_updated(&repo, &head_tree)?;
@@ -2519,6 +2595,7 @@ impl GitFiles {
         commit_message: Option<&str>,
         author_name: &str,
         author_email: &str,
+        checkout_files: bool,
     ) -> Result<(String, Vec<FileChange>), AppError> {
         tracing::debug!(tenant_id = %tenant_id, path = %dir_path, author_name = %author_name, author_email = %author_email, "deleting directory recursively");
 
@@ -2554,13 +2631,7 @@ impl GitFiles {
 
         tracing::debug!(tenant_id = %tenant_id, path = %dir_path, file_count = blobs.len(), "staging recursive directory deletion");
 
-        // A folder already missing from the working tree just means the
-        // working tree had diverged from HEAD; HEAD is what counts.
-        match std::fs::remove_dir_all(repo_path.join(dir_path)) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(AppError::Io(err)),
-        }
+        WorkingTree::new(repo_path, checkout_files).remove_directory(dir_path)?;
 
         let mut tree_update = TreeUpdateBuilder::new();
 
@@ -2582,6 +2653,7 @@ impl GitFiles {
             &mut tree_update,
             parent_directory,
             dir_name,
+            checkout_files,
         )?);
 
         let tree_id = tree_update.create_updated(&repo, &head_tree)?;
@@ -2636,6 +2708,7 @@ impl GitFiles {
         commit_message: Option<&str>,
         author_name: &str,
         author_email: &str,
+        checkout_files: bool,
     ) -> Result<(String, Vec<FileChange>), AppError> {
         tracing::debug!(
             tenant_id = %tenant_id,
@@ -2702,20 +2775,10 @@ impl GitFiles {
         // rather than whatever the working tree currently holds.
         let content = GitUtils::blob_content_from_tree(&repo, &head_tree, from_path)?;
 
-        let absolute_from = repo_path.join(from_path);
-        let absolute_to = repo_path.join(to_path);
+        let working_tree = WorkingTree::new(repo_path, checkout_files);
 
-        match std::fs::remove_file(&absolute_from) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(AppError::Io(err)),
-        }
-
-        if let Some(parent_dir) = absolute_to.parent() {
-            std::fs::create_dir_all(parent_dir)?;
-        }
-
-        std::fs::write(&absolute_to, &content)?;
+        working_tree.remove_file(from_path)?;
+        working_tree.write(to_path, content.as_bytes())?;
 
         tracing::trace!(
             tenant_id = %tenant_id,
@@ -2750,6 +2813,7 @@ impl GitFiles {
                 from_directory,
                 from_name,
                 to_name,
+                checkout_files,
             )?);
         } else {
             file_changes.extend(GitOrder::stage_entry_removed(
@@ -2759,6 +2823,7 @@ impl GitFiles {
                 &mut tree_update,
                 from_directory,
                 from_name,
+                checkout_files,
             )?);
 
             file_changes.extend(GitOrder::stage_entry_appended(
@@ -2768,6 +2833,7 @@ impl GitFiles {
                 &mut tree_update,
                 to_directory,
                 to_name,
+                checkout_files,
             )?);
         }
 
@@ -2842,6 +2908,7 @@ impl GitFiles {
         commit_message: Option<&str>,
         author_name: &str,
         author_email: &str,
+        checkout_files: bool,
     ) -> Result<(String, Vec<FileChange>), AppError> {
         tracing::debug!(
             tenant_id = %tenant_id,
@@ -2920,6 +2987,8 @@ impl GitFiles {
             "staging recursive directory move"
         );
 
+        let working_tree = WorkingTree::new(repo_path, checkout_files);
+
         // The commit tree is HEAD's tree with the source folder dropped and
         // every one of its blobs re-attached under the destination prefix,
         // reusing the existing oids — no content rehash, no index round-trip.
@@ -2945,13 +3014,7 @@ impl GitFiles {
             // needed for this file's hook payload either way.
             let content = GitUtils::blob_content_from_tree(&repo, &head_tree, source_path)?;
 
-            let absolute_destination = repo_path.join(&destination_path);
-
-            if let Some(parent_dir) = absolute_destination.parent() {
-                std::fs::create_dir_all(parent_dir)?;
-            }
-
-            std::fs::write(&absolute_destination, &content)?;
+            working_tree.write(&destination_path, content.as_bytes())?;
 
             tree_update.upsert(&destination_path, *blob_oid, FileMode::Blob);
 
@@ -2963,14 +3026,8 @@ impl GitFiles {
         }
 
         // The destination is never inside the source (rejected above), so the
-        // freshly written files cannot be swept away by this cleanup. A
-        // folder already missing on disk just means the working tree had
-        // diverged from HEAD.
-        match std::fs::remove_dir_all(repo_path.join(from_path)) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(AppError::Io(err)),
-        }
+        // freshly written files cannot be swept away by this cleanup.
+        working_tree.remove_directory(from_path)?;
 
         // The parent indexes are settled last, once every file is staged: the
         // folder loses its entry where it came from and gains one where it
@@ -2987,6 +3044,7 @@ impl GitFiles {
                 from_parent,
                 from_name,
                 &order::directory_entry(to_name),
+                checkout_files,
             )?);
         } else {
             file_changes.extend(GitOrder::stage_entry_removed(
@@ -2996,6 +3054,7 @@ impl GitFiles {
                 &mut tree_update,
                 from_parent,
                 from_name,
+                checkout_files,
             )?);
 
             file_changes.extend(GitOrder::stage_entry_appended(
@@ -3005,6 +3064,7 @@ impl GitFiles {
                 &mut tree_update,
                 to_parent,
                 &order::directory_entry(to_name),
+                checkout_files,
             )?);
         }
 
@@ -3217,6 +3277,7 @@ impl GitOrder {
         commit_message: Option<&str>,
         author_name: &str,
         author_email: &str,
+        checkout_files: bool,
     ) -> Result<(String, Option<FileChange>), AppError> {
         let display_directory = order::display_directory(directory);
 
@@ -3300,6 +3361,7 @@ impl GitOrder {
             directory,
             &canonical,
             existing_oid.is_some(),
+            checkout_files,
         )?;
 
         let tree_id = tree_update.create_updated(&repo, &head_tree)?;
@@ -3393,6 +3455,7 @@ impl GitOrder {
         commit_message: Option<&str>,
         author_name: &str,
         author_email: &str,
+        checkout_files: bool,
     ) -> Result<(String, Option<FileChange>), AppError> {
         tracing::debug!(tenant_id = %tenant_id, path = %entry_path, position = ?position, implicit_default_index = ?implicit_default_index, implicit_allow_hidden_files = implicit_allow_hidden_files, allow_prefix_path = allow_prefix_path, author_name = %author_name, author_email = %author_email, "reordering order index entry");
 
@@ -3513,6 +3576,7 @@ impl GitOrder {
             directory,
             &entries,
             existing_oid.is_some(),
+            checkout_files,
         )?;
 
         let tree_id = tree_update.create_updated(&repo, &head_tree)?;
@@ -3550,6 +3614,7 @@ impl GitOrder {
         commit_message: Option<&str>,
         author_name: &str,
         author_email: &str,
+        checkout_files: bool,
     ) -> Result<(String, FileChange), AppError> {
         let display_directory = order::display_directory(directory);
 
@@ -3574,7 +3639,15 @@ impl GitOrder {
 
         // An empty order stages a removal — an index holding nothing and no
         // index at all are the same state.
-        let change = Self::stage_index(&repo, repo_path, &mut tree_update, directory, &[], true)?;
+        let change = Self::stage_index(
+            &repo,
+            repo_path,
+            &mut tree_update,
+            directory,
+            &[],
+            true,
+            checkout_files,
+        )?;
 
         let tree_id = tree_update.create_updated(&repo, &head_tree)?;
         let tree = repo.find_tree(tree_id)?;
@@ -3785,20 +3858,15 @@ impl GitOrder {
         directory: &str,
         order_entries: &[String],
         index_existed: bool,
+        checkout_files: bool,
     ) -> Result<FileChange, AppError> {
         let index_path = order::order_file_path(directory);
-        let absolute_path = repo_path.join(&index_path);
+        let working_tree = WorkingTree::new(repo_path, checkout_files);
 
         if order_entries.is_empty() {
             tracing::trace!(path = %index_path, "staging order index removal");
 
-            // An index already missing from the working tree just means the
-            // working tree had diverged from HEAD; HEAD is what counts.
-            match std::fs::remove_file(&absolute_path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(AppError::Io(err)),
-            }
+            working_tree.remove_file(&index_path)?;
 
             tree_update.remove(&index_path);
 
@@ -3809,11 +3877,7 @@ impl GitOrder {
 
         let content = order::serialize(order_entries);
 
-        if let Some(parent_dir) = absolute_path.parent() {
-            std::fs::create_dir_all(parent_dir)?;
-        }
-
-        std::fs::write(&absolute_path, &content)?;
+        working_tree.write(&index_path, content.as_bytes())?;
 
         let blob_oid = repo.blob(content.as_bytes())?;
 
@@ -3842,6 +3906,7 @@ impl GitOrder {
         tree_update: &mut TreeUpdateBuilder,
         directory: &str,
         name: &str,
+        checkout_files: bool,
     ) -> Result<Option<FileChange>, AppError> {
         let Some(stored) = Self::stored_order(repo, head_tree, directory) else {
             return Ok(None);
@@ -3858,7 +3923,16 @@ impl GitOrder {
             return Ok(None);
         }
 
-        Self::stage_index(repo, repo_path, tree_update, directory, &retained, true).map(Some)
+        Self::stage_index(
+            repo,
+            repo_path,
+            tree_update,
+            directory,
+            &retained,
+            true,
+            checkout_files,
+        )
+        .map(Some)
     }
 
     /// Appends `canonical_entry` to `directory`'s index, at the tail.
@@ -3875,6 +3949,7 @@ impl GitOrder {
         tree_update: &mut TreeUpdateBuilder,
         directory: &str,
         canonical_entry: &str,
+        checkout_files: bool,
     ) -> Result<Option<FileChange>, AppError> {
         let Some(mut stored) = Self::stored_order(repo, head_tree, directory) else {
             return Ok(None);
@@ -3888,7 +3963,16 @@ impl GitOrder {
 
         stored.push(canonical_entry.to_string());
 
-        Self::stage_index(repo, repo_path, tree_update, directory, &stored, true).map(Some)
+        Self::stage_index(
+            repo,
+            repo_path,
+            tree_update,
+            directory,
+            &stored,
+            true,
+            checkout_files,
+        )
+        .map(Some)
     }
 
     /// Replaces `from_name` with `canonical_entry` **in place**, keeping the
@@ -3903,6 +3987,7 @@ impl GitOrder {
         directory: &str,
         from_name: &str,
         canonical_entry: &str,
+        checkout_files: bool,
     ) -> Result<Option<FileChange>, AppError> {
         let Some(mut stored) = Self::stored_order(repo, head_tree, directory) else {
             return Ok(None);
@@ -3917,7 +4002,16 @@ impl GitOrder {
 
         stored[position] = canonical_entry.to_string();
 
-        Self::stage_index(repo, repo_path, tree_update, directory, &stored, true).map(Some)
+        Self::stage_index(
+            repo,
+            repo_path,
+            tree_update,
+            directory,
+            &stored,
+            true,
+            checkout_files,
+        )
+        .map(Some)
     }
 }
 
@@ -4504,6 +4598,7 @@ impl GitCommits {
         commit_message: Option<&str>,
         author_name: &str,
         author_email: &str,
+        checkout_files: bool,
     ) -> Result<(String, Vec<FileChange>), AppError> {
         tracing::debug!(tenant_id = %tenant_id, sha = %sha, author_name = %author_name, author_email = %author_email, "reverting commit");
 
@@ -4567,6 +4662,8 @@ impl GitCommits {
 
         let mut file_changes: Vec<FileChange> = Vec::new();
 
+        let working_tree = WorkingTree::new(repo_path, checkout_files);
+
         // For each delta: mirror the inverse change onto the working tree
         // (best-effort human-visible state), stage it into the tree builder
         // (the authoritative commit state), and record the corresponding
@@ -4583,11 +4680,7 @@ impl GitCommits {
                             "revert: removing added file"
                         );
 
-                        let absolute_path = repo_path.join(new_path);
-
-                        if absolute_path.exists() {
-                            std::fs::remove_file(&absolute_path)?;
-                        }
+                        working_tree.remove_file(new_path)?;
 
                         tree_update.remove(new_path);
 
@@ -4612,13 +4705,7 @@ impl GitCommits {
                             &old_path.to_string_lossy(),
                         )?;
 
-                        let absolute_path = repo_path.join(old_path);
-
-                        if let Some(parent_dir) = absolute_path.parent() {
-                            std::fs::create_dir_all(parent_dir)?;
-                        }
-
-                        std::fs::write(&absolute_path, &content)?;
+                        working_tree.write(old_path, content.as_bytes())?;
 
                         tree_update.upsert(old_path, raw_delta.old_oid, FileMode::Blob);
 
@@ -4644,9 +4731,7 @@ impl GitCommits {
                             &old_path.to_string_lossy(),
                         )?;
 
-                        let absolute_path = repo_path.join(old_path);
-
-                        std::fs::write(&absolute_path, &content)?;
+                        working_tree.write(old_path, content.as_bytes())?;
 
                         tree_update.upsert(old_path, raw_delta.old_oid, FileMode::Blob);
 
@@ -4675,18 +4760,8 @@ impl GitCommits {
                             &old_path.to_string_lossy(),
                         )?;
 
-                        let absolute_old = repo_path.join(old_path);
-                        let absolute_new = repo_path.join(new_path);
-
-                        if absolute_new.exists() {
-                            std::fs::remove_file(&absolute_new)?;
-                        }
-
-                        if let Some(parent_dir) = absolute_old.parent() {
-                            std::fs::create_dir_all(parent_dir)?;
-                        }
-
-                        std::fs::write(&absolute_old, &content)?;
+                        working_tree.remove_file(new_path)?;
+                        working_tree.write(old_path, content.as_bytes())?;
 
                         tree_update.remove(new_path);
                         tree_update.upsert(old_path, raw_delta.old_oid, FileMode::Blob);
@@ -4771,6 +4846,7 @@ impl GitCommits {
         commit_message: Option<&str>,
         author_name: &str,
         author_email: &str,
+        checkout_files: bool,
     ) -> Result<(String, Vec<FileChange>), AppError> {
         tracing::debug!(tenant_id = %tenant_id, sha = %sha, author_name = %author_name, author_email = %author_email, "rolling files back to commit");
 
@@ -4779,7 +4855,7 @@ impl GitCommits {
         // nothing to roll back for this path.
         fn restore_path(
             repo: &Repository,
-            repo_path: &Path,
+            working_tree: &WorkingTree<'_>,
             head_tree: &git2::Tree<'_>,
             target_tree: &git2::Tree<'_>,
             tree_update: &mut TreeUpdateBuilder,
@@ -4803,13 +4879,7 @@ impl GitCommits {
 
             let content = GitUtils::blob_content_from_tree(repo, target_tree, &path_string)?;
 
-            let absolute_path = repo_path.join(path);
-
-            if let Some(parent_dir) = absolute_path.parent() {
-                std::fs::create_dir_all(parent_dir)?;
-            }
-
-            std::fs::write(&absolute_path, &content)?;
+            working_tree.write(path, content.as_bytes())?;
 
             tree_update.upsert(path, oid, FileMode::Blob);
 
@@ -4829,7 +4899,7 @@ impl GitCommits {
         // Stages the removal of `path` — absent at the target commit — unless
         // HEAD does not hold it as a file either.
         fn remove_path(
-            repo_path: &Path,
+            working_tree: &WorkingTree<'_>,
             head_tree: &git2::Tree<'_>,
             tree_update: &mut TreeUpdateBuilder,
             path: &Path,
@@ -4844,13 +4914,7 @@ impl GitCommits {
 
             tracing::trace!(path = %path_string, "rollback: removing file absent from target commit");
 
-            // A file already missing from the working tree just means the
-            // working tree had diverged from HEAD; HEAD is what counts.
-            match std::fs::remove_file(repo_path.join(path)) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(AppError::Io(err)),
-            }
+            working_tree.remove_file(path)?;
 
             tree_update.remove(path);
 
@@ -4913,6 +4977,8 @@ impl GitCommits {
 
         let mut file_changes: Vec<FileChange> = Vec::new();
 
+        let working_tree = WorkingTree::new(repo_path, checkout_files);
+
         // For each delta: mirror the target state onto the working tree
         // (best-effort human-visible state), stage it into the tree builder
         // (the authoritative commit state), and record the corresponding
@@ -4924,7 +4990,7 @@ impl GitCommits {
                     if let Some(new_path) = &raw_delta.new_path {
                         let change = restore_path(
                             &repo,
-                            repo_path,
+                            &working_tree,
                             &head_tree,
                             &target_tree,
                             &mut tree_update,
@@ -4941,7 +5007,7 @@ impl GitCommits {
                 Delta::Deleted => {
                     if let Some(old_path) = &raw_delta.old_path {
                         let change =
-                            remove_path(repo_path, &head_tree, &mut tree_update, old_path)?;
+                            remove_path(&working_tree, &head_tree, &mut tree_update, old_path)?;
 
                         file_changes.extend(change);
                     }
@@ -5008,7 +5074,7 @@ impl GitCommits {
                             // own terms.
                             let restored = restore_path(
                                 &repo,
-                                repo_path,
+                                &working_tree,
                                 &head_tree,
                                 &target_tree,
                                 &mut tree_update,
@@ -5019,7 +5085,7 @@ impl GitCommits {
                             file_changes.extend(restored);
 
                             let removed =
-                                remove_path(repo_path, &head_tree, &mut tree_update, old_path)?;
+                                remove_path(&working_tree, &head_tree, &mut tree_update, old_path)?;
 
                             file_changes.extend(removed);
                         }
@@ -5483,6 +5549,7 @@ impl GitReplication {
         repo_path: &Path,
         pack_path: &Path,
         new_head: &str,
+        checkout_files: bool,
     ) -> Result<PackApply, AppError> {
         let repo = if repo_path.join(".git").exists() {
             Repository::open(repo_path)?
@@ -5562,7 +5629,9 @@ impl GitReplication {
         // every read path is concerned; the working tree is the courtesy
         // that follows, and it is deliberately not allowed to fail the
         // apply.
-        Self::mirror_repository(repo_path, &repo);
+        if checkout_files {
+            Self::mirror_repository(repo_path, &repo);
+        }
 
         Ok(PackApply::FastForwarded {
             from: local_head.map(|oid| oid.to_string()),
@@ -5598,20 +5667,25 @@ impl GitReplication {
     /// every node, so a checkout that cannot run (a permission problem, a
     /// file held open) must not turn a correctly applied pack into a sync
     /// failure that is retried forever.
-    pub fn mirror_working_tree(repo_path: &Path) {
+    ///
+    /// Returns how many files the checkout actually wrote or removed, which
+    /// is `0` for a working tree that already matched HEAD. That number is
+    /// what lets the startup heal pass report whether it repaired anything
+    /// rather than only that it ran.
+    pub fn mirror_working_tree(repo_path: &Path) -> usize {
         let Ok(repo) = Repository::open(repo_path) else {
-            return;
+            return 0;
         };
 
-        Self::mirror_repository(repo_path, &repo);
+        Self::mirror_repository(repo_path, &repo)
     }
 
     /// The body of [`GitReplication::mirror_working_tree`], for callers that
     /// already hold the repository open.
-    fn mirror_repository(repo_path: &Path, repo: &Repository) {
+    fn mirror_repository(repo_path: &Path, repo: &Repository) -> usize {
         // Nothing to mirror before the first pack lands a ref.
         if repo.head().ok().and_then(|head| head.target()).is_none() {
-            return;
+            return 0;
         }
 
         if let Err(err) = GitLocks::cleanup_stale_index_lock(repo_path) {
@@ -5622,6 +5696,29 @@ impl GitReplication {
             );
         }
 
+        // The index is the stat cache the checkout diffs the working tree
+        // against, and on a node that accepts writes it drifts from HEAD by
+        // design: commits are built with `TreeUpdateBuilder` and never touch
+        // it (only maintenance refreshes it). Left stale, every file committed
+        // since the last maintenance pass looks modified and is rewritten —
+        // byte-identically — on every pass, which would both cost real I/O and
+        // make this report healing work it did not do. Refreshing it first
+        // makes the pass what it claims to be: HEAD, compared against disk.
+        if let Err(err) = Self::refresh_index(repo) {
+            tracing::warn!(
+                path = %repo_path.display(),
+                err = %err,
+                "cannot refresh the index before mirroring the working tree"
+            );
+        }
+
+        // Counted through the notification callback rather than by diffing
+        // first: libgit2 announces each path immediately before touching it,
+        // so the count is exactly what changed on disk and costs no second
+        // pass. A `Cell` because the callback is `FnMut` and borrowed for the
+        // duration of the checkout.
+        let touched = std::cell::Cell::new(0_usize);
+
         let mut checkout = CheckoutBuilder::new();
 
         // `force` writes over whatever is on disk, and `remove_untracked`
@@ -5629,7 +5726,15 @@ impl GitReplication {
         // the pass converge from any prior state. The index is updated as
         // well (libgit2's default), which is what keeps `git status` clean
         // between maintenance passes.
-        checkout.force().remove_untracked(true);
+        checkout
+            .force()
+            .remove_untracked(true)
+            .notify_on(git2::CheckoutNotificationType::UPDATED)
+            .notify(|_kind, _path, _baseline, _target, _workdir| {
+                touched.set(touched.get() + 1);
+
+                true
+            });
 
         if let Err(err) = repo.checkout_head(Some(&mut checkout)) {
             tracing::warn!(
@@ -5638,6 +5743,19 @@ impl GitReplication {
                 "cannot mirror the working tree onto HEAD"
             );
         }
+
+        touched.get()
+    }
+
+    /// Resets the on-disk index to HEAD, the same refresh maintenance does.
+    fn refresh_index(repo: &Repository) -> Result<(), AppError> {
+        let head_tree = repo.head()?.peel_to_commit()?.tree()?;
+        let mut index = repo.index()?;
+
+        index.read_tree(&head_tree)?;
+        index.write()?;
+
+        Ok(())
     }
 
     /// Relates `remote_sha` to this repository's HEAD using local objects

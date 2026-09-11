@@ -117,6 +117,8 @@ Use the sample [config.toml](https://github.com/crisp-oss/githttp-fs/blob/master
 * `api_key` (type: _string_, allowed: any string, no default) — API key for the githttp-fs HTTP API
 * `repos_path` (type: _string_, allowed: UNIX path, no default) — Path to all Git repositories (all tenants are stored in this path)
 * `log_level` (type: _string_, allowed: `debug`, `info`, `warn`, `error`, default: `info`) — Verbosity of logging, set it to `error` in production
+* `checkout_files` (type: _boolean_, allowed: `true`, `false`, default: `true`) — Whether each tenant's files are kept on the working tree, so a human can `ls` a repository; nothing githttp-fs serves reads them, so turning this off saves the uncompressed size of all content (see [Considerations](CONSIDERATIONS.md#files-on-disk))
+* `checkout_files_autoheal` (type: _boolean_, allowed: `true`, `false`, default: `false`) — Whether startup checks every tenant out to its HEAD, healing files that are missing or stale on disk; opt-in because it walks the whole store and removes files HEAD no longer names, so enable it for one restart after turning `checkout_files` on
 * `allowed_extensions` (type: _array[string]_, allowed: file extensions eg. `["md", "mdx"]`, default: none) — Optional whitelist of file extensions accepted for file writes and move destinations; when unset, all extensions are accepted
 
 **[hooks]**

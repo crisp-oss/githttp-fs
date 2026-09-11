@@ -183,6 +183,7 @@ pub async fn revert_commit(
     let repo_path_for_maintenance = repo_path.clone();
     let tenant_id_for_task = tenant_id.clone();
     let sha_for_task = sha.clone();
+    let checkout_files = state.config.server.checkout_files;
 
     let (new_commit_sha, file_changes) = run_blocking(move || {
         git::GitCommits::revert_commit(
@@ -192,6 +193,7 @@ pub async fn revert_commit(
             message.as_deref(),
             &author.name,
             &author.email,
+            checkout_files,
         )
     })
     .await?;
@@ -282,6 +284,7 @@ pub async fn rollback_commit(
     let repo_path_for_maintenance = repo_path.clone();
     let tenant_id_for_task = tenant_id.clone();
     let sha_for_task = sha.clone();
+    let checkout_files = state.config.server.checkout_files;
 
     let (new_commit_sha, file_changes) = run_blocking(move || {
         git::GitCommits::rollback_commit(
@@ -291,6 +294,7 @@ pub async fn rollback_commit(
             message.as_deref(),
             &author.name,
             &author.email,
+            checkout_files,
         )
     })
     .await?;

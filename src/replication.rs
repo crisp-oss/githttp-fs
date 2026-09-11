@@ -80,7 +80,9 @@
 //!   HEAD ([`crate::git::GitReplication::mirror_working_tree`]). A full
 //!   checkout rather than a delta because it converges from any prior state,
 //!   including the no-working-tree-at-all one a store replicated by an older
-//!   build is in.
+//!   build is in. Switched off with `server.checkout_files`, which a replica
+//!   is the likeliest node to want off; healing an already-filled store is
+//!   [`crate::checkout`]'s job.
 
 use dashmap::DashMap;
 use reqwest::Client;
@@ -2164,30 +2166,19 @@ impl ReplicaFollower {
         // stays gated until its first catch-up has actually landed content.
         let index = self.state.repository_index.clone();
 
-        let held = run_blocking(move || Ok(index.snapshot().repositories))
-            .await
-            .unwrap_or_default();
+        let already_holds_repositories =
+            run_blocking(move || Ok(!index.snapshot().repositories.is_empty()))
+                .await
+                .unwrap_or(false);
 
-        if held.is_empty() {
-            tracing::info!("cold replica, holding traffic until the first catch-up completes");
-        } else {
+        if already_holds_repositories {
             tracing::info!(
-                repositories = held.len(),
                 "replica restarted with existing repositories, serving while it catches up"
             );
 
             self.state.replica_status.mark_bootstrapped();
-
-            // Mirror what this node already holds onto its working trees. A
-            // landed pack mirrors its own repository, so this pass exists for
-            // the ones that landed *before* this node did: a store replicated
-            // by an older build has no working tree at all, and nothing else
-            // would fill it in until that tenant happened to be written again
-            // upstream. It is a `stat` walk per tenant that writes only what
-            // is missing, it runs off the worker's path so catch-up is not
-            // delayed by it, and it is never repeated — every later sync
-            // mirrors as it goes.
-            tokio::spawn(self.clone().mirror_held_working_trees(held));
+        } else {
+            tracing::info!("cold replica, holding traffic until the first catch-up completes");
         }
 
         let mut reconciled_once = false;
@@ -2297,44 +2288,6 @@ impl ReplicaFollower {
                 _ = self.wake.notified() => {}
             }
         }
-    }
-
-    /// Checks the working tree of every repository this node already holds
-    /// out to its HEAD, one at a time.
-    ///
-    /// Runs once, at startup, and only on a replica that booted with content:
-    /// a pack mirrors its own repository as it lands, so the only trees this
-    /// can be repairing are ones replicated before the mirroring existed (or
-    /// left torn by a process that was killed mid-checkout). Sequential and
-    /// off the worker's path on purpose — it is disk work that nothing waits
-    /// on, and a replica serves reads from HEAD's tree throughout, so a tenant
-    /// whose turn has not come yet is fully readable over the API.
-    ///
-    /// Each repository is mirrored under its own write lock, so the pass can
-    /// never run against a repository a pack is being applied to, or against
-    /// a maintenance pass.
-    async fn mirror_held_working_trees(self: Arc<Self>, held: Vec<RepositoryHead>) {
-        let total = held.len();
-
-        for repository in held {
-            let repo_path = self.repo_path(&repository.collection_id, &repository.tenant_id);
-
-            let lock_key = format!("{}/{}", repository.collection_id, repository.tenant_id);
-            let lock = self.state.get_repo_lock(&lock_key);
-            let _lock_guard = lock.lock().await;
-
-            let _ = run_blocking(move || {
-                GitReplication::mirror_working_tree(&repo_path);
-
-                Ok(())
-            })
-            .await;
-        }
-
-        tracing::info!(
-            repositories = total,
-            "mirrored existing replica working trees onto HEAD"
-        );
     }
 
     /// Compares the master's whole repository listing against this node's own
@@ -2814,9 +2767,15 @@ impl ReplicaFollower {
 
         let apply_repo_path = repo_path.clone();
         let apply_pack_path = pack_path.clone();
+        let checkout_files = self.state.config.server.checkout_files;
 
         let outcome = run_blocking(move || {
-            GitReplication::apply_pack(&apply_repo_path, &apply_pack_path, &apply_head)
+            GitReplication::apply_pack(
+                &apply_repo_path,
+                &apply_pack_path,
+                &apply_head,
+                checkout_files,
+            )
         })
         .await;
 

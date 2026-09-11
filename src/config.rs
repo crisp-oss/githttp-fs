@@ -145,6 +145,57 @@ pub struct ServerConfig {
     pub api_key: String,
     pub repos_path: PathBuf,
     pub log_level: Option<LogLevel>,
+    /// Whether each tenant's files are spelled out on the working tree, so a
+    /// human can `ls` a repository.
+    ///
+    /// Nothing this server answers ever reads them — every route resolves
+    /// content from HEAD's tree and the object database — so turning this off
+    /// costs only that inspectability, and saves the *uncompressed* size of
+    /// all content plus one filesystem block per file and directory. Git
+    /// compresses blobs, so on markdown the working tree is several times
+    /// larger than the `.git` holding its whole history.
+    ///
+    /// Defaults to `true`, which is how every deployment behaved before this
+    /// key existed.
+    #[serde(default = "default_true")]
+    pub checkout_files: bool,
+    /// Whether startup heals tenants whose files are missing or stale on
+    /// disk, by checking every one of them out.
+    ///
+    /// This is what makes `checkout_files = true` retroactive: a store that
+    /// ran with it off, or one replicated before replication checked
+    /// anything out, has working trees that no ordinary write would ever
+    /// fill in. The pass is idempotent and converging, so it repairs both
+    /// "never mirrored" and "went stale while mirroring was off".
+    ///
+    /// **Defaults to `false`**, unlike `checkout_files`, and the asymmetry is
+    /// deliberate. A default is a judgement about what should happen to a
+    /// deployment that said nothing, and these two keys answer different
+    /// questions: files on disk were always there, so keeping them changes
+    /// nothing — whereas this pass never ran before, touches *every*
+    /// repository in the store, and *removes* files HEAD no longer names.
+    /// Work of that blast radius is something an operator asks for, not
+    /// something an upgrade starts doing. Its cost is also the one part of
+    /// the feature that scales with the whole store rather than with one
+    /// operation: roughly a `stat` per file per boot, even when nothing needs
+    /// writing.
+    ///
+    /// Leaving it off stops nothing else: a master still mirrors each file as
+    /// it commits it, and a replica still checks a repository out when a pack
+    /// lands. Turning `checkout_files` on for a store that ran without it is
+    /// therefore a deliberate two-step — enable this for one restart, then
+    /// turn it back off.
+    ///
+    /// Inert when `checkout_files` is off, rather than a config error: there
+    /// is nothing to heal, the same way `include_date_type` alone changes
+    /// nothing on a listing.
+    #[serde(default)]
+    pub checkout_files_autoheal: bool,
+}
+
+/// Serde default for a flag whose absence must mean "as it always was".
+fn default_true() -> bool {
+    true
 }
 
 /// Request-level guard rails, grouped in their own `[limits]` section.
