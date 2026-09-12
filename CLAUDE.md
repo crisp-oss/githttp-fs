@@ -884,6 +884,8 @@ After applying code changes, always run `cargo fmt` before `cargo build`.
 
 The suite lives in `src/tests/`, registered as `#[cfg(test)] mod tests;` in `main.rs` rather than in a `tests/` directory — a binary crate has no library target, and an in-crate module reaches `build_router` and every internal module without adding one. Run it with `cargo test`.
 
+**When to run it.** `cargo test` is **not** part of the ordinary edit loop: while building a feature or a fix, the routine after changing code stays `cargo fmt` then `cargo build`, because the build is what catches the mistakes worth catching at that stage and the suite is too slow to pay for on every iteration. It becomes mandatory at exactly one moment — **cutting a release** (see [Release procedure](#release-procedure) below), where it runs automatically and a failure blocks the release rather than being noted and worked around. The exception is when the change under development *is* the suite itself, or when running it has been asked for: there, running it is the work rather than overhead.
+
 It is split the way the codebase is. Modules that are pure functions of their input are tested directly (`validate`, `seek`, `order_index`, `config`, `util`); everything whose contract is an HTTP contract is tested through a **real server on a real socket** (`harness.rs`), because the API-key guard, the replica read-only guard, and the `/v1` nesting are router behaviour that a handler-level test would assert nothing about. Each server gets its own `tempfile::TempDir` as `repos_path`, so tests share no state and run fully parallel; hook tests drive a stub receiver that records payloads in delivery order, which is how ordering promises are asserted.
 
 The behaviour asserted is the behaviour documented in this file. When a test's expectation looks surprising, the rule it comes from is quoted in a comment above it — so a change that breaks a test can be judged against what the API promised, not merely against what the code used to do. A new route, parameter, or event therefore belongs in the suite in the same change that documents it here.
@@ -909,8 +911,9 @@ To bump the version to `vX.Y.Z`:
 3. Update the version in `debian/rules`
 4. Document every change since the previous tag in `CHANGELOG.md` (see [Changelog](#changelog) below)
 5. Run `cargo build` to regenerate `Cargo.lock`
-6. Commit all changes with message `vX.Y.Z`
-7. Tag the commit with `vX.Y.Z`
+6. Run `cargo test` and **enforce a fully passing suite** — this is the one point in the workflow where the tests are run automatically, and a failure stops the release: fix it, or do not tag
+7. Commit all changes with message `vX.Y.Z`
+8. Tag the commit with `vX.Y.Z`
 
 ## Changelog
 
