@@ -15,6 +15,18 @@ use crate::tests::harness::{author, TestServer};
 
 const TENANT: &str = "/docs/acme";
 
+/// The children of a named directory node in a listing level.
+fn children<'a>(nodes: &'a Value, name: &str) -> &'a Value {
+    nodes
+        .as_array()
+        .expect("listing level is not an array")
+        .iter()
+        .find(|node| node["name"] == name)
+        .unwrap_or_else(|| panic!("no directory named {} in {}", name, nodes))
+        .get("children")
+        .unwrap_or_else(|| panic!("{} has no children", name))
+}
+
 fn names(nodes: &Value) -> Vec<String> {
     nodes
         .as_array()
@@ -1048,5 +1060,82 @@ async fn creating_a_file_changes_no_index() {
     assert_eq!(
         stored_order(&server, "/docs").await.unwrap(),
         vec!["intro.md"]
+    );
+}
+
+#[tokio::test]
+async fn the_listing_root_is_ordered_before_the_page_window_is_sliced() {
+    // Pagination is over root-level entries, so ordering them afterwards
+    // would page over the wrong sequence — the caller would get page 1 of
+    // the *unordered* listing, re-sorted.
+    let server = TestServer::start().await;
+
+    for name in ["alpha.md", "bravo.md", "charlie.md", "delta.md"] {
+        server.write_file(TENANT, name, "x").await;
+    }
+
+    server
+        .put(
+            &format!("{}/order", TENANT),
+            json!({
+                "author": author(),
+                "order": ["delta.md", "charlie.md", "bravo.md", "alpha.md"]
+            }),
+        )
+        .await
+        .expect_status(StatusCode::OK);
+
+    let first = server
+        .get(&format!(
+            "{}/files?apply_order_index=true&page=1&per_page=2",
+            TENANT
+        ))
+        .await
+        .json();
+
+    assert_eq!(names(&first["files"]), vec!["delta.md", "charlie.md"]);
+    assert_eq!(first["has_more"], true);
+
+    let second = server
+        .get(&format!(
+            "{}/files?apply_order_index=true&page=2&per_page=2",
+            TENANT
+        ))
+        .await
+        .json();
+
+    assert_eq!(names(&second["files"]), vec!["bravo.md", "alpha.md"]);
+    assert_eq!(second["has_more"], false);
+}
+
+#[tokio::test]
+async fn a_depth_limited_stub_is_ordered_without_reading_an_index_inside_it() {
+    // The one listing mode that opens blobs still opens only the indexes of
+    // directories it actually renders.
+    let server = TestServer::start().await;
+
+    seed(&server).await;
+
+    put_order(&server, "/docs", &["getting-started", "intro.md"]).await;
+    put_order(&server, "/docs/getting-started", &["first.md"]).await;
+
+    let body = server
+        .get(&format!(
+            "{}/files?prefix_path=/docs&apply_order_index=true&maximum_depth=1",
+            TENANT
+        ))
+        .await
+        .json();
+
+    assert_eq!(
+        names(&body["files"]),
+        vec!["getting-started", "intro.md", "advanced.mdx", "zebra.md"]
+    );
+    assert_eq!(
+        children(&body["files"], "getting-started")
+            .as_array()
+            .unwrap()
+            .len(),
+        0
     );
 }

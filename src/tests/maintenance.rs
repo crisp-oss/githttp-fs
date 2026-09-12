@@ -180,3 +180,257 @@ async fn a_pass_on_a_deleted_tenant_is_a_no_op() {
 
     assert_eq!(report.packed_objects, 0);
 }
+
+// --- Scheduling ----------------------------------------------------------
+
+/// Waits until a repository is consolidated: no loose objects, one pack.
+async fn wait_for_consolidation(repo_path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+
+    loop {
+        if GitMaintenance::pack_count(repo_path) == 1 {
+            return;
+        }
+
+        assert!(
+            std::time::Instant::now() < deadline,
+            "maintenance never ran on {}",
+            repo_path.display()
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn the_first_write_arms_a_pass_that_runs_after_the_delay() {
+    // The schedule is per repository and one-shot: the first write arms it,
+    // and the pass clears the slot so the next write re-arms it.
+    let server = TestServer::builder().maintenance(1).start().await;
+
+    server.write_file(TENANT, "a.md", "one").await;
+    server.write_file(TENANT, "b.md", "two").await;
+
+    let repo_path = server.repo_path("docs", "acme");
+
+    assert_eq!(
+        GitMaintenance::pack_count(&repo_path),
+        0,
+        "a fresh repository should hold only loose objects"
+    );
+
+    wait_for_consolidation(&repo_path).await;
+
+    // Content survives the pass, which is the only thing a caller can see.
+    assert_eq!(
+        server.read_file(TENANT, "a.md").await.as_deref(),
+        Some("one")
+    );
+}
+
+#[tokio::test]
+async fn repositories_receiving_no_writes_are_never_touched() {
+    let server = TestServer::builder().maintenance(1).start().await;
+
+    server.write_file("/docs/written", "a.md", "x").await;
+
+    // A second repository exists but is never written to after creation, so
+    // nothing arms a pass for it beyond its own first write.
+    wait_for_consolidation(&server.repo_path("docs", "written")).await;
+
+    assert!(
+        !server.repo_path("docs", "untouched").exists(),
+        "a repository was created without a write"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_tenant_disarms_its_pending_pass() {
+    // The timer outlives the repository otherwise, and would fire against a
+    // directory that is gone.
+    let server = TestServer::builder().maintenance(1).start().await;
+
+    server.write_file(TENANT, "a.md", "x").await;
+
+    server
+        .request(reqwest::Method::DELETE, TENANT, None, true)
+        .await
+        .expect_status(axum::http::StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+
+    // Nothing re-created the store, and the node is still healthy.
+    assert!(!server.repo_path("docs", "acme").exists());
+
+    server
+        .get_unauthenticated("/_health/status")
+        .await
+        .expect_status(axum::http::StatusCode::OK);
+}
+
+/// Builds a store whose repository holds several packfiles, by replicating
+/// commits into it one at a time — every applied delta lands as its own
+/// pack, which is the situation `maximum_packs` exists for.
+async fn multi_pack_store() -> (std::sync::Arc<tempfile::TempDir>, usize) {
+    let master = TestServer::builder()
+        .master()
+        .node_id("packs-master")
+        .start()
+        .await;
+
+    let replica = TestServer::builder()
+        .replica_of(master.replication_url.as_ref().unwrap())
+        .node_id("packs-replica")
+        .start()
+        .await;
+
+    for index in 0..4 {
+        master
+            .write_file(TENANT, "a.md", &format!("version {}", index))
+            .await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+
+        loop {
+            let response = replica.get(&format!("{}/files/a.md", TENANT)).await;
+
+            if response.status == axum::http::StatusCode::OK
+                && response.json()["content"] == format!("version {}", index)
+            {
+                break;
+            }
+
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the replica never caught up to version {}",
+                index
+            );
+
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    let packs = GitMaintenance::pack_count(&replica.repo_path("docs", "acme"));
+
+    assert!(
+        packs >= 2,
+        "replication did not produce several packs ({}), so the threshold cannot be tested",
+        packs
+    );
+
+    (replica.store(), packs)
+}
+
+#[tokio::test]
+async fn a_pack_threshold_runs_the_pass_at_once_instead_of_after_the_delay() {
+    // A replica applies every replicated delta as one more pack, and libgit2
+    // consults every pack index on every object lookup — so a busy tenant
+    // would otherwise degrade for a whole `delay_secs`.
+    let (store, packs_before) = multi_pack_store().await;
+
+    // A node adopting that store, with a day's delay: only the threshold can
+    // explain a pass running at all.
+    let node = TestServer::builder()
+        .reuse_store(store)
+        .maintenance(86_400)
+        .maximum_packs(2)
+        .start()
+        .await;
+
+    let repo_path = node.repo_path("docs", "acme");
+
+    assert_eq!(GitMaintenance::pack_count(&repo_path), packs_before);
+
+    // Arming is what a landed pack (or a write) does; the threshold is
+    // evaluated inside the armed task, off the request path.
+    node.state.maintenance.schedule(
+        "docs/acme",
+        repo_path.clone(),
+        node.state.get_repo_lock("docs/acme"),
+    );
+
+    wait_for_consolidation(&repo_path).await;
+
+    assert_eq!(
+        node.read_file(TENANT, "a.md").await.as_deref(),
+        Some("version 3")
+    );
+}
+
+#[tokio::test]
+async fn without_a_threshold_the_same_store_waits_out_the_delay() {
+    // The control for the test above: same store, same day-long delay, no
+    // threshold — nothing runs, and the packs stay.
+    let (store, packs_before) = multi_pack_store().await;
+
+    let node = TestServer::builder()
+        .reuse_store(store)
+        .maintenance(86_400)
+        .start()
+        .await;
+
+    let repo_path = node.repo_path("docs", "acme");
+
+    node.state.maintenance.schedule(
+        "docs/acme",
+        repo_path.clone(),
+        node.state.get_repo_lock("docs/acme"),
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert_eq!(
+        GitMaintenance::pack_count(&repo_path),
+        packs_before,
+        "a pass ran without a threshold to trigger it"
+    );
+}
+
+// --- Stale locks ---------------------------------------------------------
+
+#[tokio::test]
+async fn startup_removes_index_locks_left_by_a_killed_process() {
+    // At boot nothing can be in flight, so every lock on disk is by
+    // definition stale and safe to delete.
+    let server = TestServer::start().await;
+
+    server.write_file("/docs/one", "a.md", "x").await;
+    server.write_file("/docs/two", "b.md", "x").await;
+
+    let first = server.repo_path("docs", "one").join(".git/index.lock");
+    let second = server.repo_path("docs", "two").join(".git/index.lock");
+
+    std::fs::write(&first, b"").expect("cannot write lock");
+    std::fs::write(&second, b"").expect("cannot write lock");
+
+    crate::git::GitLocks::cleanup_all_stale_locks(&server.repos_path);
+
+    assert!(!first.exists(), "a stale lock survived startup cleanup");
+    assert!(!second.exists(), "a stale lock survived startup cleanup");
+
+    // And the repositories are still usable afterwards.
+    assert_eq!(
+        server.read_file("/docs/one", "a.md").await.as_deref(),
+        Some("x")
+    );
+}
+
+#[tokio::test]
+async fn a_stale_lock_never_blocks_a_write() {
+    // The write path does not touch the index at all, which is what makes a
+    // leftover lock harmless rather than fatal.
+    let server = TestServer::start().await;
+
+    server.write_file(TENANT, "a.md", "one").await;
+
+    let lock = server.repo_path("docs", "acme").join(".git/index.lock");
+
+    std::fs::write(&lock, b"").expect("cannot write lock");
+
+    server.write_file(TENANT, "a.md", "two").await;
+
+    assert_eq!(
+        server.read_file(TENANT, "a.md").await.as_deref(),
+        Some("two")
+    );
+}

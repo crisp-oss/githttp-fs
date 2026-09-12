@@ -518,3 +518,137 @@ async fn rolling_back_to_the_initial_commit_is_legal_where_reverting_it_is_not()
         .await
         .expect_status(StatusCode::OK);
 }
+
+#[tokio::test]
+async fn a_rollback_restores_a_rename_as_a_rename() {
+    // One `file.moved`, not a delete plus a create — which is what preserves
+    // downstream entity identity through a rollback.
+    //
+    // The scenario has to put HEAD back on the *pre*-rename path for the
+    // rollback to have a rename to redo: renaming a file and then renaming
+    // it back, and rolling back the first of the two.
+    let receiver = crate::tests::harness::HookReceiver::start().await;
+    let server = TestServer::builder().hooks(&receiver.url).start().await;
+
+    server.write_file(TENANT, "old.md", "# Hello").await;
+
+    let rename = server
+        .post(
+            &format!("{}/files/old.md/move", TENANT),
+            json!({ "author": author(), "destination": "new.md" }),
+        )
+        .await;
+
+    rename.expect_status(StatusCode::OK);
+
+    let rename_sha = rename.json()["commit_sha"].as_str().unwrap().to_string();
+
+    server
+        .post(
+            &format!("{}/files/new.md/move", TENANT),
+            json!({ "author": author(), "destination": "old.md" }),
+        )
+        .await
+        .expect_status(StatusCode::OK);
+
+    receiver.wait_for(3).await;
+
+    // HEAD holds the pre-rename path and nothing sits at the post-rename
+    // one, so the rollback settles it as a single move.
+    server
+        .post(
+            &format!("{}/commits/{}/rollback", TENANT, rename_sha),
+            json!({ "author": author() }),
+        )
+        .await
+        .expect_status(StatusCode::OK);
+
+    assert_eq!(
+        server.read_file(TENANT, "new.md").await.as_deref(),
+        Some("# Hello")
+    );
+    assert!(server.read_file(TENANT, "old.md").await.is_none());
+
+    let events = receiver.wait_for_exactly(4).await;
+
+    assert_eq!(events[3]["event"], "file.moved");
+    assert_eq!(events[3]["from"]["path"], "old.md");
+    assert_eq!(events[3]["to"]["path"], "new.md");
+}
+
+#[tokio::test]
+async fn a_rollback_leaves_a_path_the_commit_never_touched_even_when_it_is_the_other_half_of_a_rename(
+) {
+    // Rolling back the commit that *created* a file restores that file and
+    // nothing else: the later rename's destination was never in this
+    // commit's change set, so it stays exactly where it is.
+    let server = TestServer::start().await;
+
+    let create_sha = server.write_file(TENANT, "old.md", "# Hello").await;
+
+    server
+        .post(
+            &format!("{}/files/old.md/move", TENANT),
+            json!({ "author": author(), "destination": "new.md" }),
+        )
+        .await
+        .expect_status(StatusCode::OK);
+
+    server
+        .post(
+            &format!("{}/commits/{}/rollback", TENANT, create_sha),
+            json!({ "author": author() }),
+        )
+        .await
+        .expect_status(StatusCode::OK);
+
+    assert_eq!(
+        server.read_file(TENANT, "old.md").await.as_deref(),
+        Some("# Hello")
+    );
+    assert_eq!(
+        server.read_file(TENANT, "new.md").await.as_deref(),
+        Some("# Hello"),
+        "a path outside the commit's change set was touched"
+    );
+}
+
+#[tokio::test]
+async fn a_revert_of_a_rename_is_also_a_rename() {
+    let receiver = crate::tests::harness::HookReceiver::start().await;
+    let server = TestServer::builder().hooks(&receiver.url).start().await;
+
+    server.write_file(TENANT, "old.md", "# Hello").await;
+
+    let rename = server
+        .post(
+            &format!("{}/files/old.md/move", TENANT),
+            json!({ "author": author(), "destination": "new.md" }),
+        )
+        .await;
+
+    rename.expect_status(StatusCode::OK);
+
+    let rename_sha = rename.json()["commit_sha"].as_str().unwrap().to_string();
+
+    receiver.wait_for(2).await;
+
+    server
+        .post(
+            &format!("{}/commits/{}/revert", TENANT, rename_sha),
+            json!({ "author": author() }),
+        )
+        .await
+        .expect_status(StatusCode::OK);
+
+    assert_eq!(
+        server.read_file(TENANT, "old.md").await.as_deref(),
+        Some("# Hello")
+    );
+
+    let events = receiver.wait_for(3).await;
+
+    assert_eq!(events[2]["event"], "file.moved");
+    assert_eq!(events[2]["from"]["path"], "new.md");
+    assert_eq!(events[2]["to"]["path"], "old.md");
+}

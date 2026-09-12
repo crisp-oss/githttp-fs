@@ -1000,3 +1000,292 @@ async fn two_collections_holding_the_same_tenant_id_are_separate_repositories() 
 
     assert!(server.read_file("/blog/acme", "a.md").await.is_some());
 }
+
+// --- Date-range filtering ------------------------------------------------
+
+/// Builds a repository whose files have distinct, widely separated git
+/// dates — which no sequence of API calls can produce, since every write is
+/// stamped `now`.
+///
+/// The resulting dates:
+///
+/// | file     | created    | updated    |
+/// |----------|------------|------------|
+/// | `a.md`   | 2020-01-01 | 2022-01-01 |
+/// | `b.md`   | 2021-01-01 | 2021-01-01 |
+async fn seed_dated_tree(server: &TestServer) {
+    use crate::tests::fixture::{at, commit_files_at};
+
+    // One ordinary write so the repository exists with its root commit.
+    server.write_file(TENANT, "seed.md", "seed").await;
+
+    let repo = server.repo_path("docs", "acme");
+
+    commit_files_at(
+        &repo,
+        at("2020-01-01T00:00:00Z"),
+        "add a",
+        &[("a.md", b"one")],
+    );
+    commit_files_at(
+        &repo,
+        at("2021-01-01T00:00:00Z"),
+        "add b",
+        &[("b.md", b"one")],
+    );
+    commit_files_at(
+        &repo,
+        at("2022-01-01T00:00:00Z"),
+        "edit a",
+        &[("a.md", b"two")],
+    );
+}
+
+#[tokio::test]
+async fn the_date_window_is_half_open_on_the_updated_date_by_default() {
+    let server = TestServer::start().await;
+
+    seed_dated_tree(&server).await;
+
+    // `updated` is the most recent commit that touched the file.
+    let body = server
+        .get(&format!(
+            "{}/files?include_date_from=2021-06-01T00:00:00Z",
+            TENANT
+        ))
+        .await
+        .json();
+
+    // a.md was last touched in 2022, and the seed file is stamped now —
+    // both are after the bound. b.md's last touch (2021-01) is not.
+    assert_eq!(names(&body["files"]), vec!["a.md", "seed.md"]);
+
+    let body = server
+        .get(&format!(
+            "{}/files?include_date_to=2021-06-01T00:00:00Z",
+            TENANT
+        ))
+        .await
+        .json();
+
+    // b.md (2021-01) is in; a.md (2022) is out; the seed file is stamped now
+    // and so is out too.
+    assert_eq!(names(&body["files"]), vec!["b.md"]);
+}
+
+#[tokio::test]
+async fn include_date_type_created_selects_a_different_set_from_the_same_window() {
+    let server = TestServer::start().await;
+
+    seed_dated_tree(&server).await;
+
+    // Same bound, different date: by `created`, a.md belongs to 2020 rather
+    // than to 2022, so it falls inside a window that excludes it by
+    // `updated`.
+    let body = server
+        .get(&format!(
+            "{}/files?include_date_to=2021-06-01T00:00:00Z&include_date_type=created",
+            TENANT
+        ))
+        .await
+        .json();
+
+    assert_eq!(names(&body["files"]), vec!["a.md", "b.md"]);
+}
+
+#[tokio::test]
+async fn a_date_filter_prunes_directories_left_holding_nothing() {
+    use crate::tests::fixture::{at, commit_files_at};
+
+    let server = TestServer::start().await;
+
+    server.write_file(TENANT, "seed.md", "seed").await;
+
+    let repo = server.repo_path("docs", "acme");
+
+    commit_files_at(
+        &repo,
+        at("2020-01-01T00:00:00Z"),
+        "old",
+        &[("old/a.md", b"x")],
+    );
+    commit_files_at(
+        &repo,
+        at("2022-01-01T00:00:00Z"),
+        "new",
+        &[("new/b.md", b"x")],
+    );
+
+    let body = server
+        .get(&format!(
+            "{}/files?include_date_from=2021-01-01T00:00:00Z&include_date_to=2023-01-01T00:00:00Z",
+            TENANT
+        ))
+        .await
+        .json();
+
+    // Directories survive only as the structure leading to a surviving file.
+    assert_eq!(names(&body["files"]), vec!["new"]);
+    assert_eq!(names(children(&body["files"], "new")), vec!["b.md"]);
+}
+
+#[tokio::test]
+async fn a_date_filter_intersects_with_a_name_search() {
+    let server = TestServer::start().await;
+
+    seed_dated_tree(&server).await;
+
+    // A file must match both the name prefix and the date window.
+    let body = server
+        .get(&format!(
+            "{}/files?file_name_starts_with=a&include_date_to=2021-06-01T00:00:00Z",
+            TENANT
+        ))
+        .await
+        .json();
+
+    assert_eq!(names(&body["files"]), Vec::<String>::new());
+
+    let body = server
+        .get(&format!(
+            "{}/files?file_name_starts_with=b&include_date_to=2021-06-01T00:00:00Z",
+            TENANT
+        ))
+        .await
+        .json();
+
+    assert_eq!(names(&body["files"]), vec!["b.md"]);
+}
+
+// --- Search and depth composition ----------------------------------------
+
+#[tokio::test]
+async fn a_matched_directory_at_the_depth_limit_renders_as_a_childless_stub() {
+    // `maximum_depth` bounds the descent uniformly: a directory sitting *at*
+    // the limit shows because it matched, but nothing below it is walked.
+    let server = TestServer::start().await;
+
+    seed_tree(&server).await;
+
+    let body = server
+        .get(&format!(
+            "{}/files?file_name_starts_with=docs&maximum_depth=1",
+            TENANT
+        ))
+        .await
+        .json();
+
+    assert_eq!(names(&body["files"]), vec!["docs"]);
+    assert_eq!(
+        children(&body["files"], "docs").as_array().unwrap().len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_match_below_the_depth_limit_is_never_found() {
+    let server = TestServer::start().await;
+
+    seed_tree(&server).await;
+
+    // `advanced.md` lives at depth 3 and is invisible to a depth-2 listing.
+    let body = server
+        .get(&format!(
+            "{}/files?file_name_starts_with=advanced&maximum_depth=2",
+            TENANT
+        ))
+        .await
+        .json();
+
+    assert_eq!(names(&body["files"]), Vec::<String>::new());
+}
+
+// --- Content that cannot be represented ----------------------------------
+
+#[tokio::test]
+async fn a_file_that_is_not_utf8_fails_the_read_rather_than_reading_as_missing() {
+    use crate::tests::fixture::commit_files_at;
+
+    let server = TestServer::start().await;
+
+    server.write_file(TENANT, "ok.md", "fine").await;
+
+    // A blob the write route could never have accepted — its `content` is a
+    // JSON string — but which a hand-made commit can hold.
+    commit_files_at(
+        &server.repo_path("docs", "acme"),
+        1_780_000_000,
+        "binary",
+        &[("binary.md", &[0xff, 0xfe, 0x00])],
+    );
+
+    let single = server.get(&format!("{}/files/binary.md", TENANT)).await;
+
+    single.expect_status(StatusCode::UNPROCESSABLE_ENTITY);
+
+    assert!(
+        single.error_message().contains("binary.md"),
+        "{}",
+        single.text
+    );
+
+    // In a batch it is a hard failure too, naming the path: `null` must
+    // strictly mean "not found", never "unreadable".
+    let batch = server
+        .post(
+            &format!("{}/batch/files/read", TENANT),
+            json!({ "files": ["ok.md", "binary.md"] }),
+        )
+        .await;
+
+    batch.expect_status(StatusCode::UNPROCESSABLE_ENTITY);
+
+    assert!(
+        batch.error_message().contains("binary.md"),
+        "{}",
+        batch.text
+    );
+}
+
+// --- Seeking a packed object ---------------------------------------------
+
+#[tokio::test]
+async fn seeking_works_the_same_on_a_packed_object_as_on_a_loose_one() {
+    // Loose objects are seeked through a streaming ODB read that stops
+    // inflating early; libgit2 cannot stream a packed object, so those fall
+    // back to a cursor over the blob. Both must return the same window.
+    let server = TestServer::start().await;
+
+    let content = "---\ntitle: T\n---\n# Heading\nbody\n";
+
+    server.write_file(TENANT, "a.md", content).await;
+
+    let query = format!(
+        "{}/files/a.md?seek_from_line_starts_with=%5B%22---%22%5D\
+         &seek_to_line_starts_with=%24seek_from_line_starts_with",
+        TENANT
+    );
+
+    let loose = server.get(&query).await.json()["content"].clone();
+
+    assert_eq!(loose, "---\ntitle: T\n---\n");
+
+    // Consolidate every loose object into a packfile, then read again.
+    crate::git::GitMaintenance::run(&server.repo_path("docs", "acme"), false, true)
+        .expect("maintenance failed");
+
+    assert_eq!(
+        crate::git::GitMaintenance::pack_count(&server.repo_path("docs", "acme")),
+        1
+    );
+
+    let packed = server.get(&query).await.json()["content"].clone();
+
+    assert_eq!(packed, loose);
+
+    // And a whole-file read is unaffected too.
+    assert_eq!(
+        server.read_file(TENANT, "a.md").await.as_deref(),
+        Some(content)
+    );
+}

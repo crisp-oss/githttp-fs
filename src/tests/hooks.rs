@@ -15,6 +15,8 @@
 //! - **Delivery is strictly sequential per repository**, because jobs are
 //!   enqueued while the tenant write lock is still held.
 
+use std::time::Duration;
+
 use axum::http::StatusCode;
 use serde_json::json;
 
@@ -676,4 +678,281 @@ async fn a_replay_with_no_receiver_configured_is_refused() {
         )
         .await
         .expect_status(StatusCode::BAD_REQUEST);
+}
+
+// --- Delivery under failure ----------------------------------------------
+
+#[tokio::test]
+async fn a_failed_delivery_is_retried_until_it_lands() {
+    let receiver = HookReceiver::start().await;
+    let server = TestServer::builder()
+        .hooks(&receiver.url)
+        .hook_retries(5, 1)
+        .start()
+        .await;
+
+    // The first two attempts are refused; the third succeeds.
+    receiver.fail_next(2);
+
+    server.write_file(TENANT, "a.md", "x").await;
+
+    let deliveries = receiver.wait_for(3).await;
+
+    // Every attempt carries the same payload — a retry is the same event
+    // again, not a new one.
+    assert_eq!(deliveries.len(), 3);
+    assert_eq!(deliveries[0], deliveries[2]);
+    assert_eq!(deliveries[2]["event"], "file.created");
+}
+
+#[tokio::test]
+async fn backoff_grows_between_attempts() {
+    // Attempt N waits `retry_backoff_ms * 2^(N-1)` before retrying.
+    let receiver = HookReceiver::start().await;
+    let server = TestServer::builder()
+        .hooks(&receiver.url)
+        .hook_retries(4, 120)
+        .start()
+        .await;
+
+    receiver.fail_next(2);
+
+    server.write_file(TENANT, "a.md", "x").await;
+
+    receiver.wait_for(3).await;
+
+    let deliveries = receiver.deliveries();
+
+    let first_gap = deliveries[1].at.duration_since(deliveries[0].at);
+    let second_gap = deliveries[2].at.duration_since(deliveries[1].at);
+
+    assert!(
+        first_gap >= Duration::from_millis(100),
+        "first retry did not wait: {:?}",
+        first_gap
+    );
+    assert!(
+        second_gap >= first_gap * 3 / 2,
+        "backoff did not grow: {:?} then {:?}",
+        first_gap,
+        second_gap
+    );
+}
+
+#[tokio::test]
+async fn a_permanently_failing_delivery_gives_up_without_wedging_the_queue() {
+    // The retry budget is finite: the event is lost (logged CRITICAL), and
+    // the next commit's hooks still flow. A queue that blocked forever on
+    // one dead payload would take the repository's whole future with it.
+    let receiver = HookReceiver::start().await;
+    let server = TestServer::builder()
+        .hooks(&receiver.url)
+        .hook_retries(2, 1)
+        .start()
+        .await;
+
+    receiver.fail_next(2);
+
+    server.write_file(TENANT, "a.md", "one").await;
+
+    receiver.wait_for(2).await;
+
+    server.write_file(TENANT, "b.md", "two").await;
+
+    let deliveries = receiver.wait_for(3).await;
+
+    // Two refused attempts for the first file, then the second file's own
+    // event — delivered, not stuck behind the abandoned one.
+    assert_eq!(deliveries[2]["file"]["path"], "b.md");
+}
+
+#[tokio::test]
+async fn a_wedged_receiver_holds_up_only_its_own_repository() {
+    // The concurrency half of the ordering promise: different queue keys are
+    // different tokio tasks, so a slow or down receiver for one repository
+    // never delays another.
+    let receiver = HookReceiver::start().await;
+    let server = TestServer::builder().hooks(&receiver.url).start().await;
+
+    receiver.stall_tenant("stuck");
+
+    server.write_file("/docs/stuck", "a.md", "x").await;
+
+    // Its delivery is now held open, occupying that repository's queue.
+    receiver.wait_for(1).await;
+
+    server.write_file("/docs/stuck", "b.md", "x").await;
+    server.write_file("/docs/moving", "c.md", "x").await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+
+    loop {
+        let delivered: Vec<_> = receiver
+            .events()
+            .into_iter()
+            .filter(|payload| payload["tenant_id"] == "moving")
+            .collect();
+
+        if !delivered.is_empty() {
+            break;
+        }
+
+        assert!(
+            deadline > std::time::Instant::now(),
+            "a healthy repository was held up by a wedged one: {:?}",
+            receiver.event_names()
+        );
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Meanwhile the stalled repository's *second* event is still waiting
+    // behind its first — ordering within a repository is never sacrificed to
+    // make progress.
+    assert_eq!(
+        receiver
+            .events()
+            .iter()
+            .filter(|payload| payload["tenant_id"] == "stuck")
+            .count(),
+        1
+    );
+
+    receiver.resume();
+
+    // And it drains in order once the receiver recovers.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+
+    loop {
+        let stuck: Vec<_> = receiver
+            .events()
+            .into_iter()
+            .filter(|payload| payload["tenant_id"] == "stuck")
+            .collect();
+
+        if stuck.len() == 2 {
+            assert_eq!(stuck[0]["file"]["path"], "a.md");
+            assert_eq!(stuck[1]["file"]["path"], "b.md");
+
+            break;
+        }
+
+        assert!(
+            deadline > std::time::Instant::now(),
+            "the stalled repository never drained"
+        );
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn the_configured_auth_header_travels_on_every_delivery() {
+    // How a receiver authenticates this server.
+    let receiver = HookReceiver::start().await;
+    let server = TestServer::builder()
+        .hooks(&receiver.url)
+        .hook_auth("Authorization", "Bearer hook-secret")
+        .start()
+        .await;
+
+    server.write_file(TENANT, "a.md", "x").await;
+    server.write_file(TENANT, "b.md", "x").await;
+
+    receiver.wait_for(2).await;
+
+    for delivery in receiver.deliveries() {
+        assert_eq!(delivery.auth_header.as_deref(), Some("Bearer hook-secret"));
+    }
+}
+
+#[tokio::test]
+async fn no_auth_header_is_sent_when_none_is_configured() {
+    let receiver = HookReceiver::start().await;
+    let server = TestServer::builder().hooks(&receiver.url).start().await;
+
+    server.write_file(TENANT, "a.md", "x").await;
+
+    receiver.wait_for(1).await;
+
+    assert_eq!(receiver.deliveries()[0].auth_header, None);
+}
+
+#[tokio::test]
+async fn delay_ms_throttles_between_replayed_deliveries_and_not_after_the_last() {
+    let receiver = HookReceiver::start().await;
+    let server = TestServer::builder().hooks(&receiver.url).start().await;
+
+    for path in ["a.md", "b.md", "c.md"] {
+        server.write_file(TENANT, path, "x").await;
+    }
+
+    receiver.wait_for(3).await;
+
+    let started = std::time::Instant::now();
+
+    let response = server
+        .post(
+            &format!("{}/batch/replay/hook", TENANT),
+            json!({ "direction": "create", "delay_ms": 200 }),
+        )
+        .await;
+
+    response.expect_status(StatusCode::OK);
+
+    // The response returns as soon as the job is enqueued: a 200 means
+    // "scheduled", not "delivered".
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "the request waited for delivery: {:?}",
+        started.elapsed()
+    );
+
+    receiver.wait_for(6).await;
+
+    let replayed: Vec<_> = receiver
+        .deliveries()
+        .into_iter()
+        .filter(|delivery| delivery.payload["replayed"] == true)
+        .collect();
+
+    assert_eq!(replayed.len(), 3);
+
+    for pair in replayed.windows(2) {
+        let gap = pair[1].at.duration_since(pair[0].at);
+
+        assert!(
+            gap >= Duration::from_millis(150),
+            "deliveries were not throttled: {:?}",
+            gap
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_replay_scopes_its_snapshot_to_the_prefix_path() {
+    let receiver = HookReceiver::start().await;
+    let server = TestServer::builder().hooks(&receiver.url).start().await;
+
+    server.write_file(TENANT, "docs/a.md", "x").await;
+    server.write_file(TENANT, "other/b.md", "x").await;
+
+    receiver.wait_for(2).await;
+
+    let response = server
+        .post(
+            &format!("{}/batch/replay/hook", TENANT),
+            json!({ "direction": "create", "prefix_path": "/docs" }),
+        )
+        .await;
+
+    response.expect_status(StatusCode::OK);
+
+    assert_eq!(response.json()["files"], 1);
+
+    let events = receiver.wait_for_exactly(3).await;
+
+    // Paths stay repo-root-relative: the prefix scopes which files are in
+    // the snapshot, it is not joined onto them.
+    assert_eq!(events[2]["file"]["path"], "docs/a.md");
 }

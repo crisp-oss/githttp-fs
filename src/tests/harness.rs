@@ -18,22 +18,37 @@
 
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
 };
 
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    routing::post,
+    Json, Router,
+};
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::watch};
 
-use crate::{build_router, config::Config, replication::ReplicationIdentity, state::AppState};
+use crate::{
+    build_replication_server, build_router, config::Config, replication::ReplicationIdentity,
+    state::AppState,
+};
 
 /// How long a test waits for asynchronous work (hook delivery) before
 /// failing. Generous, because it is only ever reached on a real failure —
 /// the happy path polls at 5 ms and returns as soon as the work lands.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const WAIT_POLL: Duration = Duration::from_millis(5);
+
+/// The replication secret every node in a test deployment shares. Distinct
+/// from the API key on purpose: no caller of the product's API ever holds it.
+pub const REPLICATION_SECRET: &str = "test-replication-secret";
 
 /// Author object every write request needs. One helper so a change to the
 /// shape is a one-line edit across the suite.
@@ -93,6 +108,15 @@ pub struct TestServer {
     pub base_url: String,
     pub repos_path: PathBuf,
     pub api_key: String,
+    /// Base URL of this node's *replication* listener (`/_replication`),
+    /// bound only when `[replication]` is configured. A replica's
+    /// `master_url` points here, never at the content port. Peers
+    /// authenticate against it with [`REPLICATION_SECRET`].
+    pub replication_url: Option<String>,
+    /// This node's own `AppState`, for the few tests that have to reach a
+    /// background subsystem directly (the repository index, say) rather than
+    /// through a route.
+    pub state: AppState,
     client: reqwest::Client,
     /// Kept alive for the life of the server: dropping the last handle
     /// removes the store. Shared rather than owned so a test can restart a
@@ -107,12 +131,21 @@ pub struct TestServer {
 pub struct TestServerBuilder {
     hooks_url: Option<String>,
     hook_events: Vec<&'static str>,
+    hook_retry_attempts: u32,
+    hook_retry_backoff_ms: u64,
+    hook_auth: Option<(String, String)>,
     allowed_extensions: Option<Vec<&'static str>>,
     batch_read_maximum_files: Option<usize>,
     replica: bool,
+    replication_role: Option<&'static str>,
+    master_url: Option<String>,
+    node_id: Option<String>,
+    poll_interval_secs: u64,
     checkout_files: Option<bool>,
     checkout_files_autoheal: Option<bool>,
     maintenance: bool,
+    maintenance_delay_secs: u64,
+    maintenance_maximum_packs: Option<usize>,
     store: Option<Arc<TempDir>>,
 }
 
@@ -120,6 +153,9 @@ impl TestServerBuilder {
     fn new() -> Self {
         Self {
             hooks_url: None,
+            hook_retry_attempts: 1,
+            hook_retry_backoff_ms: 1,
+            hook_auth: None,
             hook_events: vec![
                 "file.created",
                 "file.updated",
@@ -131,11 +167,61 @@ impl TestServerBuilder {
             allowed_extensions: None,
             batch_read_maximum_files: None,
             replica: false,
+            replication_role: None,
+            master_url: None,
+            node_id: None,
+            poll_interval_secs: 1,
             checkout_files: None,
             checkout_files_autoheal: None,
             maintenance: false,
+            maintenance_delay_secs: 86_400,
+            maintenance_maximum_packs: None,
             store: None,
         }
+    }
+
+    /// Enables background maintenance, with the given delay between a
+    /// repository's first write and its pass. Off in tests by default: it
+    /// would otherwise hold a timer per tenant for the life of the process.
+    pub fn maintenance(mut self, delay_secs: u64) -> Self {
+        self.maintenance = true;
+        self.maintenance_delay_secs = delay_secs;
+
+        self
+    }
+
+    /// Runs a repository's maintenance pass at once, rather than after the
+    /// delay, once it holds this many packfiles.
+    pub fn maximum_packs(mut self, maximum: usize) -> Self {
+        self.maintenance_maximum_packs = Some(maximum);
+
+        self
+    }
+
+    /// Makes this node a replication master: it binds a peer listener and
+    /// serves `/_replication/*` to replicas.
+    pub fn master(mut self) -> Self {
+        self.replication_role = Some("master");
+
+        self
+    }
+
+    /// Makes this node a replica following `master_replication_url` — the
+    /// master's *replication* listener, as a real deployment configures it.
+    pub fn replica_of(mut self, master_replication_url: &str) -> Self {
+        self.replication_role = Some("replica");
+        self.master_url = Some(master_replication_url.to_string());
+
+        self
+    }
+
+    /// How this node names itself to its peers. Must be unique within a
+    /// deployment — a master refuses a second stream for a node id already
+    /// connected from another process.
+    pub fn node_id(mut self, node_id: &str) -> Self {
+        self.node_id = Some(node_id.to_string());
+
+        self
     }
 
     /// Whether this node keeps a working tree on disk.
@@ -164,6 +250,22 @@ impl TestServerBuilder {
     /// [`hook_events`](Self::hook_events) narrows it.
     pub fn hooks(mut self, url: &str) -> Self {
         self.hooks_url = Some(url.to_string());
+
+        self
+    }
+
+    /// Total delivery attempts per payload (the first try included), and
+    /// the base delay its exponential backoff doubles from.
+    pub fn hook_retries(mut self, attempts: u32, backoff_ms: u64) -> Self {
+        self.hook_retry_attempts = attempts;
+        self.hook_retry_backoff_ms = backoff_ms;
+
+        self
+    }
+
+    /// Configures `[hooks.auth]`: a static header on every delivery.
+    pub fn hook_auth(mut self, header: &str, value: &str) -> Self {
+        self.hook_auth = Some((header.to_string(), value.to_string()));
 
         self
     }
@@ -245,34 +347,79 @@ impl TestServerBuilder {
                 "\n[hooks]\n\
                  url = {}\n\
                  events = [{}]\n\
-                 retry_attempts = 1\n\
-                 retry_backoff_ms = 1\n",
+                 retry_attempts = {}\n\
+                 retry_backoff_ms = {}\n",
                 toml_string(url),
                 self.hook_events
                     .iter()
                     .map(|event| toml_string(event))
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
+                self.hook_retry_attempts,
+                self.hook_retry_backoff_ms
             ));
+
+            if let Some((header, value)) = &self.hook_auth {
+                toml_text.push_str(&format!(
+                    "\n[hooks.auth]\nheader = {}\nvalue = {}\n",
+                    toml_string(header),
+                    toml_string(value)
+                ));
+            }
         }
 
         // Maintenance is armed by every write and would otherwise hold a
         // timer per tenant for the life of the test process. Tests that want
         // it exercise `GitMaintenance` directly instead.
         toml_text.push_str(&format!(
-            "\n[maintenance]\nenabled = {}\n",
-            self.maintenance
+            "\n[maintenance]\nenabled = {}\ndelay_secs = {}\n",
+            self.maintenance, self.maintenance_delay_secs
         ));
 
-        if self.replica {
-            toml_text.push_str(
-                "\n[replication]\n\
-                 role = \"replica\"\n\
-                 secret = \"test-replication-secret\"\n\
-                 node_id = \"test-replica\"\n\
-                 master_url = \"http://127.0.0.1:1\"\n\
-                 poll_interval_secs = 3600\n",
-            );
+        if let Some(maximum) = self.maintenance_maximum_packs {
+            toml_text.push_str(&format!("maximum_packs = {}\n", maximum));
+        }
+
+        // `.replica()` is the degenerate case: a replica whose master is
+        // unreachable, which is all the read-only and bootstrapping guards
+        // need. `.master()` / `.replica_of()` build a real pair.
+        let role = if self.replica {
+            Some("replica")
+        } else {
+            self.replication_role
+        };
+
+        if let Some(role) = role {
+            let node_id = self
+                .node_id
+                .clone()
+                .unwrap_or_else(|| format!("test-{}", role));
+
+            toml_text.push_str(&format!(
+                "\n[replication]\nrole = {}\nsecret = {}\nnode_id = {}\n",
+                toml_string(role),
+                toml_string(REPLICATION_SECRET),
+                toml_string(&node_id)
+            ));
+
+            if role == "replica" {
+                let master_url = self
+                    .master_url
+                    .clone()
+                    .unwrap_or_else(|| "http://127.0.0.1:1".to_string());
+
+                toml_text.push_str(&format!(
+                    "master_url = {}\npoll_interval_secs = {}\n",
+                    toml_string(&master_url),
+                    self.poll_interval_secs
+                ));
+            }
+
+            // Never bound as configured — the peer listener below takes an
+            // ephemeral port like the content one. The key still has to be
+            // present and distinct from `server.port`, which validation
+            // checks, so the config stays a realistic one.
+            toml_text.push_str("port = 5356\n");
         }
 
         let config: Config = toml::from_str(&toml_text)
@@ -291,7 +438,32 @@ impl TestServerBuilder {
         // this node keeps files on disk and was asked to heal them.
         crate::checkout::spawn(state.clone());
 
-        let router = build_router(state);
+        // The peer surface, on its own listener — two listeners, never one,
+        // exactly as `main` binds them.
+        let replication_url = if role.is_some() {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("cannot bind replication listener");
+
+            let address = listener
+                .local_addr()
+                .expect("cannot read replication listener port");
+
+            let replication_router = build_replication_server(state.clone());
+
+            tokio::spawn(async move {
+                let _outcome = axum::serve(listener, replication_router).await;
+            });
+
+            Some(format!("http://{}", address))
+        } else {
+            None
+        };
+
+        // Starts the follower when this node is a replica; inert otherwise.
+        crate::replication::spawn(state.clone());
+
+        let router = build_router(state.clone());
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -309,6 +481,8 @@ impl TestServerBuilder {
             base_url: format!("http://{}/v1", address),
             repos_path,
             api_key: "test-api-key".to_string(),
+            replication_url,
+            state,
             client: reqwest::Client::new(),
             store,
         }
@@ -446,25 +620,50 @@ impl TestServer {
     }
 }
 
-/// A stub webhook receiver: records every payload it is POSTed, in order.
+/// A stub webhook receiver: records every payload it is POSTed, in order,
+/// and can be made to fail or to stall so the delivery path's failure and
+/// concurrency behaviour is observable.
 pub struct HookReceiver {
     pub url: String,
-    received: Arc<Mutex<Vec<Value>>>,
+    deliveries: Arc<Mutex<Vec<Delivery>>>,
+    /// How many further deliveries answer 500 before the receiver recovers.
+    failures: Arc<AtomicUsize>,
+    /// Which deliveries are held open rather than answered — what a slow or
+    /// wedged receiver looks like from the server's side. `None` answers
+    /// everything; `Some(tenant_id)` holds only that repository's, which is
+    /// how the per-repository concurrency of the queues becomes observable.
+    gate: watch::Sender<Option<String>>,
+}
+
+/// One delivery as the receiver saw it.
+#[derive(Clone)]
+pub struct Delivery {
+    pub payload: Value,
+    /// Value of the header `[hooks.auth]` configures, when one is set.
+    pub auth_header: Option<String>,
+    /// When the receiver was reached, for asserting on throttling.
+    pub at: Instant,
 }
 
 #[derive(Clone)]
 struct ReceiverState {
-    received: Arc<Mutex<Vec<Value>>>,
+    deliveries: Arc<Mutex<Vec<Delivery>>>,
+    failures: Arc<AtomicUsize>,
+    gate: watch::Receiver<Option<String>>,
 }
 
 impl HookReceiver {
     pub async fn start() -> Self {
-        let received = Arc::new(Mutex::new(Vec::new()));
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        let failures = Arc::new(AtomicUsize::new(0));
+        let (gate, gate_receiver) = watch::channel(None);
 
         let router = Router::new()
             .route("/hook", post(receive_hook))
             .with_state(ReceiverState {
-                received: received.clone(),
+                deliveries: deliveries.clone(),
+                failures: failures.clone(),
+                gate: gate_receiver,
             });
 
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -479,16 +678,45 @@ impl HookReceiver {
 
         Self {
             url: format!("http://{}/hook", address),
-            received,
+            deliveries,
+            failures,
+            gate,
         }
+    }
+
+    /// Makes the next `count` deliveries answer `500`, after which the
+    /// receiver recovers. Every attempt is still recorded, so a test can
+    /// count retries.
+    pub fn fail_next(&self, count: usize) {
+        self.failures.store(count, Ordering::SeqCst);
+    }
+
+    /// Holds open every delivery whose payload names `tenant_id`, without
+    /// answering — one wedged repository, while the rest stay responsive.
+    pub fn stall_tenant(&self, tenant_id: &str) {
+        self.gate
+            .send(Some(tenant_id.to_string()))
+            .expect("hook receiver gate closed");
+    }
+
+    /// Lets held deliveries complete, and stops holding new ones.
+    pub fn resume(&self) {
+        self.gate.send(None).expect("hook receiver gate closed");
+    }
+
+    pub fn deliveries(&self) -> Vec<Delivery> {
+        self.deliveries
+            .lock()
+            .expect("hook receiver poisoned")
+            .clone()
     }
 
     /// Everything received so far, in delivery order.
     pub fn events(&self) -> Vec<Value> {
-        self.received
-            .lock()
-            .expect("hook receiver poisoned")
-            .clone()
+        self.deliveries()
+            .into_iter()
+            .map(|delivery| delivery.payload)
+            .collect()
     }
 
     /// The `event` field of everything received so far — the shorthand most
@@ -503,7 +731,7 @@ impl HookReceiver {
     /// Waits until at least `count` payloads have arrived, then returns them
     /// all. Panics on timeout, naming what did arrive.
     pub async fn wait_for(&self, count: usize) -> Vec<Value> {
-        let deadline = std::time::Instant::now() + WAIT_TIMEOUT;
+        let deadline = Instant::now() + WAIT_TIMEOUT;
 
         loop {
             let events = self.events();
@@ -512,7 +740,7 @@ impl HookReceiver {
                 return events;
             }
 
-            if std::time::Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 panic!(
                     "timed out waiting for {} hook(s); received {:?}",
                     count,
@@ -548,13 +776,59 @@ impl HookReceiver {
 
 async fn receive_hook(
     State(state): State<ReceiverState>,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> StatusCode {
+    let held_tenant = payload["tenant_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
     state
-        .received
+        .deliveries
         .lock()
         .expect("hook receiver poisoned")
-        .push(payload);
+        .push(Delivery {
+            payload,
+            auth_header: headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+            at: Instant::now(),
+        });
+
+    // Held open while this delivery's repository is stalled, so the server's
+    // queue for it stays occupied and a test can watch another repository's
+    // queue drain past it.
+    let mut gate = state.gate.clone();
+
+    loop {
+        let stalled = gate
+            .borrow_and_update()
+            .as_deref()
+            .map(|tenant_id| tenant_id == held_tenant)
+            .unwrap_or(false);
+
+        if !stalled {
+            break;
+        }
+
+        if gate.changed().await.is_err() {
+            break;
+        }
+    }
+
+    // Fail a bounded number of times, so a test can count retries and still
+    // see the delivery eventually succeed.
+    if state
+        .failures
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            left.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
 
     StatusCode::OK
 }
