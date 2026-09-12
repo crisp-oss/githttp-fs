@@ -880,6 +880,14 @@ reminder that "write-shaped" and "write" are different questions on this API.
 
 After applying code changes, always run `cargo fmt` before `cargo build`.
 
+### Tests
+
+The suite lives in `src/tests/`, registered as `#[cfg(test)] mod tests;` in `main.rs` rather than in a `tests/` directory — a binary crate has no library target, and an in-crate module reaches `build_router` and every internal module without adding one. Run it with `cargo test`.
+
+It is split the way the codebase is. Modules that are pure functions of their input are tested directly (`validate`, `seek`, `order_index`, `config`, `util`); everything whose contract is an HTTP contract is tested through a **real server on a real socket** (`harness.rs`), because the API-key guard, the replica read-only guard, and the `/v1` nesting are router behaviour that a handler-level test would assert nothing about. Each server gets its own `tempfile::TempDir` as `repos_path`, so tests share no state and run fully parallel; hook tests drive a stub receiver that records payloads in delivery order, which is how ordering promises are asserted.
+
+The behaviour asserted is the behaviour documented in this file. When a test's expectation looks surprising, the rule it comes from is quoted in a comment above it — so a change that breaks a test can be judged against what the API promised, not merely against what the code used to do. A new route, parameter, or event therefore belongs in the suite in the same change that documents it here.
+
 ## Documentation files
 
 Each documentation file has one audience, and they must not grow into copies of each other:

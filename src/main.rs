@@ -56,6 +56,12 @@ mod state;
 mod util;
 mod validate;
 
+// The test suite. A module of the binary crate rather than a `tests/`
+// directory, so it can reach `build_router` and every internal module
+// without exposing them through a library target nobody else needs.
+#[cfg(test)]
+mod tests;
+
 use axum::{
     middleware as axum_middleware,
     routing::{any, delete, get, on, post, MethodFilter},

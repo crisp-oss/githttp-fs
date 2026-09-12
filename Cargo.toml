@@ -35,6 +35,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 
+[dev-dependencies]
+# Isolated repository stores per test, cleaned up when the test ends.
+tempfile = "3"
+
 [profile.dev]
 opt-level = 0
 debug = true
