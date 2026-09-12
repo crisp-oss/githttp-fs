@@ -417,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "githttp-fs"
-version = "1.10.2"
+version = "1.11.1"
 dependencies = [
  "axum",
  "chrono",
@@ -428,6 +428,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-stream",

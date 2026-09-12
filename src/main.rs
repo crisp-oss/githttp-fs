@@ -41,6 +41,7 @@
 //! - [`util`] — `spawn_blocking` wrapper and constant-time comparison
 //! - [`validate`] — sanitisation of all user-supplied identifiers and paths
 
+mod checkout;
 mod config;
 mod error;
 mod git;
@@ -54,6 +55,12 @@ mod seek;
 mod state;
 mod util;
 mod validate;
+
+// The test suite. A module of the binary crate rather than a `tests/`
+// directory, so it can reach `build_router` and every internal module
+// without exposing them through a library target nobody else needs.
+#[cfg(test)]
+mod tests;
 
 use axum::{
     middleware as axum_middleware,
@@ -118,6 +125,13 @@ async fn main() {
     });
 
     let app_state = AppState::new(config.clone(), identity);
+
+    // Heals working trees that do not match HEAD — a store that ran with
+    // checkout_files off, or one replicated before replication checked
+    // anything out. Spawned, so the listener does not wait on disk work
+    // nothing reads; a no-op when this node keeps no files on disk, or when
+    // checkout_files_autoheal is off.
+    checkout::spawn(app_state.clone());
 
     // Starts the follower when this node is a replica; a no-op otherwise.
     // Deliberately spawned before the listener binds so a cold replica is

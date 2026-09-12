@@ -22,13 +22,13 @@ You might find it convenient to run githttp-fs via Docker. You can find the pre-
 First, pull the `crispim/githttp-fs` image:
 
 ```bash
-docker pull crispim/githttp-fs:v1.10.2
+docker pull crispim/githttp-fs:v1.11.1
 ```
 
 Then, provide a configuration file and run it (replace `/path/to/your/githttp-fs/config.toml` with the path to your configuration file):
 
 ```bash
-docker run -p 5355:5355 -v /path/to/your/githttp-fs/config.toml:/etc/githttp-fs.cfg crispim/githttp-fs:v1.10.2
+docker run -p 5355:5355 -v /path/to/your/githttp-fs/config.toml:/etc/githttp-fs.cfg crispim/githttp-fs:v1.11.1
 ```
 
 In the configuration file, ensure that:
@@ -117,6 +117,8 @@ Use the sample [config.toml](https://github.com/crisp-oss/githttp-fs/blob/master
 * `api_key` (type: _string_, allowed: any string, no default) — API key for the githttp-fs HTTP API
 * `repos_path` (type: _string_, allowed: UNIX path, no default) — Path to all Git repositories (all tenants are stored in this path)
 * `log_level` (type: _string_, allowed: `debug`, `info`, `warn`, `error`, default: `info`) — Verbosity of logging, set it to `error` in production
+* `checkout_files` (type: _boolean_, allowed: `true`, `false`, default: `true`) — Whether each tenant's files are kept on the working tree, so a human can `ls` a repository; nothing githttp-fs serves reads them, so turning this off saves the uncompressed size of all content (see [Considerations](CONSIDERATIONS.md#files-on-disk))
+* `checkout_files_autoheal` (type: _boolean_, allowed: `true`, `false`, default: `false`) — Whether startup checks every tenant out to its HEAD, healing files that are missing or stale on disk; opt-in because it walks the whole store and removes files HEAD no longer names, so enable it for one restart after turning `checkout_files` on
 * `allowed_extensions` (type: _array[string]_, allowed: file extensions eg. `["md", "mdx"]`, default: none) — Optional whitelist of file extensions accepted for file writes and move destinations; when unset, all extensions are accepted
 
 **[hooks]**
@@ -151,60 +153,10 @@ Use the sample [config.toml](https://github.com/crisp-oss/githttp-fs/blob/master
 * `destructive_prune` (type: _boolean_, allowed: `true`, `false`, default: `false`) — Whether the maintenance repack may permanently drop unreachable Git objects (garbage left behind by interrupted writes); commit history and past file versions are never affected either way, but with the default `false` maintenance retains every object and can never destroy data
 * `maximum_packs` (type: _number_, allowed: `2` or more, no default) — Opt-in pack-count trigger: when a repository holds at least this many packfiles, its maintenance pass runs immediately on the next write (or replicated pack apply) instead of after `delay_secs`. Meant for replicas, where every replicated delta arrives as one more pack and object lookups slow down with each; a master's writes land as loose objects, so on a master it rarely fires. Unset means the timer alone decides
 
-### Considerations
+### Read more
 
-#### Read-only replicas
-
-Configure a `[replication]` section and githttp-fs nodes form a single-master, many-replica set: **writes stay on the master, while replicas keep serving every read route when the master is down.** Omit the section and nothing changes — no replication routes are mounted, no follower runs. See [REPLICATION.md](REPLICATION.md) for the complete peer-protocol reference, including wire formats, reconciliation, safety guarantees, and failure handling.
-
-Replicas copy Git objects rather than replaying events, which is what makes them exact: every read route is answered from HEAD's tree and the object database, so a replica returns byte-identical results — file listings, seeks, counts, order indexes, commit history, batch reads — including for routes added later.
-
-* **Replicas pull; notifications are only a hint.** A replica converges by comparing its own HEAD shas against the master's repository listing and fetching a packfile for whatever differs. Change notifications carry no content, so a replica that misses them — or that was offline for a week — catches up with exactly the same work. Nothing queues up on the master while a replica is away.
-* **Replicas dial out, never in.** The notification channel is a long-lived `GET /_replication/events` opened *by the replica*, so replicas need no public URL, no inbound firewall rule, and no entry in the master's configuration; a replica joins by connecting.
-* **Catch-up needs no state and survives interruption.** Each repository's objects are written before its ref moves, so an interrupted catch-up leaves every repository either fully at the old commit or fully at the new one. A replica's own refs are its cursor — there is nothing to checkpoint and nothing to resume.
-* **A cold replica refuses reads until it actually holds content** — not merely until it can reach its master, since reaching the master reveals what exists without transferring a single byte, and a node in that state would answer `404` for content that does exist. Any content clears the gate (partial beats empty); a replica that merely restarted with content on disk serves immediately.
-* **Writes to a replica answer `423`**, with no `Retry-After`, so a failover-aware client can tell "wrong node" from "no such route" *and* from "come back later" — waiting never makes a replica accept a write, only going to the master does. A replica holding no content at all refuses reads too until its first catch-up completes (an empty repository is not stale, it is wrong), and that refusal *is* transient, so it is a `503` with `Retry-After`; one that merely restarted serves its existing content immediately.
-* **A replica pins its master's identity.** Every replicating node keeps `.replication.json` in its `repos_path`, holding a random identity a master generates on first start and states to its replicas; a replica stores the first one it receives and refuses to sync with a master stating any other — loudly, in its logs and in `GET /v1/_health/replication` — until an operator deletes the file and restarts it. This is what stops a replica pointed at the wrong deployment, or following a master rebuilt from an empty disk, from silently deleting its tenants and re-cloning. It is a guard against configuration mistakes on a trusted network, not a cryptographic one: `secret` is what guards the surface.
-* **`GET /v1` reports replica status** — whether it is ready or still bootstrapping, whether its stream to the master is up, when it last reconciled, how many repositories are still behind, and a one-word `sync` verdict (`synced`, `lagging`, `stalled`, or `halted`). A master and a standalone node answer `{ "pong": true }` as before.
-* **A replica never destroys its own data.** When a repository cannot be converged safely — the replica holds *more* history than its master announces (a master restored from backup, a chained upstream that restarted behind), or the two histories have diverged (a tenant deleted and re-created under the same name) — the replica keeps and keeps serving its local copy, suspends replication of that one repository, logs an error, and reports it as an issue on the health route until an operator decides which history to keep. The same rule guards deletions: a master listing that would have a replica delete more than half of what it holds is refused and reported, not applied. There is no automatic re-clone anywhere.
-* **One field to alert on.** `GET /v1/_health/replication` answers with a top-level `status` on every node — `healthy`, `degraded` (converging on its own: a stalled or silent replica), or `halted` (something needs a human) — and an `issues` list saying exactly what: `replica_ahead`, `history_diverged`, `identity_mismatch`, `deletion_refused`, `identity_file_missing`, `identity_file_changed`, `node_id_collision`, each with a `since` timestamp. A master folds its replicas' reported condition into its own `status`, so one probe against the master covers the set.
-* **Replicas can chain**, since they serve the replication surface too — useful for geographic tiering.
-* **Promotion is a config swap.** In an emergency any replica becomes the master by setting `role = "master"`, removing `master_url`, adding `[hooks]`, and restarting — no data step, because its repositories are complete Git object stores and its `.replication.json` already holds the data-set identity. The other replicas follow it by changing `master_url` alone, and the old master can return as a replica; any writes it took after the promoted node's last pull surface as `replica_ahead` issues rather than being lost silently. The full runbook is in [REPLICATION.md](REPLICATION.md#promotion-making-a-replica-the-master).
-* **Two public health routes, answered by every node.** `GET /v1/_health/replication` (no credential) reports this node's role, the master's reachability, and every replica following it — with each field attributable to whoever witnessed it: the master observes `stream_connected`/`packs_delivered`, while replicas report their own `pending_repositories`, since only they can know their lag. A replica serves the roster its master last gave it, stamped `replicas_observed_at`, so an answer given while the master is down is visibly stale rather than quietly wrong. It answers on a standalone node too (`role: "standalone"`), so one probe covers a whole deployment. `GET /v1/_health/status` is its companion: name, version, role, `writable`, and uptime, read from memory with no I/O at all. Both are unauthenticated on purpose — the audience is load balancers, rollout probes and monitoring, none of which should have to hold the content API key — and neither names a tenant or opens a repository. Peers read the same replication picture from `/_replication/health` with the replication key.
-* **Replication runs on its own HTTP server and port** (`[replication] host`/`port`, default `5356`), serving `/_replication` and nothing else, behind `replication.secret`. That is deliberate protection against a likely mistake: front the content port with nginx on a shared listener and you have also published a surface that hands out whole repositories and a live change stream, with nothing in the proxy config to say so. Two ports make that mistake unavailable. The secret still guards every route there — the port is defence in depth, not a replacement for auth.
-* **The protocol version lives in the payloads, not the URL** — `"protocol": 1` in every JSON body, a `hello` frame opening the event stream, and `X-Replication-Protocol` on the binary packfile response. So the paths never move for a protocol change, and your firewall rules never need revisiting.
-* **Hooks stay on the master.** A replica never delivers webhooks (that would duplicate every event), so no hooks fire at all while the master is down; repair downstream mirrors afterwards with `POST /v1/:collection_id/:tenant_id/batch/replay/hook`.
-* **Promotion is manual.** Two nodes accepting writes would fork two histories that cannot be merged, so there is no automatic failover for the write role.
-
-#### Public health routes
-
-Every route on the API requires `Authorization: Bearer <api_key>` — with exactly two exceptions, both under `/v1/_health`, both `GET`, and both deliberately public:
-
-* **`GET /v1/_health/status`** — what this process is: `status` (`healthy`, or `bootstrapping` on a cold replica), `name`, `version`, `role` (`master` / `replica` / `standalone`), `writable` (whether a write sent here would be accepted at all), `started_at` and `uptime_secs`. It performs **no I/O whatsoever** — every field comes from the config or from an atomic in memory — so it is safe to poll at any interval, and an anonymous caller cannot make the node do work by asking. It always answers `200`, including while bootstrapping: the status code says the process is alive, and the body says what it can serve.
-* **`GET /v1/_health/replication`** — the replication picture described above, identical to what peers read from `/_replication/health` with the replication secret.
-
-They are unauthenticated because their audience is precisely the callers that do not hold the content API key and should not need it: load balancers, rollout probes, uptime monitors, and failover-aware clients asking which node takes writes. Requiring the key there would turn a health probe into a secret-distribution problem. `GET /v1` remains the *authenticated* probe — use that one to verify a key.
-
-Neither route names a tenant, opens a repository, or resolves a path, so what is public is metadata about the process and the node set, never about content. The replication body does describe topology (peer node ids, the master's URL with any credentials stripped, the data-set identity, a repository count); none of it is a credential, but a deployment that treats internal hostnames as sensitive should keep the content port off the public internet.
-
-`_health` is the one collection id reserved by this API, and only for those two exact paths: `/v1/_health/:tenant_id/...` still routes to the ordinary tenant routes.
-
-#### Reserved files
-
-githttp-fs stores one file of its own inside a tenant repository, holding data Git itself cannot express: **`.order.json`**, the presentation order of the directory it sits in (Git tree entries are name-sorted and carry no metadata slot).
-
-```json
-{
-  "order": ["intro.md", "getting-started/", "advanced.mdx"]
-}
-```
-
-* **Entirely opt-in:** no `.order.json` is ever written unless you call `PUT /v1/:collection_id/:tenant_id/order[/*path]` or `POST /v1/:collection_id/:tenant_id/files/*path/reorder`. Never use those routes and no reserved file exists anywhere.
-* **A separate resource, not an addressable file:** read and write it through `GET` / `PUT` / `DELETE` on `/order[/*path]`, exchanging a plain JSON array of names. To move a single entry instead of replacing the whole list, `POST /files/*path/reorder` with a numerical `position` shifts that one entry into place, or drops it from the index with `position: -1` (files only, unless you pass `allow_prefix_path: true` to position a folder too).
-* **Invisible to every `/files` route** — list, count, read, `HEAD`, batch (where it is `null`) — regardless of `include_hidden_files`. `PUT` and move destinations refuse the path with `400`; move sources and `DELETE` answer `404`.
-* **Delivers `order.updated` / `order.deleted` webhooks, never `file.*` ones.** `order.updated` carries the directory's complete resulting order, so downstream it is a replace, not a diff. Both are ordinary `[hooks] events` subscriptions, so a receiver that does not list them gets none.
-* **Kept up to date automatically:** deleting or moving a file rewrites the affected index in the same commit. Renames keep their position, cross-directory moves append only to an index that already exists, and an emptied index is removed.
-* **Applied on read only if asked:** pass `apply_order_index=true` on the file listing route (default `false`); unlisted entries follow in the ordinary order, or pass `implicit_order_default_index` (e.g. `0` or `-1`) to lift them above the ordered ones instead. Reading a single file always reports its own `position` in its parent's index, `-1` when unlisted.
+* [CONSIDERATIONS.md](CONSIDERATIONS.md) — how read-only replicas behave, why two health routes are public, and the one file githttp-fs reserves inside a tenant repository
+* [REPLICATION.md](REPLICATION.md) — the replication peer protocol: wire formats, reconciliation, safety guarantees, failure handling, and the promotion runbook
 
 ## :fire: Report A Vulnerability
 

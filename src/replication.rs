@@ -73,7 +73,16 @@
 //!   During a master outage no hooks fire at all, and downstream mirrors are
 //!   repaired afterwards with `POST /batch/replay/hook`, which already
 //!   exists for exactly that drift.
-//! - **No working-tree checkout on a replica** (reads never consult it).
+//! - **A replica's working tree is mirrored by checkout, not file by file.**
+//!   Nothing on a replica reads it — every route answers from HEAD's tree —
+//!   but a tenant a human can `ls` on the master and not on the replica is a
+//!   difference with no upside, so a landed pack checks the repository out to
+//!   HEAD ([`crate::git::GitReplication::mirror_working_tree`]). A full
+//!   checkout rather than a delta because it converges from any prior state,
+//!   including the no-working-tree-at-all one a store replicated by an older
+//!   build is in. Switched off with `server.checkout_files`, which a replica
+//!   is the likeliest node to want off; healing an already-filled store is
+//!   [`crate::checkout`]'s job.
 
 use dashmap::DashMap;
 use reqwest::Client;
@@ -155,11 +164,18 @@ const DELETION_GUARD_MINIMUM_HELD: usize = 2;
 /// restarted), and there is no other event a master could learn that from.
 const COLLISION_EXPIRY_SECS: i64 = 150;
 
-/// How long a `409` on the notification stream may persist before the
-/// replica reports it as an issue. A replica that restarted while its old
-/// socket was still open on the master collides with *itself* until the
-/// master notices the dead connection, which takes about a heartbeat; only
-/// a collision outlasting two of them is worth a page.
+/// How long a node id collision may persist before it is reported as an
+/// issue — on the replica being refused, and on the master refusing it.
+///
+/// A restarted replica collides with the socket of its own previous process
+/// until the node serving the stream notices that socket is dead. Normally
+/// that is immediate (the stream task watches for its peer going away), but
+/// a connection whose `FIN` never arrives — a proxy in between, a partition
+/// that left the old socket half-open — is only discovered when a heartbeat
+/// write finally fails, which takes up to two of them. The stream is refused
+/// throughout either way, since the two cases are indistinguishable from the
+/// serving side; this is purely how long the refusal has to last before an
+/// operator is told it is a misconfiguration rather than a restart.
 const COLLISION_REPORT_AFTER_SECS: u64 = 2 * EVENT_HEARTBEAT_SECS;
 
 /// Size of the per-process instance token, before hex encoding.
@@ -518,6 +534,12 @@ pub struct ReplicaPresence {
     /// process stops dialling.
     #[serde(skip)]
     pub last_collision_at: Option<i64>,
+    /// When the *current* run of refusals under this node id began, cleared
+    /// the moment a stream opens. Internal; what holds the collision issue
+    /// back while a restarting replica is colliding with its own dying
+    /// socket.
+    #[serde(skip)]
+    pub collision_since: Option<i64>,
 }
 
 /// A replica's own view of how its following is going.
@@ -1474,10 +1496,37 @@ impl ReplicaRegistry {
         if presence.stream_connected {
             if let Some(holder) = &presence.instance {
                 if holder != instance {
+                    // A refusal long after the previous one starts a fresh
+                    // run, so a collision that was fixed and comes back
+                    // months later is not reported as if it had been open
+                    // the whole time. The window is the master's own issue
+                    // expiry: a collision still in progress re-dials well
+                    // inside it, since a refused replica's backoff caps at
+                    // 60 s.
+                    if presence
+                        .last_collision_at
+                        .map(|last| now - last > COLLISION_EXPIRY_SECS)
+                        .unwrap_or(true)
+                    {
+                        presence.collision_since = None;
+                    }
+
+                    let since = *presence.collision_since.get_or_insert(now);
+
                     presence.last_collision_at = Some(now);
 
                     return Err(StreamCollision {
                         node_id: node_id.to_string(),
+                        // A replica that restarted collides with the socket
+                        // of its own previous process until this node
+                        // notices that socket is dead, so a refusal is only
+                        // worth reporting once it has outlived that window.
+                        // The stream is refused either way: the two cases
+                        // are indistinguishable from here, and letting the
+                        // newcomer in would merge two nodes into one roster
+                        // row.
+                        persisting: now - since >= COLLISION_REPORT_AFTER_SECS as i64,
+                        since,
                     });
                 }
             }
@@ -1487,6 +1536,7 @@ impl ReplicaRegistry {
         presence.connected_at = Some(now);
         presence.last_contact_at = Some(now);
         presence.instance = Some(instance.to_string());
+        presence.collision_since = None;
 
         Ok(())
     }
@@ -1538,6 +1588,7 @@ impl ReplicaRegistry {
                 reported_at: None,
                 instance: None,
                 last_collision_at: None,
+                collision_since: None,
             })
     }
 
@@ -1566,6 +1617,12 @@ impl ReplicaRegistry {
 #[derive(Debug)]
 pub struct StreamCollision {
     pub node_id: String,
+    /// Whether this run of refusals has outlived a restarting replica's own
+    /// lingering socket, and is therefore worth reporting as an issue rather
+    /// than only refusing.
+    pub persisting: bool,
+    /// When this run of refusals began.
+    pub since: i64,
 }
 
 impl Default for ReplicaRegistry {
@@ -2710,9 +2767,15 @@ impl ReplicaFollower {
 
         let apply_repo_path = repo_path.clone();
         let apply_pack_path = pack_path.clone();
+        let checkout_files = self.state.config.server.checkout_files;
 
         let outcome = run_blocking(move || {
-            GitReplication::apply_pack(&apply_repo_path, &apply_pack_path, &apply_head)
+            GitReplication::apply_pack(
+                &apply_repo_path,
+                &apply_pack_path,
+                &apply_head,
+                checkout_files,
+            )
         })
         .await;
 
@@ -3046,20 +3109,33 @@ impl ReplicaFollower {
                 Ok(response) if response.status() == reqwest::StatusCode::CONFLICT => {
                     let since = *collision_since.get_or_insert_with(Instant::now);
 
-                    tracing::error!(
-                        node_id = %self.node_id,
-                        master = %self.master_url_display,
-                        "master refused the notification stream: another process is connected under this node id; \
-                         still converging by polling, but every replica needs a unique replication.node_id"
-                    );
-
+                    // Loud only once it persists, for the same reason the
+                    // master reports it only then: this process restarting
+                    // is refused by its own previous socket until the master
+                    // reaps it, which is a normal restart rather than a
+                    // misconfiguration. Polling converges throughout either
+                    // way.
                     if since.elapsed().as_secs() >= COLLISION_REPORT_AFTER_SECS {
+                        tracing::error!(
+                            node_id = %self.node_id,
+                            master = %self.master_url_display,
+                            "master refused the notification stream: another process is connected under this node id; \
+                             still converging by polling, but every replica needs a unique replication.node_id"
+                        );
+
                         self.state.issues.raise(
                             ISSUE_NODE_ID_COLLISION,
                             Issue::NodeIdCollision {
                                 node_id: self.node_id.clone(),
                                 since: chrono::Utc::now().timestamp(),
                             },
+                        );
+                    } else {
+                        tracing::warn!(
+                            node_id = %self.node_id,
+                            master = %self.master_url_display,
+                            "master still holds a stream under this node id, retrying shortly \
+                             (expected for a moment after this replica restarts)"
                         );
                     }
                 }

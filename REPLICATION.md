@@ -26,7 +26,7 @@ sequenceDiagram
     R->>R: Import objects, fast-forward ref atomically
     R->>M: GET /_replication/events
     M-->>R: hello, updates, deletions, heartbeats
-    Note over R,M: Events prompt reconciliation; polling remains authoritative
+    Note over R,M: Events prompt reconciliation, polling remains authoritative
 ```
 
 ## Topology, listeners, and authentication
@@ -70,6 +70,8 @@ node_id = "master-eu"        # required, unique per deployment
 `master_url` is required for `role = "replica"` and rejected for a master. `node_id` is required and must be unique across the deployment: a master refuses a notification stream (`409 Conflict`) from a process presenting a node id that another process already holds a stream under. It is observability telemetry, not authentication: it is limited to 64 characters from `[A-Za-z0-9._:-]` plus IPv6 brackets. Invalid peer-supplied IDs are treated as absent.
 
 Each replica process also generates a random instance token at startup and sends it as `X-Replication-Instance` on every request. The same node id with the same token is a replica reconnecting after a drop, and replaces its own connection; the same node id with a different token is a second replica wearing the same name, which is the collision the master refuses. Only the stream is refused — `state` and `pack` stay served, so a misnamed replica keeps converging while its operator is told.
+
+A restarting replica presents a *new* token, so it would collide with its own previous connection if that connection outlived it. It does not: the stream task watches for its peer going away and releases the node id the moment the socket dies, so a restart reconnects immediately. A refusal is therefore reported — logged as an error, raised as `node_id_collision` on both sides — only once it has persisted for two heartbeats (40 s), which covers the one case where a dead socket is not seen at once: a `FIN` that never arrives, through a proxy or a partition that leaves the old socket half-open. Until then it is a warning on both sides and the replica keeps re-dialling with its ordinary backoff.
 
 The default polling interval bounds normal eventual-consistency delay. `parallelism` bounds the number of repositories pulled at once. A dropped event stream is re-dialed with exponential backoff, capped at 60 seconds.
 
@@ -315,7 +317,7 @@ The replica advances to `X-Replication-Head-Sha`, not merely the SHA from an ear
 
 ## Replica serving behavior
 
-Replicas do not have working trees; they serve reads directly from Git's object database and HEAD. A replica repository is initialized without the local `"chore: initialize"` root commit used for writable repositories, avoiding immediate divergence. Consequently, `git status` in a replica repository can show files as deleted; this does not affect the API.
+Replicas serve every read directly from Git's object database and HEAD, never from the working tree. The working tree is nonetheless mirrored by default, so a replica repository looks on disk exactly like a master one: each landed pack checks the repository out to its new HEAD (a full checkout, including the removal of files the master deleted). A checkout that fails is logged and does not fail the sync — the working tree is a courtesy on every node. Set `server.checkout_files = false` to keep a replica object-store-only, which saves the uncompressed size of all content; `server.checkout_files_autoheal` (opt-in, off by default) checks every tenant out at startup, which is how a store replicated before this existed is filled in — enable it for one restart. Both are documented in [CONSIDERATIONS.md](CONSIDERATIONS.md#files-on-disk). A replica repository is initialized without the local `"chore: initialize"` root commit used for writable repositories, avoiding immediate divergence.
 
 - Content writes are always rejected with `423 Locked`, before the bootstrap gate. This includes write-shaped `POST` routes, except the read-only batch-read route.
 - A cold replica with no repositories on disk returns `503` (with `Retry-After`) for content reads until its initial catch-up completes. Its API ping and replication health remain available so it can explain its state.
@@ -329,7 +331,7 @@ Replicas arm ordinary maintenance after an apply because every sync adds a pack.
 
 When the master is lost, any replica can become the new master by **swapping its configuration and restarting**. No data step is involved, because everything a master needs is already on the replica's disk:
 
-- Its repositories are complete Git object stores with a HEAD. The write path builds every commit from HEAD's tree and the object database, and merely mirrors files into the working tree afterwards as a courtesy — and the delete and move paths tolerate a file that was never mirrored. A promoted node's working trees fill in file by file as writes land, and nothing reads them.
+- Its repositories are complete Git object stores with a HEAD. The write path builds every commit from HEAD's tree and the object database, and merely mirrors files into the working tree afterwards as a courtesy — and the delete and move paths tolerate a file that was never mirrored. So a promoted node is writable whether its working trees were ever filled in or not, which is also what makes `server.checkout_files = false` safe on any node.
 - Its `.replication.json` holds the data-set identity it pinned from the old master. Serving that same identity as a master is exactly what lets every other replica follow the promoted node **without re-pairing**, and what lets the old master come back as a replica of it.
 
 The procedure, in order:

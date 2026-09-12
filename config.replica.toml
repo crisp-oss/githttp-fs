@@ -22,7 +22,7 @@ port = 5365
 # The same key as the master, so one client credential reads from either node.
 api_key = "MySecretAPIKey"
 
-repos_path = "./dev/repositories/slave"
+repos_path = "./dev/repositories/replica"
 log_level = "debug"
 
 [limits]

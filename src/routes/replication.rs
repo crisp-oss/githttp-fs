@@ -288,19 +288,33 @@ pub async fn replication_events(State(state): State<AppState>, headers: HeaderMa
         let instance = peer.instance.as_deref().unwrap_or("");
 
         if let Err(collision) = state.replica_registry.stream_opened(node_id, instance) {
-            tracing::error!(
-                node_id = %collision.node_id,
-                "refusing notification stream: another process is already connected under this node id; \
-                 every replica needs a unique replication.node_id"
-            );
+            // Refused immediately, reported only once the refusals persist.
+            // A replica that was restarted dials back before this node has
+            // noticed its previous socket died, and that collision is with
+            // *itself*: it clears as soon as the dead stream is reaped, and
+            // paging an operator for it would make every replica restart
+            // turn this node `halted` for minutes.
+            if collision.persisting {
+                tracing::error!(
+                    node_id = %collision.node_id,
+                    "refusing notification stream: another process is already connected under this node id; \
+                     every replica needs a unique replication.node_id"
+                );
 
-            state.issues.raise(
-                &replication::Issues::collision_key(&collision.node_id),
-                Issue::NodeIdCollision {
-                    node_id: collision.node_id.clone(),
-                    since: chrono::Utc::now().timestamp(),
-                },
-            );
+                state.issues.raise(
+                    &replication::Issues::collision_key(&collision.node_id),
+                    Issue::NodeIdCollision {
+                        node_id: collision.node_id.clone(),
+                        since: collision.since,
+                    },
+                );
+            } else {
+                tracing::warn!(
+                    node_id = %collision.node_id,
+                    "refusing notification stream: a stream is already open under this node id, \
+                     which is expected for a heartbeat after that replica restarts"
+                );
+            }
 
             return (
                 StatusCode::CONFLICT,
@@ -387,6 +401,14 @@ pub async fn replication_events(State(state): State<AppState>, headers: HeaderMa
                 },
 
                 _ = tokio::time::sleep(heartbeat) => ReplicationEvent::Heartbeat,
+
+                // The replica went away. Watching for it explicitly is what
+                // makes presence (and the node id it holds) released as soon
+                // as the socket dies, rather than on whichever later
+                // heartbeat write happens to fail — which is what made a
+                // restarting replica collide with its own previous
+                // connection for up to two heartbeats.
+                _ = sender.closed() => break,
             };
 
             let Ok(mut line) = serde_json::to_vec(&frame) else {

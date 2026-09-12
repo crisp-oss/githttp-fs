@@ -217,6 +217,7 @@ async fn write(
 
     let repo_path_for_maintenance = repo_path.clone();
     let tenant_id_for_task = tenant_id.clone();
+    let checkout_files = state.config.server.checkout_files;
 
     let (commit_sha, change) = run_blocking(move || {
         git::GitOrder::write_order(
@@ -227,6 +228,7 @@ async fn write(
             message.as_deref(),
             &author.name,
             &author.email,
+            checkout_files,
         )
     })
     .await?;
@@ -299,6 +301,7 @@ async fn delete(
 
     let repo_path_for_maintenance = repo_path.clone();
     let tenant_id_for_task = tenant_id.clone();
+    let checkout_files = state.config.server.checkout_files;
 
     let (commit_sha, change) = run_blocking(move || {
         git::GitOrder::delete_order(
@@ -308,6 +311,7 @@ async fn delete(
             message.as_deref(),
             &author.name,
             &author.email,
+            checkout_files,
         )
     })
     .await?;
