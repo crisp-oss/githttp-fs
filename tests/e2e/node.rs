@@ -25,12 +25,17 @@
 #![allow(dead_code)]
 
 use std::{
+    collections::BTreeSet,
     fs::{self, File},
     io::Read,
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    time::{Duration, Instant},
+    sync::{
+        atomic::{AtomicU16, Ordering},
+        LazyLock, Mutex,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{json, Value};
@@ -70,16 +75,104 @@ fn toml_string(value: &str) -> String {
     serde_json::to_string(value).expect("cannot encode TOML string")
 }
 
-/// Claims a free TCP port by binding it and letting it go.
+/// The lowest port an e2e node is ever given.
 ///
-/// Inherently racy — something else may take the port between the bind and
-/// the node's own — but the window is microseconds on a loopback interface,
-/// and the alternative (a fixed port range) collides with whatever else the
-/// developer is running, which is worse and less obvious when it happens.
-pub fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("cannot bind a probe socket");
+/// Clear of the ports a developer machine runs real services on — including
+/// the 5355/5356 pair the shipped dev configs use — and low enough to leave a
+/// wide band under the kernel's ephemeral range.
+const PORT_BAND_START: u16 = 20_000;
 
-    listener
+/// Assumed low bound of the kernel's ephemeral range when it cannot be read:
+/// Linux's default `net.ipv4.ip_local_port_range` floor, which also sits well
+/// under macOS's 49152, so the band stays clear on either.
+const EPHEMERAL_FLOOR_FALLBACK: u16 = 32_768;
+
+/// Ports already handed out in this process.
+///
+/// [`free_port`] releases its probe socket before returning, so without this
+/// two tests picking at the same instant could be handed the same port and
+/// only one of them would get to bind it.
+static CLAIMED_PORTS: LazyLock<Mutex<BTreeSet<u16>>> =
+    LazyLock::new(|| Mutex::new(BTreeSet::new()));
+
+/// Where the next scan of the band starts, seeded per process so two runs on
+/// one machine (two terminals, two checkouts) do not walk it in lockstep.
+static BAND_CURSOR: LazyLock<AtomicU16> = LazyLock::new(|| {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.subsec_nanos())
+        .unwrap_or_default();
+
+    AtomicU16::new((std::process::id() ^ nanos) as u16)
+});
+
+/// The low bound of the kernel's ephemeral port range — the ports `bind(:0)`
+/// hands out — or [`EPHEMERAL_FLOOR_FALLBACK`] where it cannot be read.
+fn ephemeral_floor() -> u16 {
+    fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|text| text.split_whitespace().next()?.parse().ok())
+        .unwrap_or(EPHEMERAL_FLOOR_FALLBACK)
+}
+
+/// Claims a free TCP port for a node that is about to be spawned.
+///
+/// The port is taken from a band *below* the kernel's ephemeral range and
+/// verified free by binding it and letting it go. Both halves matter, and the
+/// first is what makes this safe:
+///
+/// - **Below the ephemeral range**, nothing on the machine is handed this
+///   port by accident. The probe socket has to be released before the node
+///   can bind it, so a window always exists; what closes it is that losing
+///   the race now requires another process to ask for *this exact port*.
+///   Picking from the ephemeral range instead — which is what `bind(:0)`
+///   does — loses that race routinely, because every `bind(:0)` on the box is
+///   a competitor: the in-crate suite alone holds one ephemeral port per test
+///   server, so running `cargo test` and `cargo e2e` at the same time on one
+///   machine was enough to kill a node with `Address already in use`.
+/// - **Verified by binding**, so a port some other server does hold is
+///   skipped here rather than handed out and discovered at spawn time.
+///
+/// A machine whose ephemeral range has been widened to swallow the band has
+/// nowhere to do this, and falls back to asking the kernel.
+pub fn free_port() -> u16 {
+    let ceiling = ephemeral_floor();
+
+    if ceiling <= PORT_BAND_START + 1_024 {
+        return ephemeral_port();
+    }
+
+    let span = ceiling - PORT_BAND_START;
+
+    for _ in 0..span {
+        let candidate = PORT_BAND_START + (BAND_CURSOR.fetch_add(1, Ordering::Relaxed) % span);
+
+        // Recorded even when the bind below fails: a port something else
+        // holds is not worth probing again on the next call.
+        if !CLAIMED_PORTS
+            .lock()
+            .expect("claimed port set is poisoned")
+            .insert(candidate)
+        {
+            continue;
+        }
+
+        if TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+            return candidate;
+        }
+    }
+
+    panic!(
+        "no free port between {} and {}: is something holding the whole band?",
+        PORT_BAND_START, ceiling
+    );
+}
+
+/// Asks the kernel for an ephemeral port and lets it go again — the spelling
+/// [`free_port`] exists to avoid, kept for the machine that leaves it no band.
+fn ephemeral_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("cannot bind a probe socket")
         .local_addr()
         .expect("cannot read probe socket address")
         .port()
