@@ -150,6 +150,9 @@ pub async fn require_replication_key(
 /// absent. The API-key ping is always allowed through so monitors can see
 /// *why* a node is refusing; the unauthenticated `/v1/_health` routes say the
 /// same thing without a credential, and never reach this guard at all.
+// The `Err` variant is an `axum::Response`, which clippy flags as large. It
+// is the shape axum's `from_fn` middleware requires, so it cannot be boxed.
+#[allow(clippy::result_large_err)]
 pub async fn enforce_replica_read_only(
     State(state): State<AppState>,
     request: Request,

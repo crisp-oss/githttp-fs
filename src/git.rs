@@ -901,6 +901,7 @@ impl GitMaintenance {
     ///      are append-only in this system, so every past file version —
     ///      including versions of since-deleted files — stays reachable
     ///      through its commit and is always carried over.
+    ///
     ///    Skipped entirely when the repository is already consolidated (no
     ///    loose objects, at most one pack).
     /// 3. **Index refresh** — the on-disk index is reset to HEAD so
@@ -2700,6 +2701,10 @@ impl GitFiles {
     ///   and appends it to the destination index *only when one already
     ///   exists* — creating an index would pin one file in a directory whose
     ///   siblings are all implicitly ordered, which the caller did not ask for.
+    // One over clippy's limit: the git layer takes its commit context
+    // (message, author, checkout) flat rather than in a struct, as every
+    // other write function here does.
+    #[allow(clippy::too_many_arguments)]
     pub fn move_file(
         repo_path: &Path,
         tenant_id: &str,
@@ -2900,6 +2905,10 @@ impl GitFiles {
     /// new one. The two *parent* indexes — outside the subtree — are updated
     /// in the same commit, with the same rename-keeps-its-position rule as
     /// [`Self::move_file`].
+    // One over clippy's limit: the git layer takes its commit context
+    // (message, author, checkout) flat rather than in a struct, as every
+    // other write function here does.
+    #[allow(clippy::too_many_arguments)]
     pub fn move_directory(
         repo_path: &Path,
         tenant_id: &str,
@@ -3269,6 +3278,10 @@ impl GitOrder {
     /// Writing the order the index already holds is a no-op, exactly as
     /// re-PUTting unchanged file content is: no commit, no hook, and the
     /// returned sha is HEAD's.
+    // One over clippy's limit: the git layer takes its commit context
+    // (message, author, checkout) flat rather than in a struct, as every
+    // other write function here does.
+    #[allow(clippy::too_many_arguments)]
     pub fn write_order(
         repo_path: &Path,
         tenant_id: &str,
@@ -3979,6 +3992,10 @@ impl GitOrder {
     /// entry's position. `None` when there is no index there, or when it does
     /// not list `from_name` — an unlisted entry stays unlisted, since a rename
     /// changes a name and should not change an ordering.
+    // One over clippy's limit: the git layer takes its commit context
+    // (message, author, checkout) flat rather than in a struct, as every
+    // other write function here does.
+    #[allow(clippy::too_many_arguments)]
     fn stage_entry_renamed(
         repo: &Repository,
         repo_path: &Path,
