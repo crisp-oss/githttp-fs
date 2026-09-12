@@ -29,7 +29,7 @@ git2 = { version = "0.21", features = ["vendored-libgit2"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls-vendored"] }
 dashmap = "6"
 chrono = { version = "0.4", features = ["serde"] }
-getrandom = "0.3"
+getrandom = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "2"
