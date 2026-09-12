@@ -834,7 +834,7 @@ cargo run -- -c config.replica.toml          # replica: api :5365, replication :
 ```
 
 Each node has its own store — `dev/repositories/master` and
-`dev/repositories/slave` — because they are separate copies of the same
+`dev/repositories/replica` — because they are separate copies of the same
 content, not two processes sharing a directory. Both are tracked by a
 `.gitkeep` with everything inside them gitignored. They share
 `server.api_key`, so one client credential reads from either node, which is
