@@ -1,6 +1,18 @@
 Changelog
 =========
 
+## v1.11.1
+
+### New Features
+
+* Added the `server.checkout_files` configuration key (default `true`), which controls whether each tenant's files are kept on the working tree; turning it off saves the uncompressed size of all content, as nothing githttp-fs serves reads those files.
+* Added the `server.checkout_files_autoheal` configuration key (default `false`), which checks every tenant out to its HEAD at startup, writing files that are missing on disk and removing files HEAD no longer names — what makes turning `checkout_files` back on retroactive.
+
+### Bug Fixes
+
+* A replica now mirrors its working tree like a master does: each landed pack checks the repository out to its new HEAD, so `ls` shows the same files on either node and `git status` is clean on both. A failed checkout is logged and never fails the sync.
+* A replica restarting now reconnects its notification stream immediately instead of being refused for up to two heartbeats: the master releases a node id as soon as the peer's socket dies, and a `node_id_collision` issue is only raised once a refusal has persisted.
+
 ## v1.11.0
 
 ### New Features
