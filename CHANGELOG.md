@@ -1,6 +1,13 @@
 Changelog
 =========
 
+## v1.11.3
+
+### Changes
+
+* Auto-generated commit messages for order writes (`PUT` and `DELETE` on `/order`, and `POST .../reorder`) now use the `reorder:` prefix instead of `order:`, and the reorder route no longer appends the entry's position (formerly `order: docs/intro.md -> 2` or `order: docs/intro.md -> unlisted`, now `reorder: docs/intro.md`).
+* Auto-generated commit messages for file and folder moves now separate source and destination with `→` instead of `->`, e.g. `move: docs/old.md → docs/new.md`.
+
 ## v1.11.2
 
 ### Changes
