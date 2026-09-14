@@ -6,6 +6,8 @@
 
 //! Small cross-cutting helpers with no better home.
 
+use std::path::Path;
+
 use crate::error::AppError;
 
 /// Runs a blocking closure on Tokio's blocking thread pool, returning the
@@ -30,6 +32,39 @@ where
     tokio::task::spawn_blocking(blocking_fn)
         .await
         .map_err(|join_err| AppError::TaskFailed(join_err.to_string()))?
+}
+
+/// [`run_blocking`] for a read of one tenant repository.
+///
+/// Reads never take the tenant write lock, so a tenant can be deleted while
+/// a read of it is running. Deletion renames the repository away in one step
+/// (`git::GitStaging`), which keeps a read that has not opened it yet from
+/// seeing anything but "no tenant" — but libgit2 resolves refs and loose
+/// objects by path on every lookup, so a read that already had it open fails
+/// its next lookup with whatever git error that path produces. Such a read
+/// answers `404`, the same as if it had arrived a moment later, rather than a
+/// `500` for a tenant that simply stopped existing.
+///
+/// Only `Git` and `Io` failures are reinterpreted, and only when the
+/// repository is gone once the read has returned: every other error means
+/// what it says whatever happened to the tenant meanwhile.
+pub async fn run_tenant_read<F, T>(
+    repo_path: &Path,
+    tenant_id: &str,
+    blocking_fn: F,
+) -> Result<T, AppError>
+where
+    F: FnOnce() -> Result<T, AppError> + Send + 'static,
+    T: Send + 'static,
+{
+    match run_blocking(blocking_fn).await {
+        Err(AppError::Git(_) | AppError::Io(_)) if !repo_path.join(".git").exists() => {
+            Err(AppError::TenantNotFound {
+                tenant_id: tenant_id.to_string(),
+            })
+        }
+        outcome => outcome,
+    }
 }
 
 /// Constant-time equality check for byte slices, used for comparing secrets

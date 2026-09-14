@@ -108,6 +108,11 @@ async fn main() {
     // is by definition stale and safe to delete regardless of its age.
     git::GitLocks::cleanup_all_stale_locks(&repos_path);
 
+    // Tenant repositories are created and deleted through staging siblings
+    // (see `GitStaging`); one a previous process never finished is abandoned
+    // for the same reason a stale lock is.
+    git::GitStaging::cleanup_abandoned(&repos_path);
+
     // Packfile downloads abandoned by a previous process are dead weight for
     // the same reason a stale index lock is: at boot nothing can be in
     // flight, so anything found is finished business.

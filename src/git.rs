@@ -16,6 +16,8 @@
 //! - `GitUtils` — private low-level helpers (signatures, repo open/init,
 //!   blob reads, tree building)
 //! - `GitLocks` — stale `.git/index.lock` cleanup
+//! - `GitStaging` — tenant repositories created and deleted atomically, as
+//!   far as a concurrent reader can tell
 //! - `GitMaintenance` — consolidating repack, optional prune, reflog
 //!   expiry, index refresh
 //! - `GitFiles` — file CRUD (list / read / exists / write / delete / move)
@@ -335,18 +337,41 @@ impl GitUtils {
 
     /// Opens an existing tenant repository, mapping a missing directory to a
     /// 404-friendly `TenantNotFound` error rather than a generic git failure.
+    ///
+    /// "Missing" also covers a directory that is not a repository and a
+    /// repository with no commit yet. [`GitStaging`] keeps readers from ever
+    /// seeing either while this process creates or deletes a tenant, but a
+    /// store can still hold one — a replica's first import interrupted by an
+    /// older build, an operator removing a tenant by hand — and neither holds
+    /// anything a caller could read, so neither is a server error.
     fn open_tenant_repo(repo_path: &Path, tenant_id: &str) -> Result<Repository, AppError> {
-        if !repo_path.exists() {
+        let not_found = || {
             tracing::debug!(tenant_id = %tenant_id, "tenant repository not found");
 
-            return Err(AppError::TenantNotFound {
+            AppError::TenantNotFound {
                 tenant_id: tenant_id.to_string(),
-            });
+            }
+        };
+
+        if !repo_path.exists() {
+            return Err(not_found());
         }
 
         tracing::trace!(tenant_id = %tenant_id, path = %repo_path.display(), "opening tenant repository");
 
-        Repository::open(repo_path).map_err(AppError::Git)
+        let repo = match Repository::open(repo_path) {
+            Ok(repo) => repo,
+            Err(err) if err.code() == git2::ErrorCode::NotFound => return Err(not_found()),
+            Err(err) => return Err(AppError::Git(err)),
+        };
+
+        if let Err(err) = repo.head() {
+            if err.code() == git2::ErrorCode::UnbornBranch {
+                return Err(not_found());
+            }
+        }
+
+        Ok(repo)
     }
 
     /// Opens an existing repo or initialises a new one with an empty root commit
@@ -357,6 +382,12 @@ impl GitUtils {
     /// The immediate `"chore: initialize"` root commit matters — every other
     /// function in this module assumes `repo.head()` resolves to a commit,
     /// and an initialised-but-commitless repository would break that.
+    ///
+    /// A new repository is built through [`GitStaging::create`], so a reader
+    /// finds either no tenant or one already holding its root commit. A
+    /// directory that exists without being a repository is adopted in place
+    /// instead, as it always was: renaming over it would fail, and removing
+    /// whatever it holds is not this function's call.
     fn open_or_init_repo(
         repo_path: &Path,
         author_name: &str,
@@ -370,31 +401,42 @@ impl GitUtils {
 
         tracing::info!(path = %repo_path.display(), "initialising new tenant repository");
 
-        std::fs::create_dir_all(repo_path)?;
-
-        let repo = Repository::init(repo_path)?;
         let signature = Self::git_signature(author_name, author_email)?;
 
+        if repo_path.exists() {
+            Self::init_with_root_commit(repo_path, &signature)?;
+        } else {
+            GitStaging::create(repo_path, |staging| {
+                Self::init_with_root_commit(staging, &signature)
+            })?;
+        }
+
+        Repository::open(repo_path).map_err(AppError::Git)
+    }
+
+    /// Initialises a repository at `path` with the empty `"chore: initialize"`
+    /// root commit, leaving nothing open on it.
+    fn init_with_root_commit(path: &Path, signature: &Signature) -> Result<(), AppError> {
+        let repo = Repository::init(path)?;
+
         // An empty tree is required for the root commit so that HEAD is valid.
-        tracing::trace!(path = %repo_path.display(), "writing empty tree for root commit");
+        tracing::trace!(path = %path.display(), "writing empty tree for root commit");
 
         let empty_tree_id = repo.treebuilder(None)?.write()?;
         let empty_tree = repo.find_tree(empty_tree_id)?;
 
         let root_oid = repo.commit(
             Some("HEAD"),
-            &signature,
-            &signature,
+            signature,
+            signature,
             "chore: initialize",
             &empty_tree,
             &[],
         )?;
 
-        tracing::debug!(path = %repo_path.display(), sha = %root_oid, "root commit created");
+        tracing::debug!(path = %path.display(), sha = %root_oid, "root commit created");
 
-        drop(empty_tree);
-
-        Ok(repo)
+        Ok(())
     }
 
     /// Reads a blob's content from `tree` at `file_path` and decodes it as
@@ -851,6 +893,192 @@ impl GitLocks {
                         );
                     }
                 }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GitStaging — tenant repositories appear and disappear in one step
+// ---------------------------------------------------------------------------
+
+/// What a staging directory is for, spelled into its name.
+const STAGING_CREATING: &str = "creating";
+const STAGING_DELETING: &str = "deleting";
+
+/// Keeps staging names unique within this process. Uniqueness across
+/// processes is not needed: whatever a previous process left behind is
+/// swept at startup, and one found in the way anyway is discarded first.
+static STAGING_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Creation and deletion of a whole tenant repository, made atomic with
+/// respect to readers.
+///
+/// Reads never take the tenant write lock, so whatever a reader finds at
+/// `<collection>/<tenant>` must be either nothing or a complete repository.
+/// Building one in place breaks that twice over: between `create_dir_all`
+/// and `Repository::init` the directory exists but is not a repository, and
+/// on a replica HEAD then stays unborn for as long as the first pack takes
+/// to import. `remove_dir_all` breaks it in the other direction, deleting
+/// `.git` piecemeal under a reader that already found the directory. Each
+/// of those windows answers a read with a raw git error — a `500` where
+/// "no such tenant" is the only true answer.
+///
+/// So a repository is built in a dot-prefixed sibling and renamed into
+/// place once it is complete, and removed by being renamed away first and
+/// deleted where nobody looks. A rename inside one directory is atomic and
+/// never crosses a filesystem, which is why the staging directory is a
+/// sibling in the collection directory rather than somewhere under the
+/// store root. The dot prefix is what keeps it invisible: no collection or
+/// tenant id can start with one, so the repository scan and every route
+/// skip it without knowing it exists.
+///
+/// Both operations must run under the tenant write lock, which is what
+/// makes a per-tenant staging name free of collisions.
+pub struct GitStaging;
+
+impl GitStaging {
+    /// The staging sibling of `repo_path`: `.<tenant>.<purpose>-<sequence>`.
+    fn sibling(repo_path: &Path, purpose: &str) -> Result<PathBuf, AppError> {
+        let (Some(parent), Some(name)) = (
+            repo_path.parent(),
+            repo_path.file_name().and_then(|name| name.to_str()),
+        ) else {
+            return Err(AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("not a tenant repository path: {}", repo_path.display()),
+            )));
+        };
+
+        let sequence = STAGING_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(parent.join(format!(".{}.{}-{}", name, purpose, sequence)))
+    }
+
+    /// Whether `name` is a staging directory this module could have created.
+    /// Parsed exactly rather than matched loosely, so the startup sweep can
+    /// never remove anything else an operator keeps beside the tenants.
+    fn is_staging_name(name: &str) -> bool {
+        let Some((tenant, suffix)) = name
+            .strip_prefix('.')
+            .and_then(|rest| rest.rsplit_once('.'))
+        else {
+            return false;
+        };
+
+        let Some((purpose, sequence)) = suffix.split_once('-') else {
+            return false;
+        };
+
+        validate::tenant_id(tenant).is_ok()
+            && (purpose == STAGING_CREATING || purpose == STAGING_DELETING)
+            && !sequence.is_empty()
+            && sequence.bytes().all(|byte| byte.is_ascii_digit())
+    }
+
+    /// Best-effort removal of a staging directory. Absent is success.
+    fn discard(path: &Path) {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    err = %err,
+                    "cannot remove staging directory, it is cleared at the next start"
+                );
+            }
+        }
+    }
+
+    /// Builds a repository with `build` in a staging directory, then renames
+    /// it to `repo_path`. `build` receives the staging path and must leave
+    /// nothing open on it (every `Repository` it created dropped) by the time
+    /// it returns. Nothing is left behind on failure.
+    ///
+    /// `repo_path` must not exist: the rename would fail on a non-empty
+    /// directory, and a directory already there is the caller's to adopt.
+    pub fn create<T>(
+        repo_path: &Path,
+        build: impl FnOnce(&Path) -> Result<T, AppError>,
+    ) -> Result<T, AppError> {
+        let staging = Self::sibling(repo_path, STAGING_CREATING)?;
+
+        if let Some(parent) = staging.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        Self::discard(&staging);
+
+        std::fs::create_dir(&staging)?;
+
+        let outcome = build(&staging).and_then(|value| {
+            std::fs::rename(&staging, repo_path)?;
+
+            Ok(value)
+        });
+
+        if outcome.is_err() {
+            Self::discard(&staging);
+        }
+
+        outcome
+    }
+
+    /// Removes the repository at `repo_path`: renamed away first, so readers
+    /// see it vanish at once, then deleted. Once the rename has happened the
+    /// tenant is gone as far as anything is concerned, so a failure to delete
+    /// the renamed copy is logged rather than returned — the startup sweep
+    /// finishes the job.
+    pub fn remove(repo_path: &Path) -> Result<(), AppError> {
+        let trash = Self::sibling(repo_path, STAGING_DELETING)?;
+
+        Self::discard(&trash);
+
+        std::fs::rename(repo_path, &trash)?;
+
+        Self::discard(&trash);
+
+        Ok(())
+    }
+
+    /// Walks `repos_root/<collection>/` once on startup and removes every
+    /// staging directory a previous process left behind: a creation that
+    /// never reached its rename, or a deletion that never finished. At boot
+    /// nothing can be in flight, so everything found is abandoned. Errors
+    /// are swallowed, as for the stale lock sweep: this is hygiene, and must
+    /// never prevent the server from starting.
+    pub fn cleanup_abandoned(repos_root: &Path) {
+        let Ok(collections) = std::fs::read_dir(repos_root) else {
+            return;
+        };
+
+        for collection_entry in collections.flatten() {
+            let collection_path = collection_entry.path();
+
+            if !collection_path.is_dir() {
+                continue;
+            }
+
+            let Ok(tenants) = std::fs::read_dir(&collection_path) else {
+                continue;
+            };
+
+            for tenant_entry in tenants.flatten() {
+                let name = tenant_entry.file_name();
+
+                if !name.to_str().is_some_and(Self::is_staging_name) {
+                    continue;
+                }
+
+                let path = tenant_entry.path();
+
+                tracing::warn!(
+                    path = %path.display(),
+                    "removing tenant staging directory abandoned by a previous process"
+                );
+
+                Self::discard(&path);
             }
         }
     }
@@ -5159,6 +5387,8 @@ impl GitTenant {
     /// trash: the API contract is that tenant deletion is irreversible.
     /// Must be called under the tenant write lock (the route handler holds
     /// it) so no commit can be in flight while the directory disappears.
+    /// Removed through [`GitStaging::remove`], so a concurrent read sees the
+    /// tenant vanish at once rather than a half-deleted repository.
     pub fn delete_repo(repo_path: &Path, tenant_id: &str) -> Result<(), AppError> {
         tracing::debug!(tenant_id = %tenant_id, "deleting tenant repository");
 
@@ -5170,7 +5400,7 @@ impl GitTenant {
             });
         }
 
-        std::fs::remove_dir_all(repo_path).map_err(|err| {
+        GitStaging::remove(repo_path).map_err(|err| {
             tracing::error!(
                 tenant_id = %tenant_id,
                 path = %repo_path.display(),
@@ -5178,7 +5408,7 @@ impl GitTenant {
                 "failed to remove tenant repository directory"
             );
 
-            AppError::Io(err)
+            err
         })?;
 
         tracing::info!(tenant_id = %tenant_id, "tenant repository deleted");
@@ -5554,26 +5784,51 @@ impl GitReplication {
     /// therefore a permanently divergent history — from its master. A replica
     /// only ever holds commits it was handed.
     ///
-    /// The working tree is mirrored onto HEAD once the ref has moved, so a
-    /// replica repository looks on disk exactly like a master one — see
-    /// [`GitReplication::mirror_working_tree`] for why that is worth the
-    /// walk, and why a failure to do it never fails the sync.
+    /// A fresh repository is imported through [`GitStaging::create`], so a
+    /// reader finds either no tenant or one whose HEAD already points at the
+    /// imported commit — never a directory being initialised, nor a
+    /// repository whose HEAD stays unborn for as long as the pack takes to
+    /// import. A directory that exists without being a repository is adopted
+    /// in place, as it always was.
+    ///
+    /// The working tree is **not** touched here: the caller mirrors it with
+    /// [`GitReplication::mirror_working_tree`] once it has recorded the new
+    /// head. A checkout is a walk of the whole tenant, and every read already
+    /// answers from the moved ref, so running it first would leave the
+    /// node's repository listing — and every replica chained to it — behind
+    /// its own reads for the length of that walk.
     pub fn apply_pack(
         repo_path: &Path,
         pack_path: &Path,
         new_head: &str,
-        checkout_files: bool,
     ) -> Result<PackApply, AppError> {
-        let repo = if repo_path.join(".git").exists() {
-            Repository::open(repo_path)?
-        } else {
-            tracing::info!(path = %repo_path.display(), "initialising replica repository");
+        if repo_path.join(".git").exists() {
+            let repo = Repository::open(repo_path)?;
 
-            std::fs::create_dir_all(repo_path)?;
+            return Self::import_pack(&repo, pack_path, new_head);
+        }
 
-            Repository::init(repo_path)?
-        };
+        tracing::info!(path = %repo_path.display(), "initialising replica repository");
 
+        if repo_path.exists() {
+            let repo = Repository::init(repo_path)?;
+
+            return Self::import_pack(&repo, pack_path, new_head);
+        }
+
+        GitStaging::create(repo_path, |staging| {
+            let repo = Repository::init(staging)?;
+
+            Self::import_pack(&repo, pack_path, new_head)
+        })
+    }
+
+    /// The body of [`GitReplication::apply_pack`]: objects first, ref last.
+    fn import_pack(
+        repo: &Repository,
+        pack_path: &Path,
+        new_head: &str,
+    ) -> Result<PackApply, AppError> {
         let new_oid = Oid::from_str(new_head).map_err(|_err| AppError::CommitNotFound {
             sha: new_head.to_string(),
         })?;
@@ -5629,7 +5884,7 @@ impl GitReplication {
             }
         }
 
-        let head_reference = Self::head_reference_name(&repo)?;
+        let head_reference = Self::head_reference_name(repo)?;
 
         repo.reference(
             &head_reference,
@@ -5637,14 +5892,6 @@ impl GitReplication {
             true,
             &format!("replication: fast-forward to {}", new_head),
         )?;
-
-        // The ref has moved, so the repository is already correct as far as
-        // every read path is concerned; the working tree is the courtesy
-        // that follows, and it is deliberately not allowed to fail the
-        // apply.
-        if checkout_files {
-            Self::mirror_repository(repo_path, &repo);
-        }
 
         Ok(PackApply::FastForwarded {
             from: local_head.map(|oid| oid.to_string()),

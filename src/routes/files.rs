@@ -32,7 +32,7 @@ use crate::{
     routes::AuthorRequest,
     seek::{SeekBody, SeekFilter, SeekOptions},
     state::AppState,
-    util::run_blocking,
+    util::{run_blocking, run_tenant_read},
     validate,
 };
 
@@ -415,7 +415,7 @@ pub async fn list_files(
 
     let tenant_id_for_task = tenant_id.clone();
 
-    let (tree, has_more) = run_blocking(move || {
+    let (tree, has_more) = run_tenant_read(&repo_path.clone(), &tenant_id, move || {
         git::GitFiles::list_files(
             &repo_path,
             &tenant_id_for_task,
@@ -500,7 +500,7 @@ pub async fn count_files(
 
     let tenant_id_for_task = tenant_id.clone();
 
-    let counts = run_blocking(move || {
+    let counts = run_tenant_read(&repo_path.clone(), &tenant_id, move || {
         git::GitFiles::count_files(
             &repo_path,
             &tenant_id_for_task,
@@ -586,7 +586,7 @@ pub async fn read_file(
     let file_path_for_task = file_path.clone();
     let tenant_id_for_task = tenant_id.clone();
 
-    let file = run_blocking(move || {
+    let file = run_tenant_read(&repo_path.clone(), &tenant_id, move || {
         git::GitFiles::read_file(&repo_path, &tenant_id_for_task, &file_path_for_task, &seek)
     })
     .await?;
@@ -687,8 +687,10 @@ pub async fn batch_read_files(
 
     let file_reads_for_task = file_reads.clone();
 
-    let contents = run_blocking(move || {
-        git::GitFiles::batch_read_files(&repo_path, &tenant_id, &file_reads_for_task)
+    let tenant_id_for_task = tenant_id.clone();
+
+    let contents = run_tenant_read(&repo_path.clone(), &tenant_id, move || {
+        git::GitFiles::batch_read_files(&repo_path, &tenant_id_for_task, &file_reads_for_task)
     })
     .await?;
 
@@ -741,9 +743,12 @@ pub async fn file_exists(
 
     let file_path_for_task = file_path.clone();
 
-    let kind =
-        run_blocking(move || git::GitFiles::path_kind(&repo_path, &tenant_id, &file_path_for_task))
-            .await?;
+    let tenant_id_for_task = tenant_id.clone();
+
+    let kind = run_tenant_read(&repo_path.clone(), &tenant_id, move || {
+        git::GitFiles::path_kind(&repo_path, &tenant_id_for_task, &file_path_for_task)
+    })
+    .await?;
 
     match kind {
         git::PathKind::File => Ok(StatusCode::OK),

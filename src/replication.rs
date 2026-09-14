@@ -96,7 +96,9 @@ use tokio::sync::{broadcast, Notify, Semaphore};
 use tokio::time::{sleep, Duration};
 
 use crate::config::{Config, ReplicationConfig};
-use crate::git::{GitReplication, HeadRelation, PackApply, RepositoryHead, RepositoryScan};
+use crate::git::{
+    GitReplication, GitStaging, HeadRelation, PackApply, RepositoryHead, RepositoryScan,
+};
 use crate::state::AppState;
 use crate::util::run_blocking;
 use crate::validate;
@@ -1210,7 +1212,7 @@ impl RepositoryIndex {
             let _scanning = self.scan_lock.lock();
 
             if self.needs_scan() {
-                self.rescan();
+                self.rescan_locked();
             }
         }
 
@@ -1273,7 +1275,19 @@ impl RepositoryIndex {
     /// walk itself found, and the condition is raised as an issue: the store
     /// under this process is not the store it started with, and nothing
     /// scanned from it may be used to infer a deletion.
+    ///
+    /// Scans never overlap: the merge below trusts `announced_at` against the
+    /// sequence its own scan started at, and a second scan folding in
+    /// meanwhile resets entries it saw on disk to `0` — after which the first
+    /// one, finishing later, would drop an entry announced while it walked.
     pub fn rescan(&self) {
+        let _scanning = self.scan_lock.lock();
+
+        self.rescan_locked();
+    }
+
+    /// [`RepositoryIndex::rescan`], for a caller already holding `scan_lock`.
+    fn rescan_locked(&self) {
         let started_at = match self.inner.lock() {
             Ok(inner) => inner.sequence,
             Err(_) => return,
@@ -2767,15 +2781,9 @@ impl ReplicaFollower {
 
         let apply_repo_path = repo_path.clone();
         let apply_pack_path = pack_path.clone();
-        let checkout_files = self.state.config.server.checkout_files;
 
         let outcome = run_blocking(move || {
-            GitReplication::apply_pack(
-                &apply_repo_path,
-                &apply_pack_path,
-                &apply_head,
-                checkout_files,
-            )
+            GitReplication::apply_pack(&apply_repo_path, &apply_pack_path, &apply_head)
         })
         .await;
 
@@ -2791,16 +2799,43 @@ impl ReplicaFollower {
                     "replicated"
                 );
 
-                self.state
-                    .maintenance
-                    .schedule(&lock_key, repo_path, lock.clone());
-
+                // Recorded the moment the ref has moved, before the working
+                // tree is mirrored: every read already answers from the new
+                // head, so this node's listing — and the cascade below — must
+                // not trail it by the length of a checkout. A listing behind
+                // the reads is what let a sync finishing late overwrite a
+                // newer head a rescan had already found.
+                //
                 // Cascade: a replica serves the replication surface too, so
                 // anything following *this* node learns about the change
                 // without waiting for its own poll interval.
                 self.state
                     .replication
                     .repository_updated(collection_id, tenant_id, &to);
+
+                self.state
+                    .maintenance
+                    .schedule(&lock_key, repo_path.clone(), lock.clone());
+
+                // The courtesy that follows, still under the lock so it never
+                // races a maintenance pass or the next sync of this
+                // repository. It cannot fail the sync: the ref has moved.
+                if self.state.config.server.checkout_files {
+                    let mirror_repo_path = repo_path.clone();
+
+                    if let Err(err) = run_blocking(move || {
+                        Ok(GitReplication::mirror_working_tree(&mirror_repo_path))
+                    })
+                    .await
+                    {
+                        tracing::warn!(
+                            collection_id = %collection_id,
+                            tenant_id = %tenant_id,
+                            err = %err,
+                            "cannot mirror the working tree onto the replicated head"
+                        );
+                    }
+                }
 
                 Ok(SyncOutcome::Synced)
             }
@@ -3019,7 +3054,11 @@ impl ReplicaFollower {
         let lock = self.state.get_repo_lock(&lock_key);
         let _lock_guard = lock.lock().await;
 
-        match tokio::fs::remove_dir_all(&repo_path).await {
+        // Renamed away before it is deleted, so a read racing the deletion
+        // finds no tenant rather than a half-removed repository.
+        let remove_repo_path = repo_path.clone();
+
+        match run_blocking(move || GitStaging::remove(&remove_repo_path)).await {
             Ok(()) => {
                 self.state.maintenance.cancel(&lock_key);
 

@@ -62,6 +62,8 @@ checkout_files_autoheal = false   # default
 
 Startup is deliberately the only moment healing happens. Doing it on read would mean writing to disk from a read path, which would have to take the tenant write lock that reads here never take; doing it on write would make whichever request first touches a long-disabled tenant pay for checking out the whole of it, and would never reach the tenants nobody writes to — exactly the ones someone goes looking at on disk.
 
+A tenant is never built or deleted where it lives. A new repository is assembled in a hidden sibling named `.<tenant_id>.creating-<n>` and renamed into place once it holds a commit, and a deleted one is renamed to `.<tenant_id>.deleting-<n>` before its files are removed — so a request never finds a tenant half-created or half-deleted. You may see one of these beside the tenants for as long as that takes. One left behind by a killed process is removed at the next start.
+
 ## Reserved files
 
 githttp-fs stores one file of its own inside a tenant repository, holding data Git itself cannot express: **`.order.json`**, the presentation order of the directory it sits in (Git tree entries are name-sorted and carry no metadata slot).

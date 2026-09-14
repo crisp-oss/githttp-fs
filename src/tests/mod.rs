@@ -31,6 +31,7 @@ mod order_routes;
 mod prefix_path;
 mod replication;
 mod seek;
+mod staging;
 mod util;
 mod validate;
 mod working_tree;

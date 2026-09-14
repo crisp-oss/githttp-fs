@@ -380,6 +380,50 @@ async fn server_head_matches(master: &TestServer, replica: &TestServer) {
     }
 }
 
+/// Waits until the replica's own peer listing names the master's HEAD for
+/// the tenant.
+///
+/// Reads answer from the ref the moment it moves, and the listing is updated
+/// from the sync that moved it right after — so "the replica reads the new
+/// head" is not yet "the replica lists it". A test that goes on to change the
+/// replica's repository behind its back, or that asserts on the listing,
+/// waits for this rather than for [`server_head_matches`]: a sync still
+/// finishing would otherwise record its head over whatever the test did.
+async fn replica_lists_master_head(master: &TestServer, replica: &TestServer) {
+    let expected = master.head_sha(TENANT).await;
+    let deadline = Instant::now() + CONVERGE_TIMEOUT;
+
+    loop {
+        let response = peer_get(replica, "/state", Some(REPLICATION_SECRET)).await;
+
+        if response.status() == StatusCode::OK {
+            let body: serde_json::Value = response.json().await.expect("state is not JSON");
+
+            let listed = body["repositories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| {
+                    entry["collection_id"] == "docs"
+                        && entry["tenant_id"] == "acme"
+                        && entry["head_sha"].as_str() == Some(expected.as_str())
+                });
+
+            if listed {
+                return;
+            }
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "the replica never listed the master's HEAD {}",
+            expected
+        );
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test]
 async fn a_replica_pins_its_masters_identity() {
     let (master, replica) = pair().await;
@@ -420,16 +464,35 @@ async fn a_caught_up_replica_reports_itself_synced_and_takes_traffic() {
 
     server_head_matches(&master, &replica).await;
 
-    let ping = replica.get("").await;
+    // Reading the master's head is not yet the end of the sync pass that
+    // landed it: the pending count and the bootstrap gate settle when the
+    // pass finishes, so this is polled rather than read once.
+    let deadline = Instant::now() + CONVERGE_TIMEOUT;
 
-    ping.expect_status(StatusCode::OK);
+    loop {
+        let ping = replica.get("").await;
 
-    let status = &ping.json()["replica"];
+        ping.expect_status(StatusCode::OK);
 
-    assert_eq!(status["state"], "ready");
-    assert_eq!(status["sync"], "synced");
-    assert_eq!(status["pending_repositories"], 0);
-    assert!(status["last_reconcile_at"].is_string());
+        let status = ping.json()["replica"].clone();
+
+        if status["state"] == "ready"
+            && status["sync"] == "synced"
+            && status["pending_repositories"] == 0
+        {
+            assert!(status["last_reconcile_at"].is_string());
+
+            break;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "the replica never reported itself caught up: {}",
+            status
+        );
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
     let health = replica.get_unauthenticated("/_health/status").await;
 
@@ -485,7 +548,7 @@ async fn a_replica_chains_its_own_peer_surface() {
 
     master.write_file(TENANT, "a.md", "x").await;
 
-    server_head_matches(&master, &replica).await;
+    replica_lists_master_head(&master, &replica).await;
 
     let body: serde_json::Value = peer_get(&replica, "/state", Some(REPLICATION_SECRET))
         .await
@@ -624,7 +687,7 @@ async fn a_replica_holding_history_its_master_lacks_is_locked_not_wiped() {
 
     master.write_file(TENANT, "a.md", "# Master").await;
 
-    server_head_matches(&master, &replica).await;
+    replica_lists_master_head(&master, &replica).await;
 
     // The replica gains a commit its master will never announce.
     let local_head = commit_on_top(&replica.repo_path("docs", "acme"), "out of band");
@@ -676,7 +739,7 @@ async fn removing_the_local_copy_is_the_operators_exit_from_a_lock() {
 
     master.write_file(TENANT, "a.md", "# Master").await;
 
-    server_head_matches(&master, &replica).await;
+    replica_lists_master_head(&master, &replica).await;
 
     commit_on_top(&replica.repo_path("docs", "acme"), "out of band");
 
@@ -729,7 +792,7 @@ async fn a_master_that_only_commits_more_leaves_a_diverged_replica_locked() {
 
     master.write_file(TENANT, "a.md", "# One").await;
 
-    server_head_matches(&master, &replica).await;
+    replica_lists_master_head(&master, &replica).await;
 
     commit_on_top(&replica.repo_path("docs", "acme"), "out of band");
 
@@ -760,16 +823,10 @@ async fn a_listing_that_would_delete_most_of_a_replica_is_refused() {
     master.write_file("/docs/one", "a.md", "x").await;
     master.write_file("/docs/two", "b.md", "x").await;
 
-    let deadline = Instant::now() + CONVERGE_TIMEOUT;
-
-    while read_when_ready(&replica, "/docs/two", "b.md")
-        .await
-        .is_none()
-    {
-        assert!(Instant::now() < deadline, "the replica never caught up");
-
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    // Both, as the replica lists them: the guard measures what the listing
+    // holds, and a replica that had landed only one would hold too little to
+    // trip it.
+    wait_for_repository_count(&replica, 2).await;
 
     // The master's whole store goes at once — an unmounted or swapped
     // directory, which is the shape of the accident this guard exists for.

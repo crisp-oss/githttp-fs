@@ -23,8 +23,13 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
-    error::AppError, git, hooks::HookJob, routes::AuthorRequest, state::AppState,
-    util::run_blocking, validate,
+    error::AppError,
+    git,
+    hooks::HookJob,
+    routes::AuthorRequest,
+    state::AppState,
+    util::{run_blocking, run_tenant_read},
+    validate,
 };
 
 #[derive(Deserialize)]
@@ -87,7 +92,7 @@ pub async fn list_commits(
 
     let tenant_id_for_task = tenant_id.clone();
 
-    let (commits, has_more) = run_blocking(move || {
+    let (commits, has_more) = run_tenant_read(&repo_path.clone(), &tenant_id, move || {
         git::GitCommits::list_commits(
             &repo_path,
             &tenant_id_for_task,
@@ -131,9 +136,10 @@ pub async fn get_commit(
 
     let tenant_id_for_task = tenant_id.clone();
 
-    let commit_detail =
-        run_blocking(move || git::GitCommits::get_commit(&repo_path, &tenant_id_for_task, &sha))
-            .await?;
+    let commit_detail = run_tenant_read(&repo_path.clone(), &tenant_id, move || {
+        git::GitCommits::get_commit(&repo_path, &tenant_id_for_task, &sha)
+    })
+    .await?;
 
     tracing::debug!(
         tenant_id = %tenant_id,

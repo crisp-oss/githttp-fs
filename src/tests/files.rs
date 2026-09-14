@@ -976,6 +976,105 @@ async fn deleting_a_tenant_removes_the_whole_repository() {
 }
 
 #[tokio::test]
+async fn a_directory_holding_no_commit_reads_as_no_tenant() {
+    // A store can hold a tenant directory that is not a repository yet (an
+    // operator removed `.git` by hand) or a repository with no commit (a
+    // replica's first import interrupted by an older build). Neither holds
+    // anything a caller could read, so neither is a server error.
+    let server = TestServer::start().await;
+
+    std::fs::create_dir_all(server.repo_path("docs", "empty")).unwrap();
+    git2::Repository::init(server.repo_path("docs", "unborn")).unwrap();
+
+    for tenant in ["/docs/empty", "/docs/unborn"] {
+        server
+            .get(&format!("{}/files/a.md", tenant))
+            .await
+            .expect_status(StatusCode::NOT_FOUND);
+
+        server
+            .get(&format!("{}/files", tenant))
+            .await
+            .expect_status(StatusCode::NOT_FOUND);
+
+        server
+            .get(&format!("{}/commits", tenant))
+            .await
+            .expect_status(StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_being_created_or_deleted_never_reads_as_a_server_error() {
+    // Reads never take the tenant write lock, so a read racing a tenant's
+    // creation or deletion must find either no tenant or a whole one —
+    // never a directory half-way to being a repository.
+    let server = TestServer::start().await;
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let reader = {
+        let stop = stop.clone();
+        let client = reqwest::Client::new();
+        let url = format!("{}{}/files/a.md", server.base_url, TENANT);
+        let api_key = server.api_key.clone();
+
+        tokio::spawn(async move {
+            let mut unexpected = Vec::new();
+            let mut reads = 0_usize;
+
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let response = client
+                    .get(&url)
+                    .bearer_auth(&api_key)
+                    .send()
+                    .await
+                    .expect("read failed");
+
+                reads += 1;
+
+                let status = response.status();
+
+                if status != StatusCode::OK && status != StatusCode::NOT_FOUND {
+                    unexpected.push(format!(
+                        "{}: {}",
+                        status,
+                        response.text().await.unwrap_or_default()
+                    ));
+                }
+            }
+
+            (reads, unexpected)
+        })
+    };
+
+    for _ in 0..25 {
+        server.write_file(TENANT, "a.md", "x").await;
+
+        server
+            .request(reqwest::Method::DELETE, TENANT, None, true)
+            .await
+            .expect_status(StatusCode::OK);
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let (reads, unexpected) = reader.await.expect("reader panicked");
+
+    assert!(reads > 0, "the reader never ran");
+    assert!(unexpected.is_empty(), "unexpected reads: {:?}", unexpected);
+
+    // Nothing of the staging it went through is left beside the tenants.
+    let leftovers: Vec<_> = std::fs::read_dir(server.repos_path.join("docs"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect();
+
+    assert!(leftovers.is_empty(), "left behind: {:?}", leftovers);
+}
+
+#[tokio::test]
 async fn two_collections_holding_the_same_tenant_id_are_separate_repositories() {
     // `collection_id` and `tenant_id` together are the repository identity —
     // this is why a hook receiver must key on both.

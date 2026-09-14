@@ -44,8 +44,14 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
-    error::AppError, git, hooks::HookJob, order, routes::AuthorRequest, state::AppState,
-    util::run_blocking, validate,
+    error::AppError,
+    git,
+    hooks::HookJob,
+    order,
+    routes::AuthorRequest,
+    state::AppState,
+    util::{run_blocking, run_tenant_read},
+    validate,
 };
 
 #[derive(Deserialize)]
@@ -163,8 +169,10 @@ async fn read(
 
     let directory_for_task = directory.clone();
 
-    let stored_order = run_blocking(move || {
-        git::GitOrder::read_order(&repo_path, &tenant_id, &directory_for_task)
+    let tenant_id_for_task = tenant_id.clone();
+
+    let stored_order = run_tenant_read(&repo_path.clone(), &tenant_id, move || {
+        git::GitOrder::read_order(&repo_path, &tenant_id_for_task, &directory_for_task)
     })
     .await?;
 
