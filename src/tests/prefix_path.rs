@@ -233,7 +233,7 @@ async fn a_recursive_move_relocates_the_subtree_keeping_every_leaf_name() {
 
     assert_eq!(
         commits.json()["commits"][0]["message"],
-        "move: docs/guides/ -> handbook/"
+        "move: docs/guides/ → handbook/"
     );
 }
 

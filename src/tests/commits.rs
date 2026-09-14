@@ -141,7 +141,7 @@ async fn file_path_filters_the_listing_and_follows_renames_backward() {
     // Always pass the current path; the server resolves the prior name.
     assert_eq!(
         messages,
-        vec!["update: new.md", "move: old.md -> new.md", "create: old.md"]
+        vec!["update: new.md", "move: old.md → new.md", "create: old.md"]
     );
 }
 

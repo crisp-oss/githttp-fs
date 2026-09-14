@@ -2847,7 +2847,7 @@ impl GitFiles {
         let tree = repo.find_tree(tree_id)?;
         let signature = GitUtils::git_signature(author_name, author_email)?;
 
-        let auto_message = format!("move: {} -> {}", from_path, to_path);
+        let auto_message = format!("move: {} → {}", from_path, to_path);
         let message = commit_message.unwrap_or(&auto_message);
 
         tracing::trace!(
@@ -3083,7 +3083,7 @@ impl GitFiles {
 
         // Trailing slashes mark this as a folder-wide move, so a reader of the
         // history can tell it apart from a single-file one.
-        let auto_message = format!("move: {}/ -> {}/", from_path, to_path);
+        let auto_message = format!("move: {}/ → {}/", from_path, to_path);
         let message = commit_message.unwrap_or(&auto_message);
 
         tracing::trace!(
@@ -3381,7 +3381,7 @@ impl GitOrder {
         let tree = repo.find_tree(tree_id)?;
         let signature = GitUtils::git_signature(author_name, author_email)?;
 
-        let auto_message = format!("order: {}", display_directory);
+        let auto_message = format!("reorder: {}", display_directory);
         let message = commit_message.unwrap_or(&auto_message);
 
         let commit_oid = repo.commit(
@@ -3542,8 +3542,8 @@ impl GitOrder {
 
         // `Unlisted` stops here: the entry is dropped and never re-inserted.
         // The position it actually landed at (after clamping) is kept for the
-        // auto-generated message, so the commit records where it went rather
-        // than what was asked for.
+        // log line, so it records where the entry went rather than what was
+        // asked for.
         let inserted_at = match position {
             OrderPosition::At(position) => {
                 let position = position.min(entries.len());
@@ -3596,11 +3596,7 @@ impl GitOrder {
         let tree = repo.find_tree(tree_id)?;
         let signature = GitUtils::git_signature(author_name, author_email)?;
 
-        let auto_message = match inserted_at {
-            Some(position) => format!("order: {} -> {}", entry_path, position),
-            None => format!("order: {} -> unlisted", entry_path),
-        };
-
+        let auto_message = format!("reorder: {}", entry_path);
         let message = commit_message.unwrap_or(&auto_message);
 
         let commit_oid = repo.commit(
@@ -3666,7 +3662,7 @@ impl GitOrder {
         let tree = repo.find_tree(tree_id)?;
         let signature = GitUtils::git_signature(author_name, author_email)?;
 
-        let auto_message = format!("order: {}", display_directory);
+        let auto_message = format!("reorder: {}", display_directory);
         let message = commit_message.unwrap_or(&auto_message);
 
         let commit_oid = repo.commit(
