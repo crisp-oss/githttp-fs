@@ -3381,7 +3381,7 @@ impl GitOrder {
         let tree = repo.find_tree(tree_id)?;
         let signature = GitUtils::git_signature(author_name, author_email)?;
 
-        let auto_message = format!("order update: {}", display_directory);
+        let auto_message = format!("order: {}", display_directory);
         let message = commit_message.unwrap_or(&auto_message);
 
         let commit_oid = repo.commit(
@@ -3597,8 +3597,8 @@ impl GitOrder {
         let signature = GitUtils::git_signature(author_name, author_email)?;
 
         let auto_message = match inserted_at {
-            Some(position) => format!("order position: {} -> {}", entry_path, position),
-            None => format!("order position: {} -> unlisted", entry_path),
+            Some(position) => format!("order: {} -> {}", entry_path, position),
+            None => format!("order: {} -> unlisted", entry_path),
         };
 
         let message = commit_message.unwrap_or(&auto_message);
@@ -3666,7 +3666,7 @@ impl GitOrder {
         let tree = repo.find_tree(tree_id)?;
         let signature = GitUtils::git_signature(author_name, author_email)?;
 
-        let auto_message = format!("order delete: {}", display_directory);
+        let auto_message = format!("order: {}", display_directory);
         let message = commit_message.unwrap_or(&auto_message);
 
         let commit_oid = repo.commit(
