@@ -1,6 +1,13 @@
 Changelog
 =========
 
+## v1.11.2
+
+### Changes
+
+* Auto-generated commit messages for order writes (`PUT` and `DELETE` on `/order`, and `POST .../reorder`) now all share the `order:` prefix, e.g. `order: docs/guides` or `order: docs/intro.md -> 2`, replacing the former `order update:`, `order delete:` and `order position:` prefixes.
+* Updated all dependencies to latest.
+
 ## v1.11.1
 
 ### New Features
