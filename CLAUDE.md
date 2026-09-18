@@ -881,6 +881,16 @@ reminder that "write-shaped" and "write" are different questions on this API.
 
 After applying code changes, always run `cargo fmt` before `cargo build`.
 
+### Commit messages
+
+**One line, and only one line.** A commit message is a single subject line with no body: the subject says what the change does, and why it is the way it is belongs in this file or in `CONSIDERATIONS.md`, where it stays discoverable long after the commit has scrolled out of `git log`. The only things that ever follow the subject are the trailers a tool appends (`Co-Authored-By:`, `Claude-Session:`) and a merge commit's generated message.
+
+The subject is written in the **imperative mood**, capitalised, with no trailing period — `Add check file exist route`, `Fix reads racing tenant creation, deletion and replica sync`, `Only auto-run tests prior to releasing`. There is no `type:` prefix and no scope: this repository does not use Conventional Commits, and [the changelog is written by hand at release time](#changelog) rather than derived from commit subjects, so a machine-readable prefix would buy nothing while a `feat:`/`fix:` split would have to be maintained for no reader.
+
+The recurring verbs carry their ordinary meaning: `Add` and `Implement` for new surface, `Fix` for behaviour that did not match its documentation, `Update` and `Bump` for dependencies and generated files, `Normalize` / `Rename` / `Move` for mechanical passes. A change that genuinely does two things joins them with ` + ` rather than reaching for a vaguer summary — `Add configuration to tune the auto-checkout behavior of githttp-fs + auto-heal behavior`.
+
+**A release commit is the version and nothing else** — `v1.11.3`, exactly as step 8 of the [release procedure](#release-procedure) says. Everything that went into it is already written up in `CHANGELOG.md` under that same heading, so a prose subject would only paraphrase it.
+
 ### Tests
 
 The suite lives in `src/tests/`, registered as `#[cfg(test)] mod tests;` in `main.rs` rather than in a `tests/` directory — a binary crate has no library target, and an in-crate module reaches `build_router` and every internal module without adding one. Run it with `cargo test`.
