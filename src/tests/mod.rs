@@ -12,7 +12,7 @@
 //! contract is tested through a real server on a real socket (see
 //! [`harness`]).
 //!
-//! The behaviour asserted here is the behaviour documented in `CLAUDE.md`.
+//! The behaviour asserted here is the behaviour documented in `API.md`.
 //! Where a test's expectation looks surprising, the documented rule it comes
 //! from is quoted in a comment above it — so a future change that breaks a
 //! test can be judged against what the API promised, not just against what

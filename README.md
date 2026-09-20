@@ -155,6 +155,8 @@ Use the sample [config.toml](https://github.com/crisp-oss/githttp-fs/blob/master
 
 ### Read more
 
+* [API.md](API.md) — the complete HTTP API and webhook payload reference
+* [DESIGN.md](DESIGN.md) — the annotated configuration reference and the reasoning behind every design decision
 * [CONSIDERATIONS.md](CONSIDERATIONS.md) — how read-only replicas behave, why two health routes are public, and the one file githttp-fs reserves inside a tenant repository
 * [REPLICATION.md](REPLICATION.md) — the replication peer protocol: wire formats, reconciliation, safety guarantees, failure handling, and the promotion runbook
 
