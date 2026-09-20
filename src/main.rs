@@ -53,6 +53,7 @@ mod replication;
 mod routes;
 mod seek;
 mod state;
+mod traverse;
 mod util;
 mod validate;
 
