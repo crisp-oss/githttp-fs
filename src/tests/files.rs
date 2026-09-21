@@ -1229,6 +1229,46 @@ async fn a_date_filter_prunes_directories_left_holding_nothing() {
 }
 
 #[tokio::test]
+async fn a_depth_limited_date_filter_keeps_the_directories_holding_a_match() {
+    use crate::tests::fixture::{at, commit_files_at};
+
+    let server = TestServer::start().await;
+
+    server.write_file(TENANT, "seed.md", "seed").await;
+
+    let repo = server.repo_path("docs", "acme");
+
+    commit_files_at(
+        &repo,
+        at("2020-01-01T00:00:00Z"),
+        "old",
+        &[("old/deep/a.md", b"x")],
+    );
+    commit_files_at(
+        &repo,
+        at("2022-01-01T00:00:00Z"),
+        "new",
+        &[("new/deep/b.md", b"x")],
+    );
+
+    let body = server
+        .get(&format!(
+            "{}/files?maximum_depth=1&include_date_from=2021-01-01T00:00:00Z&include_date_to=2023-01-01T00:00:00Z",
+            TENANT
+        ))
+        .await
+        .json();
+
+    // "`maximum_depth` bounds what is *returned* rather than what is looked
+    // at: a directory sitting at the limit comes back as the same childless
+    // stub the plain listing returns, but only when the subtree below it holds
+    // an in-window file." Both directories hold their file below the limit;
+    // only `new`'s is inside the window, and `seed.md` is stamped now.
+    assert_eq!(names(&body["files"]), vec!["new"]);
+    assert_eq!(children(&body["files"], "new").as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn a_date_filter_intersects_with_a_name_search() {
     let server = TestServer::start().await;
 
@@ -1254,6 +1294,50 @@ async fn a_date_filter_intersects_with_a_name_search() {
         .json();
 
     assert_eq!(names(&body["files"]), vec!["b.md"]);
+}
+
+#[tokio::test]
+async fn a_name_matched_directory_at_the_depth_limit_still_needs_an_in_window_file() {
+    use crate::tests::fixture::{at, commit_files_at};
+
+    let server = TestServer::start().await;
+
+    let repo = server.repo_path("docs", "acme");
+
+    server.write_file(TENANT, "seed.md", "seed").await;
+
+    commit_files_at(
+        &repo,
+        at("2020-01-01T00:00:00Z"),
+        "old",
+        &[("guides-old/deep/a.md", b"x")],
+    );
+    commit_files_at(
+        &repo,
+        at("2022-01-01T00:00:00Z"),
+        "new",
+        &[("guides-new/deep/b.md", b"x")],
+    );
+
+    let body = server
+        .get(&format!(
+            "{}/files?file_name_starts_with=guides&maximum_depth=1&include_date_from=2021-01-01T00:00:00Z&include_date_to=2023-01-01T00:00:00Z",
+            TENANT
+        ))
+        .await
+        .json();
+
+    // Both directories match the name and sit at the depth limit, so the
+    // date window is what separates them — the stub rule is the same one the
+    // plain date-filtered listing follows.
+    assert_eq!(names(&body["files"]), vec!["guides-new"]);
+    assert_eq!(
+        children(&body["files"], "guides-new")
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
 }
 
 // --- Search and depth composition ----------------------------------------

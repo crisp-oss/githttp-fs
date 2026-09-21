@@ -53,6 +53,7 @@ use git2::{
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use crate::error::AppError;
@@ -1873,6 +1874,12 @@ impl GitFiles {
         let mut flat: Vec<String> = Vec::new();
         let mut dir_stubs: Vec<String> = Vec::new();
 
+        // Matched directories the depth limit stopped the walk at, kept apart
+        // from the stubs above because their contents are still unknown here:
+        // a date filter has to look inside them (their subtree oid is what it
+        // looks inside with) before it can say whether they belong on the page.
+        let mut depth_stubs: Vec<(String, Oid)> = Vec::new();
+
         // While walking inside a directory whose name matched, this holds that
         // directory's path with a trailing slash. Every descendant is then
         // collected unconditionally (the whole matched subtree is expanded);
@@ -1923,7 +1930,7 @@ impl GitFiles {
 
                         if entry_depth >= max {
                             if matched {
-                                dir_stubs.push(full_path);
+                                depth_stubs.push((full_path, entry.id()));
                             }
 
                             return git2::TreeWalkResult::Skip;
@@ -1955,14 +1962,62 @@ impl GitFiles {
         // name matches that also fall inside the date window survive. Because
         // directories carry no date, the matched tree is rebuilt from the
         // surviving *files* alone — a name-matched directory left with no
-        // in-window file is pruned (and depth stubs, whose contents we never
-        // walked and so cannot date, are dropped).
+        // in-window file is pruned.
+        //
+        // A directory the depth limit cut the walk short at is the one case
+        // that needs more than `flat`: it is on the page as a childless stub,
+        // so whether it holds an in-window file is decided by walking its
+        // subtree now. Those files answer that question and nothing else —
+        // they are never rendered, since the depth limit is exactly the
+        // promise that nothing below it is.
         let (flat, dir_stubs) = match date_filter {
-            Some(date_filter) => (
-                Self::retain_by_date(repo, path_prefix, flat, date_filter)?,
-                Vec::new(),
-            ),
-            None => (flat, dir_stubs),
+            Some(date_filter) => {
+                let mut candidates = flat;
+                let rendered = candidates.len();
+                let mut stub_ranges: Vec<(String, Range<usize>)> =
+                    Vec::with_capacity(depth_stubs.len());
+
+                for (stub_path, stub_oid) in depth_stubs {
+                    let start = candidates.len();
+
+                    if let Ok(subtree) = repo.find_tree(stub_oid) {
+                        for leaf in Self::collect_flat_files(&subtree, None, include_hidden_files)?
+                        {
+                            candidates.push(format!("{}/{}", stub_path, leaf));
+                        }
+                    }
+
+                    stub_ranges.push((stub_path, start..candidates.len()));
+                }
+
+                let surviving =
+                    Self::surviving_by_date(repo, path_prefix, &candidates, date_filter)?;
+
+                let stubs: Vec<String> = stub_ranges
+                    .into_iter()
+                    .filter(|(_stub_path, range)| {
+                        candidates[range.clone()]
+                            .iter()
+                            .any(|leaf| surviving.contains(leaf))
+                    })
+                    .map(|(stub_path, _range)| stub_path)
+                    .collect();
+
+                candidates.truncate(rendered);
+
+                (
+                    candidates
+                        .into_iter()
+                        .filter(|leaf| surviving.contains(leaf))
+                        .collect(),
+                    stubs,
+                )
+            }
+            None => {
+                dir_stubs.extend(depth_stubs.into_iter().map(|(stub_path, _oid)| stub_path));
+
+                (flat, dir_stubs)
+            }
         };
 
         // The walk already bounded depth, so every collected path is within
@@ -1994,8 +2049,17 @@ impl GitFiles {
     /// file is dated against commit history, and the surviving set is
     /// paginated over its root-level entries. Directories survive only as the
     /// structure leading to a surviving file, so an emptied directory is
-    /// pruned. `maximum_depth` and `include_hidden_files` bound the walk
-    /// exactly as elsewhere; files below the depth limit are never candidates.
+    /// pruned. `include_hidden_files` bounds the walk exactly as elsewhere.
+    ///
+    /// `maximum_depth` bounds the *result* rather than the walk: a directory
+    /// sitting at the limit renders as a childless stub, exactly as the plain
+    /// listing renders it, but only when the subtree below it holds an
+    /// in-window file — which is why the walk has to go past the limit even
+    /// though nothing below it is ever rendered. Bounding the walk instead
+    /// would drop every directory from a depth-limited listing (nothing below
+    /// the limit is walked, so nothing below it can be dated), leaving a
+    /// caller that browses one level at a time with no folder to descend
+    /// into.
     #[allow(clippy::too_many_arguments)]
     fn list_with_date_filter(
         repo: &Repository,
@@ -2008,13 +2072,15 @@ impl GitFiles {
         page: usize,
         per_page: usize,
     ) -> Result<(Vec<TreeNode>, bool), AppError> {
-        let flat = Self::collect_flat_files(walk_tree, maximum_depth, include_hidden_files)?;
+        let flat = Self::collect_flat_files(walk_tree, None, include_hidden_files)?;
         let matched = Self::retain_by_date(repo, path_prefix, flat, date_filter)?;
 
-        // Depth was already applied during collection, so `build_tree` needs
-        // no depth handling of its own, and there are no stubs (a directory we
-        // could not descend into cannot be date-classified, so it is dropped).
-        let mut tree = GitUtils::build_tree(matched, Vec::new(), None);
+        // `build_tree` applies the depth limit, so a surviving file below it
+        // is not rendered but still puts the directory it sits under on the
+        // page, as the childless stub the plain listing would show. A
+        // directory whose whole subtree fell outside the window contributes no
+        // path at all and is therefore pruned, exactly like an emptied one.
+        let mut tree = GitUtils::build_tree(matched, Vec::new(), maximum_depth);
 
         // The whole surviving tree is in hand before pagination here, so
         // ordering is applied to it in full and the page window is sliced from
@@ -2082,17 +2148,21 @@ impl GitFiles {
         Ok(flat)
     }
 
-    /// Keeps only those `flat` paths (relative to the listing root) whose git
-    /// date falls inside `date_filter`'s window. The date map returned by
+    /// Which of those `flat` paths (relative to the listing root) have a git
+    /// date inside `date_filter`'s window. The date map returned by
     /// `file_dates` is keyed by repo-root paths, so the listing-root
     /// `path_prefix` is re-joined before each lookup. A path with no date in
     /// history (which cannot happen for a file present in HEAD) is dropped.
-    fn retain_by_date(
+    ///
+    /// A set rather than a filtered list because a caller may be asking about
+    /// two different things at once: which files to render, and whether some
+    /// *other* file — one below a depth limit — puts its directory on the page.
+    fn surviving_by_date(
         repo: &Repository,
         path_prefix: Option<&str>,
-        flat: Vec<String>,
+        flat: &[String],
         date_filter: DateFilter,
-    ) -> Result<Vec<String>, AppError> {
+    ) -> Result<HashSet<String>, AppError> {
         let to_full = |leaf: &str| -> String {
             match path_prefix {
                 Some(prefix) if !prefix.is_empty() => format!("{}/{}", prefix, leaf),
@@ -2103,18 +2173,40 @@ impl GitFiles {
         let full_paths: HashSet<String> = flat.iter().map(|leaf| to_full(leaf)).collect();
 
         if full_paths.is_empty() {
-            return Ok(Vec::new());
+            return Ok(HashSet::new());
         }
 
-        let dates = Self::file_dates(repo, &full_paths, date_filter.kind)?;
+        let dates = Self::file_dates(
+            repo,
+            &full_paths,
+            date_filter.kind,
+            path_prefix.filter(|prefix| !prefix.is_empty()),
+        )?;
 
         Ok(flat
-            .into_iter()
+            .iter()
             .filter(|leaf| {
                 dates
                     .get(&to_full(leaf))
                     .is_some_and(|date| date_filter.matches(*date))
             })
+            .cloned()
+            .collect())
+    }
+
+    /// [`Self::surviving_by_date`] applied to a list the caller owns, keeping
+    /// the surviving paths in the order they came in.
+    fn retain_by_date(
+        repo: &Repository,
+        path_prefix: Option<&str>,
+        flat: Vec<String>,
+        date_filter: DateFilter,
+    ) -> Result<Vec<String>, AppError> {
+        let surviving = Self::surviving_by_date(repo, path_prefix, &flat, date_filter)?;
+
+        Ok(flat
+            .into_iter()
+            .filter(|leaf| surviving.contains(leaf))
             .collect())
     }
 
@@ -2132,10 +2224,23 @@ impl GitFiles {
     ///   requested path has a date.
     /// - `Created`: the oldest commit that *added* a path; the walk must reach
     ///   the root of history, so this is the heavier of the two.
+    ///
+    /// `scope` is the listing's `prefix_path`, and every requested path lives
+    /// under it. Handing it to the diff as a pathspec is what keeps a scoped
+    /// listing cheap: without it each commit is diffed in full and the deltas
+    /// of every *other* directory are produced only to be discarded here, so a
+    /// repository holding one sub-tree per locale pays for all of them on
+    /// every commit of its history. With it, libgit2 prunes the tree walk to
+    /// the sub-tree in scope and never reads the objects behind the rest.
+    /// `disable_pathspec_match` is what makes that pruning happen at all —
+    /// libgit2 hands the pathspec to its tree iterators only when it is set,
+    /// and matching then compares literal path prefixes rather than globs,
+    /// which is what a directory path should mean here anyway.
     fn file_dates(
         repo: &Repository,
         paths: &HashSet<String>,
         kind: DateKind,
+        scope: Option<&str>,
     ) -> Result<HashMap<String, DateTime<Utc>>, AppError> {
         let mut dates: HashMap<String, DateTime<Utc>> = HashMap::new();
 
@@ -2143,6 +2248,18 @@ impl GitFiles {
 
         revwalk.push_head()?;
         revwalk.set_sorting(Sort::TIME | Sort::TOPOLOGICAL)?;
+
+        // Built once and reused: the options are the same for every commit,
+        // and a scoped walk would otherwise re-allocate its pathspec on each
+        // of them.
+        let mut diff_options = DiffOptions::new();
+
+        diff_options.include_untracked(false);
+
+        if let Some(scope) = scope {
+            diff_options.disable_pathspec_match(true);
+            diff_options.pathspec(scope);
+        }
 
         for oid_result in revwalk {
             // Updated: once every requested path is dated, every older commit
@@ -2164,10 +2281,6 @@ impl GitFiles {
             // The root commit has no parent — diff against an empty tree
             // (`None`), so its entries register as additions.
             let parent_tree = commit.parent(0).and_then(|parent| parent.tree()).ok();
-
-            let mut diff_options = DiffOptions::new();
-
-            diff_options.include_untracked(false);
 
             let diff = match repo.diff_tree_to_tree(
                 parent_tree.as_ref(),
