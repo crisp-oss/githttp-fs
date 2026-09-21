@@ -224,6 +224,16 @@ impl TestServerBuilder {
         self
     }
 
+    /// How often this replica polls its master. The default of one second
+    /// is what keeps convergence tests quick; a test that cares about the
+    /// cadence a replica *reports* rather than how fast it converges sets
+    /// its own.
+    pub fn poll_interval_secs(mut self, secs: u64) -> Self {
+        self.poll_interval_secs = secs;
+
+        self
+    }
+
     /// Whether this node keeps a working tree on disk.
     pub fn checkout_files(mut self, enabled: bool) -> Self {
         self.checkout_files = Some(enabled);

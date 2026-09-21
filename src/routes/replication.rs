@@ -39,7 +39,7 @@ use crate::{
     replication::{
         self, Issue, ReplicationEvent, ReplicationHealth, RepositoryEntry, RepositoryListing,
         EVENT_HEARTBEAT_SECS, HEAD_SHA_HEADER, INSTANCE_HEADER, NODE_ID_HEADER, PENDING_HEADER,
-        PROTOCOL_HEADER, PROTOCOL_VERSION, REPOSITORIES_HEADER, SYNC_HEADER,
+        POLL_INTERVAL_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION, REPOSITORIES_HEADER, SYNC_HEADER,
     },
     state::AppState,
     util::run_blocking,
@@ -92,9 +92,13 @@ pub async fn replication_state(
     let peer = peer_identity(&headers);
 
     if let Some(node_id) = &peer.node_id {
-        state
-            .replica_registry
-            .note_request(node_id, peer.repositories, peer.pending, peer.sync);
+        state.replica_registry.note_request(
+            node_id,
+            peer.repositories,
+            peer.pending,
+            peer.sync,
+            peer.poll_interval_secs,
+        );
     }
 
     let identity = state.identity.current();
@@ -281,9 +285,13 @@ pub async fn replication_events(State(state): State<AppState>, headers: HeaderMa
     // token is an older build; it is let through without the check rather
     // than locked out of a feature it predates.
     if let Some(node_id) = &peer_node_id {
-        state
-            .replica_registry
-            .note_request(node_id, peer.repositories, peer.pending, peer.sync);
+        state.replica_registry.note_request(
+            node_id,
+            peer.repositories,
+            peer.pending,
+            peer.sync,
+            peer.poll_interval_secs,
+        );
 
         let instance = peer.instance.as_deref().unwrap_or("");
 
@@ -450,6 +458,9 @@ struct PeerHeaders {
     repositories: Option<usize>,
     pending: Option<usize>,
     sync: Option<String>,
+    /// The caller's own `poll_interval_secs`, which sizes the silence
+    /// threshold its roster row is judged against.
+    poll_interval_secs: Option<u64>,
 }
 
 /// Reads the identity a peer volunteered, and the numbers only it can know,
@@ -471,6 +482,7 @@ fn peer_identity(headers: &HeaderMap) -> PeerHeaders {
     };
 
     let number = |name: &str| header(name).and_then(|value| value.parse::<usize>().ok());
+    let seconds = |name: &str| header(name).and_then(|value| value.parse::<u64>().ok());
 
     let node_id = header(NODE_ID_HEADER).and_then(|node_id| match validate::node_id(&node_id) {
         Ok(_) => Some(node_id),
@@ -491,6 +503,9 @@ fn peer_identity(headers: &HeaderMap) -> PeerHeaders {
         repositories: number(REPOSITORIES_HEADER),
         pending: number(PENDING_HEADER),
         sync: bounded(SYNC_HEADER),
+        // Unbounded on purpose: an absurd value cannot do harm here, because
+        // `replication::silent_after_secs` clamps what it derives from it.
+        poll_interval_secs: seconds(POLL_INTERVAL_HEADER),
     }
 }
 
@@ -509,9 +524,13 @@ pub async fn replication_health(
     let peer = peer_identity(&headers);
 
     if let Some(node_id) = &peer.node_id {
-        state
-            .replica_registry
-            .note_request(node_id, peer.repositories, peer.pending, peer.sync);
+        state.replica_registry.note_request(
+            node_id,
+            peer.repositories,
+            peer.pending,
+            peer.sync,
+            peer.poll_interval_secs,
+        );
     }
 
     Ok((StatusCode::OK, Json(health_for(&state).await?)))

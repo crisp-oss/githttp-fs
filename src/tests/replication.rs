@@ -18,7 +18,7 @@ use axum::http::StatusCode;
 use serde_json::json;
 
 use crate::{
-    replication::{NODE_ID_HEADER, PROTOCOL_VERSION, URL_PREFIX},
+    replication::{silent_after_secs, NODE_ID_HEADER, PROTOCOL_VERSION, URL_PREFIX},
     tests::harness::{author, TestServer, REPLICATION_SECRET},
 };
 
@@ -975,4 +975,77 @@ async fn head_relation_classifies_the_three_cases_a_replica_must_tell_apart() {
         crate::git::GitReplication::relation_to(&repo_path, &forked),
         crate::git::HeadRelation::Diverged { .. }
     ));
+}
+
+// --- The silence threshold -----------------------------------------------
+
+#[tokio::test]
+async fn a_replica_states_the_cadence_its_silence_is_judged_against() {
+    let master = TestServer::builder()
+        .master()
+        .node_id("threshold-master")
+        .start()
+        .await;
+
+    // Far above the floor, so the derived threshold is visibly this
+    // replica's own rather than the fallback.
+    let _replica = TestServer::builder()
+        .replica_of(master.replication_url.as_ref().unwrap())
+        .node_id("threshold-replica")
+        .poll_interval_secs(300)
+        .start()
+        .await;
+
+    let deadline = Instant::now() + CONVERGE_TIMEOUT;
+
+    loop {
+        let row = master
+            .state
+            .replica_registry
+            .roster()
+            .into_iter()
+            .find(|entry| entry.node_id == "threshold-replica");
+
+        if let Some(row) = row {
+            if let Some(reported) = row.poll_interval_secs {
+                assert_eq!(reported, 300);
+
+                // "the master sizes each row's silence threshold from the
+                // row's own cadence" — two intervals of it, here.
+                assert_eq!(silent_after_secs(row.poll_interval_secs), 600);
+
+                break;
+            }
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "the master never learned its replica's polling cadence"
+        );
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[test]
+fn the_silence_threshold_is_two_poll_intervals_between_a_floor_and_a_ceiling() {
+    // A peer that states nothing — one predating the header — keeps exactly
+    // the behaviour this rule had before it was derived.
+    assert_eq!(silent_after_secs(None), 120);
+
+    // The default cadence lands on that same value, which is where the
+    // floor comes from.
+    assert_eq!(silent_after_secs(Some(60)), 120);
+
+    // Above the floor, the threshold follows the cadence.
+    assert_eq!(silent_after_secs(Some(180)), 360);
+
+    // Below it, the floor holds: a replica polling every second is still
+    // allowed a couple of minutes of quiet before anyone calls it degraded.
+    assert_eq!(silent_after_secs(Some(1)), 120);
+
+    // "a self-asserted number cannot disable the rule" — including one
+    // large enough to overflow the multiplication.
+    assert_eq!(silent_after_secs(Some(3_600)), 900);
+    assert_eq!(silent_after_secs(Some(u64::MAX)), 900);
 }
