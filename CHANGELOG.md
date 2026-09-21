@@ -1,6 +1,23 @@
 Changelog
 =========
 
+## v1.12.0
+
+### Breaking Changes
+
+* ⚠️ A date-filtered file listing (`include_date_from` / `include_date_to`) now walks commit history under a safety timer of ten seconds, configured by the new `limits.date_filter_maximum_ms` key. A listing that exhausts it answers `200` with the entries it had dated by then and the new `partial` response field set to `true`, instead of walking to completion however long that takes. Set the key to `0` to turn the timer off and keep the previous, always-exact behaviour.
+* ⚠️ A date-filtered file listing combined with `maximum_depth` now returns the directories sitting at the depth limit, as childless stubs, whenever the subtree below one holds a file inside the date window — previously every such directory was dropped, so a depth-limited date filter answered with files only. A directory whose subtree holds nothing in the window is still pruned. Deciding that requires walking below the depth limit, so a depth-limited date filter now costs what an unlimited one costs.
+
+### New Features
+
+* Added the `limits.date_filter_maximum_ms` configuration key (default `10000`, `0` to disable), a safety timer on the commit-history walk a date-filtered file listing runs.
+* Added a `partial` field to the file listing response, `true` when the answer is short because that safety timer ran out, and `false` on every other listing. Unlike `has_more`, it means asking again will not return the missing entries.
+
+### Changes
+
+* A date-filtered file listing scoped with `prefix_path` now diffs each commit inside that prefix alone rather than in full, so a repository whose history spreads over many sibling directories no longer pays for the ones the listing never looks at. On a repository of 8 700 commits holding one sub-tree per locale, a listing scoped to one locale's articles went from 32 s to 1.8 s.
+* A replica now reports its own `replication.poll_interval_secs` to its master, which sizes the silence that makes it call that replica `degraded` from it (bounded to between two and fifteen minutes) instead of from a fixed two-minute threshold. Raising a replica's poll interval therefore no longer turns a healthy replica into an alert.
+
 ## v1.11.4
 
 ### Changes
