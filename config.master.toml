@@ -31,11 +31,6 @@ allowed_extensions = ["html", "txt", "toml", "json", "md", "mdx"]
 
 batch_read_maximum_files = 100
 
-[hooks.auth]
-
-header = "Authorization"
-value = "Bearer your-hook-receiver-secret"
-
 [maintenance]
 
 enabled = true
