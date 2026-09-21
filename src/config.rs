@@ -209,6 +209,15 @@ pub struct LimitsConfig {
     /// Safety cap on how many files one batch read request may ask for;
     /// larger requests are rejected with a 400.
     pub batch_read_maximum_files: usize,
+    /// Safety timer on the commit-history walk a date-filtered listing runs,
+    /// in milliseconds; a listing that exhausts it stops walking and answers
+    /// with the entries it had dated by then, flagged `partial`. Defaults to
+    /// ten seconds — the one listing cost that is bounded by history length
+    /// rather than by the request, so a node that never ran out of time
+    /// keeps the exact answers it always gave, while one that would have
+    /// spent minutes on a query now answers. `0` turns the timer off and
+    /// restores the unbounded walk.
+    pub date_filter_maximum_ms: u64,
 }
 
 impl Default for LimitsConfig {
@@ -216,6 +225,7 @@ impl Default for LimitsConfig {
         Self {
             allowed_extensions: None,
             batch_read_maximum_files: 100,
+            date_filter_maximum_ms: 10_000,
         }
     }
 }

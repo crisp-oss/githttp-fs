@@ -136,6 +136,7 @@ pub struct TestServerBuilder {
     hook_auth: Option<(String, String)>,
     allowed_extensions: Option<Vec<&'static str>>,
     batch_read_maximum_files: Option<usize>,
+    date_filter_maximum_ms: Option<u64>,
     replica: bool,
     replication_role: Option<&'static str>,
     master_url: Option<String>,
@@ -166,6 +167,7 @@ impl TestServerBuilder {
             ],
             allowed_extensions: None,
             batch_read_maximum_files: None,
+            date_filter_maximum_ms: None,
             replica: false,
             replication_role: None,
             master_url: None,
@@ -299,6 +301,14 @@ impl TestServerBuilder {
         self
     }
 
+    /// The safety timer a date-filtered listing's history walk runs under;
+    /// `0` turns it off. Left alone, the node's ten-second default applies.
+    pub fn date_filter_maximum_ms(mut self, maximum: u64) -> Self {
+        self.date_filter_maximum_ms = Some(maximum);
+
+        self
+    }
+
     /// Makes this node a replica. It follows an unreachable master, which is
     /// exactly what the read-only and bootstrapping guards need: the node
     /// must refuse writes without ever succeeding at replication.
@@ -350,6 +360,10 @@ impl TestServerBuilder {
 
         if let Some(maximum) = self.batch_read_maximum_files {
             toml_text.push_str(&format!("batch_read_maximum_files = {}\n", maximum));
+        }
+
+        if let Some(maximum) = self.date_filter_maximum_ms {
+            toml_text.push_str(&format!("date_filter_maximum_ms = {}\n", maximum));
         }
 
         if let Some(url) = &self.hooks_url {

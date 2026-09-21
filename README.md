@@ -119,7 +119,12 @@ Use the sample [config.toml](https://github.com/crisp-oss/githttp-fs/blob/master
 * `log_level` (type: _string_, allowed: `debug`, `info`, `warn`, `error`, default: `info`) — Verbosity of logging, set it to `error` in production
 * `checkout_files` (type: _boolean_, allowed: `true`, `false`, default: `true`) — Whether each tenant's files are kept on the working tree, so a human can `ls` a repository; nothing githttp-fs serves reads them, so turning this off saves the uncompressed size of all content (see [Considerations](CONSIDERATIONS.md#files-on-disk))
 * `checkout_files_autoheal` (type: _boolean_, allowed: `true`, `false`, default: `false`) — Whether startup checks every tenant out to its HEAD, healing files that are missing or stale on disk; opt-in because it walks the whole store and removes files HEAD no longer names, so enable it for one restart after turning `checkout_files` on
+
+**[limits]**
+
 * `allowed_extensions` (type: _array[string]_, allowed: file extensions eg. `["md", "mdx"]`, default: none) — Optional whitelist of file extensions accepted for file writes and move destinations; when unset, all extensions are accepted
+* `batch_read_maximum_files` (type: _integer_, allowed: any number above zero, default: `100`) — Maximum number of files one batch read request may ask for; larger requests are rejected
+* `date_filter_maximum_ms` (type: _integer_, allowed: any number, default: `10000`) — Safety timer, in milliseconds, on the commit-history walk a date-filtered file listing runs; a listing that exhausts it answers with the entries it had dated by then, flagged `partial`, and `0` turns the timer off so the walk always runs to completion
 
 **[hooks]**
 
