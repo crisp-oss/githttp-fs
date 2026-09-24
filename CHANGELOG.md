@@ -1,6 +1,12 @@
 Changelog
 =========
 
+## v1.13.0
+
+### New Features
+
+* Added the `file_paths` option to the file listing route (`GET /v1/:collection_id/:tenant_id/files`), narrowing a listing to exactly the paths it names — a bare path or a JSON-array string of paths, each relative to `prefix_path` when one is set. A path the repository does not hold is left out of the result rather than erroring, so the option doubles as a bulk existence check, and naming a folder returns its whole subtree. It cannot be combined with `file_name_starts_with` (`400`), and it is the cheapest listing mode: one tree lookup per path, nothing else walked.
+
 ## v1.12.0
 
 ### Breaking Changes
