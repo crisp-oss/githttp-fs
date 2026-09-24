@@ -1,6 +1,19 @@
 Changelog
 =========
 
+## v1.11.4
+
+### Changes
+
+* Hook replays (`POST /v1/:collection_id/:tenant_id/batch/replay/hook`) now deliver their events in tree order, top down: a folder's own files first, then each of its sub-folders in turn, each finished before its next sibling begins, with hidden (dot-prefixed) entries leading inside each folder. A receiver is therefore never told about a file before the files of the folders above it. This holds in both directions and whatever order the `files` list was sent in; events were previously delivered in the order of that list, or in git's depth-first name order when it was omitted, which could deliver a deeply nested file before a file of one of its parent folders.
+* The `order.updated` events closing a hook replay are now delivered top down as well: the repository root first, a directory before its sub-directories, hidden directories leading.
+* Updated all dependencies to latest.
+
+### Bug Fixes
+
+* Fixed reads answering a raw `500` when they raced a tenant being created, deleted, or first synced on a replica: a repository now appears and disappears in one atomic step, and a read whose tenant is deleted while it runs answers `404`.
+* Fixed a replica recording a repository's new head only after checking its working tree out, which left its listing — and any replica chained to it — behind its own reads for the length of that checkout, and could let a late sync record its head over a newer one.
+
 ## v1.11.3
 
 ### Changes

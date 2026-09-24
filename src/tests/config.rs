@@ -51,6 +51,10 @@ fn optional_sections_collapse_to_their_defaults() {
 
     assert!(config.limits.allowed_extensions.is_none());
     assert_eq!(config.limits.batch_read_maximum_files, 100);
+    assert_eq!(
+        config.limits.date_filter_maximum_ms, 10_000,
+        "a date filter's history walk is timed out of the box"
+    );
 
     assert!(config.maintenance.enabled);
     assert_eq!(config.maintenance.delay_secs, 86_400);
@@ -302,6 +306,21 @@ fn validate_rejects_a_zero_batch_read_cap() {
         "{:?}",
         errors
     );
+}
+
+#[test]
+fn a_zero_date_filter_budget_is_the_timer_turned_off() {
+    // Zero is not rejected: it is how an operator asks for the unbounded
+    // walk back, so the exact-answer behaviour stays reachable.
+    let (_store, server) = server_section();
+
+    let config = parse(&format!(
+        "{}\n[limits]\ndate_filter_maximum_ms = 0\n",
+        server
+    ));
+
+    assert_eq!(config.limits.date_filter_maximum_ms, 0);
+    assert!(config.validate().is_ok());
 }
 
 #[test]

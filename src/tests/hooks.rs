@@ -571,6 +571,268 @@ async fn a_replay_ends_with_one_order_snapshot_per_directory_holding_an_index() 
     assert_eq!(events[5]["replayed"], true);
 }
 
+// --- Replay delivery order ------------------------------------------------
+//
+// A replay re-emits a repository as if a user were creating it by hand, level
+// by level, like peeling an onion: a folder's own files first (hidden ones
+// leading), then each of its sub-folders in turn, each finished before its
+// next sibling begins. Receivers rebuild a tree from these events and depend
+// on the sequence, so it is a wire contract — a failure below is fixed by
+// restoring the order, never by updating the expectation. The comparator's
+// own rules are pinned in `traverse.rs`; these tests pin that every replay
+// path actually goes through it.
+
+/// The replayed tree, in the one order it must be delivered in.
+const REPLAY_ORDER: &[&str] = &[
+    ".meta.md",
+    "-notes.md",
+    "README.md",
+    "zed.md",
+    ".templates/page.md",
+    "docs/.draft.md",
+    "docs/intro.md",
+    "docs/guides/setup.md",
+    "docs/guides/advanced/tuning.md",
+    "docs/reference/api.md",
+    "legal/terms.md",
+];
+
+/// Commits [`REPLAY_ORDER`]'s files deepest-first, so that neither commit
+/// order nor git's own tree order can pass for the expected one by accident.
+async fn write_replay_tree(server: &TestServer, receiver: &HookReceiver) {
+    for path in REPLAY_ORDER.iter().rev() {
+        server.write_file(TENANT, path, path).await;
+    }
+
+    receiver.wait_for(REPLAY_ORDER.len()).await;
+}
+
+/// The paths of the replayed file events, in delivery order.
+fn replayed_paths(events: &[serde_json::Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|payload| payload["replayed"] == true && payload.get("file").is_some())
+        .map(|payload| payload["file"]["path"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_whole_repository_replay_peels_the_tree_level_by_level() {
+    let receiver = HookReceiver::start().await;
+    let server = TestServer::builder().hooks(&receiver.url).start().await;
+
+    write_replay_tree(&server, &receiver).await;
+
+    server
+        .post(
+            &format!("{}/batch/replay/hook", TENANT),
+            json!({ "direction": "create", "include_hidden_files": true }),
+        )
+        .await
+        .expect_status(StatusCode::OK);
+
+    let events = receiver.wait_for_exactly(REPLAY_ORDER.len() * 2).await;
+
+    assert_eq!(replayed_paths(&events), REPLAY_ORDER);
+
+    // Each event carries its own file's content, so ordering the paths did
+    // not detach them from what is read at delivery.
+    for payload in events.iter().filter(|payload| payload["replayed"] == true) {
+        assert_eq!(payload["file"]["content"], payload["file"]["path"]);
+    }
+}
+
+#[tokio::test]
+async fn a_replay_without_hidden_files_keeps_the_same_order_for_the_rest() {
+    let receiver = HookReceiver::start().await;
+    let server = TestServer::builder().hooks(&receiver.url).start().await;
+
+    write_replay_tree(&server, &receiver).await;
+
+    server
+        .post(
+            &format!("{}/batch/replay/hook", TENANT),
+            json!({ "direction": "create" }),
+        )
+        .await
+        .expect_status(StatusCode::OK);
+
+    let visible: Vec<&str> = REPLAY_ORDER
+        .iter()
+        .copied()
+        .filter(|path| !path.split('/').any(|name| name.starts_with('.')))
+        .collect();
+
+    let events = receiver
+        .wait_for_exactly(REPLAY_ORDER.len() + visible.len())
+        .await;
+
+    assert_eq!(replayed_paths(&events), visible);
+}
+
+#[tokio::test]
+async fn the_order_of_the_callers_files_list_does_not_leak_into_delivery() {
+    let receiver = HookReceiver::start().await;
+    let server = TestServer::builder().hooks(&receiver.url).start().await;
+
+    write_replay_tree(&server, &receiver).await;
+
+    // Reversed: the worst case, every child ahead of its parents.
+    let given: Vec<&str> = REPLAY_ORDER.iter().copied().rev().collect();
+
+    server
+        .post(
+            &format!("{}/batch/replay/hook", TENANT),
+            json!({ "direction": "create", "files": given }),
+        )
+        .await
+        .expect_status(StatusCode::OK);
+
+    let events = receiver.wait_for_exactly(REPLAY_ORDER.len() * 2).await;
+
+    assert_eq!(replayed_paths(&events), REPLAY_ORDER);
+}
+
+#[tokio::test]
+async fn the_delete_direction_follows_the_same_order() {
+    // These paths exist nowhere in git, so the order can only come from the
+    // path strings themselves — which is why it is a sort and not a walk.
+    let receiver = HookReceiver::start().await;
+    let server = TestServer::builder().hooks(&receiver.url).start().await;
+
+    server.write_file(TENANT, "kept.md", "x").await;
+
+    receiver.wait_for(1).await;
+
+    let mut given: Vec<&str> = REPLAY_ORDER.iter().copied().rev().collect();
+
+    given.push("kept.md");
+
+    let response = server
+        .post(
+            &format!("{}/batch/replay/hook", TENANT),
+            json!({ "direction": "delete", "files": given }),
+        )
+        .await;
+
+    response.expect_status(StatusCode::OK);
+
+    assert_eq!(response.json()["files"], REPLAY_ORDER.len());
+
+    let events = receiver.wait_for_exactly(1 + REPLAY_ORDER.len()).await;
+
+    assert!(events[1..]
+        .iter()
+        .all(|payload| payload["event"] == "file.deleted"));
+    assert_eq!(replayed_paths(&events), REPLAY_ORDER);
+}
+
+#[tokio::test]
+async fn a_prefix_scoped_replay_peels_its_own_subtree() {
+    let receiver = HookReceiver::start().await;
+    let server = TestServer::builder().hooks(&receiver.url).start().await;
+
+    write_replay_tree(&server, &receiver).await;
+
+    server
+        .post(
+            &format!("{}/batch/replay/hook", TENANT),
+            json!({ "direction": "create", "prefix_path": "/docs", "include_hidden_files": true }),
+        )
+        .await
+        .expect_status(StatusCode::OK);
+
+    let expected: Vec<&str> = REPLAY_ORDER
+        .iter()
+        .copied()
+        .filter(|path| path.starts_with("docs/"))
+        .collect();
+
+    let events = receiver
+        .wait_for_exactly(REPLAY_ORDER.len() + expected.len())
+        .await;
+
+    assert_eq!(replayed_paths(&events), expected);
+}
+
+#[tokio::test]
+async fn replayed_order_snapshots_open_directories_top_down_after_every_file() {
+    let receiver = HookReceiver::start().await;
+    let server = TestServer::builder().hooks(&receiver.url).start().await;
+
+    write_replay_tree(&server, &receiver).await;
+
+    // Indexes are written deepest-first, again so commit order cannot pass
+    // for the expected one.
+    let indexed = [
+        ("legal", "terms.md"),
+        ("docs/reference", "api.md"),
+        ("docs/guides/advanced", "tuning.md"),
+        ("docs/guides", "setup.md"),
+        ("docs", "intro.md"),
+        ("", "README.md"),
+    ];
+
+    for (directory, entry) in indexed {
+        let route = match directory {
+            "" => format!("{}/order", TENANT),
+            directory => format!("{}/order/{}", TENANT, directory),
+        };
+
+        server
+            .put(&route, json!({ "author": author(), "order": [entry] }))
+            .await
+            .expect_status(StatusCode::OK);
+    }
+
+    let live = REPLAY_ORDER.len() + indexed.len();
+
+    receiver.wait_for(live).await;
+
+    let response = server
+        .post(
+            &format!("{}/batch/replay/hook", TENANT),
+            json!({ "direction": "create", "include_hidden_files": true }),
+        )
+        .await;
+
+    response.expect_status(StatusCode::OK);
+
+    assert_eq!(response.json()["orders"], indexed.len());
+
+    let events = receiver
+        .wait_for_exactly(live + REPLAY_ORDER.len() + indexed.len())
+        .await;
+
+    let replayed = &events[live..];
+
+    // Every file event first, in tree order…
+    assert_eq!(replayed_paths(replayed), REPLAY_ORDER);
+
+    // …then the order snapshots, root first, parents before children, one
+    // subtree finished before the next sibling.
+    let directories: Vec<&str> = replayed[REPLAY_ORDER.len()..]
+        .iter()
+        .map(|payload| {
+            assert_eq!(payload["event"], "order.updated");
+
+            payload["directory"].as_str().unwrap()
+        })
+        .collect();
+
+    assert_eq!(
+        directories,
+        [
+            "",
+            "docs",
+            "docs/guides",
+            "docs/guides/advanced",
+            "docs/reference",
+            "legal"
+        ]
+    );
+}
+
 #[tokio::test]
 async fn a_replay_commits_nothing() {
     let receiver = HookReceiver::start().await;

@@ -128,7 +128,8 @@ pub struct ReplayJob {
     /// carries no content at all.
     pub repo_path: PathBuf,
     pub kind: ReplayKind,
-    /// Repo-root-relative paths, in the order they should be delivered.
+    /// Repo-root-relative paths, in the order they should be delivered —
+    /// which the replay route makes the tree's own, top down (`traverse.rs`).
     pub paths: Vec<String>,
     /// Repo-root-relative directories that hold an order index, delivered as
     /// one `order.updated` each **after every file event of the replay** —

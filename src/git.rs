@@ -53,7 +53,9 @@ use git2::{
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::error::AppError;
 use crate::order;
@@ -81,6 +83,32 @@ impl TreeNode {
     fn name(&self) -> &str {
         match self {
             Self::File { name } | Self::Directory { name, .. } => name,
+        }
+    }
+}
+
+/// What a listing answers with: one page of entries, whether more follow it,
+/// and whether the answer is everything the request asked for.
+///
+/// `partial` is only ever true of a date-filtered listing whose history walk
+/// spent the `limits.date_filter_maximum_ms` budget: entries are then missing
+/// from the page, and — unlike `has_more`, which is about the next page —
+/// nothing the caller can ask for will bring them back except a narrower
+/// request or a larger budget.
+pub struct Listing {
+    pub nodes: Vec<TreeNode>,
+    pub has_more: bool,
+    pub partial: bool,
+}
+
+impl Listing {
+    /// Nothing to list — a prefix that names no directory. Complete, not
+    /// partial: the question was answered in full, the answer is empty.
+    fn empty() -> Self {
+        Self {
+            nodes: vec![],
+            has_more: false,
+            partial: false,
         }
     }
 }
@@ -158,11 +186,18 @@ pub enum DateKind {
 /// half-open — `from` inclusive, `to` exclusive (`[from, to)`) — and each
 /// bound is independently optional (an open-ended range). A file's date is
 /// compared at whole-second (git commit) resolution, in UTC.
+///
+/// `budget` is the safety timer from `limits.date_filter_maximum_ms`. It
+/// rides on the filter rather than travelling as its own argument because it
+/// is only ever spent on this filter's work: a listing that carries no date
+/// filter never walks history and so has nothing to time. Unset, the walk
+/// runs to completion — the only behaviour there was before the key existed.
 #[derive(Debug, Clone, Copy)]
 pub struct DateFilter {
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,
     pub kind: DateKind,
+    pub budget: Option<Duration>,
 }
 
 impl DateFilter {
@@ -1496,7 +1531,7 @@ impl GitFiles {
         order_options: Option<OrderOptions>,
         page: usize,
         per_page: usize,
-    ) -> Result<(Vec<TreeNode>, bool), AppError> {
+    ) -> Result<Listing, AppError> {
         tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, file_name_starts_with = ?file_name_starts_with, date_filter = ?date_filter, order_options = ?order_options, page = page, per_page = per_page, "listing files");
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
@@ -1512,9 +1547,9 @@ impl GitFiles {
             Some(prefix) => match head_tree.get_path(Path::new(prefix)) {
                 Ok(entry) => match repo.find_tree(entry.id()) {
                     Ok(tree) => tree,
-                    Err(_) => return Ok((vec![], false)),
+                    Err(_) => return Ok(Listing::empty()),
                 },
-                Err(_) => return Ok((vec![], false)),
+                Err(_) => return Ok(Listing::empty()),
             },
             None => head_tree,
         };
@@ -1680,7 +1715,12 @@ impl GitFiles {
 
         tracing::debug!(tenant_id = %tenant_id, page = page, returned = nodes.len(), has_more = has_more, "file listing complete");
 
-        Ok((nodes, has_more))
+        // Nothing here walks history, so nothing here can run out of time.
+        Ok(Listing {
+            nodes,
+            has_more,
+            partial: false,
+        })
     }
 
     /// Position of each name in a stored order, so a *stable* sort by rank
@@ -1868,10 +1908,16 @@ impl GitFiles {
         order_options: Option<OrderOptions>,
         page: usize,
         per_page: usize,
-    ) -> Result<(Vec<TreeNode>, bool), AppError> {
+    ) -> Result<Listing, AppError> {
         let needles: Vec<String> = needles.iter().map(|needle| needle.to_lowercase()).collect();
         let mut flat: Vec<String> = Vec::new();
         let mut dir_stubs: Vec<String> = Vec::new();
+
+        // Matched directories the depth limit stopped the walk at, kept apart
+        // from the stubs above because their contents are still unknown here:
+        // a date filter has to look inside them (their subtree oid is what it
+        // looks inside with) before it can say whether they belong on the page.
+        let mut depth_stubs: Vec<(String, Oid)> = Vec::new();
 
         // While walking inside a directory whose name matched, this holds that
         // directory's path with a trailing slash. Every descendant is then
@@ -1923,7 +1969,7 @@ impl GitFiles {
 
                         if entry_depth >= max {
                             if matched {
-                                dir_stubs.push(full_path);
+                                depth_stubs.push((full_path, entry.id()));
                             }
 
                             return git2::TreeWalkResult::Skip;
@@ -1955,14 +2001,66 @@ impl GitFiles {
         // name matches that also fall inside the date window survive. Because
         // directories carry no date, the matched tree is rebuilt from the
         // surviving *files* alone — a name-matched directory left with no
-        // in-window file is pruned (and depth stubs, whose contents we never
-        // walked and so cannot date, are dropped).
+        // in-window file is pruned.
+        //
+        // A directory the depth limit cut the walk short at is the one case
+        // that needs more than `flat`: it is on the page as a childless stub,
+        // so whether it holds an in-window file is decided by walking its
+        // subtree now. Those files answer that question and nothing else —
+        // they are never rendered, since the depth limit is exactly the
+        // promise that nothing below it is.
+        let mut partial = false;
+
         let (flat, dir_stubs) = match date_filter {
-            Some(date_filter) => (
-                Self::retain_by_date(repo, path_prefix, flat, date_filter)?,
-                Vec::new(),
-            ),
-            None => (flat, dir_stubs),
+            Some(date_filter) => {
+                let mut candidates = flat;
+                let rendered = candidates.len();
+                let mut stub_ranges: Vec<(String, Range<usize>)> =
+                    Vec::with_capacity(depth_stubs.len());
+
+                for (stub_path, stub_oid) in depth_stubs {
+                    let start = candidates.len();
+
+                    if let Ok(subtree) = repo.find_tree(stub_oid) {
+                        for leaf in Self::collect_flat_files(&subtree, None, include_hidden_files)?
+                        {
+                            candidates.push(format!("{}/{}", stub_path, leaf));
+                        }
+                    }
+
+                    stub_ranges.push((stub_path, start..candidates.len()));
+                }
+
+                let (surviving, exhausted) =
+                    Self::surviving_by_date(repo, path_prefix, &candidates, date_filter)?;
+
+                partial = exhausted;
+
+                let stubs: Vec<String> = stub_ranges
+                    .into_iter()
+                    .filter(|(_stub_path, range)| {
+                        candidates[range.clone()]
+                            .iter()
+                            .any(|leaf| surviving.contains(leaf))
+                    })
+                    .map(|(stub_path, _range)| stub_path)
+                    .collect();
+
+                candidates.truncate(rendered);
+
+                (
+                    candidates
+                        .into_iter()
+                        .filter(|leaf| surviving.contains(leaf))
+                        .collect(),
+                    stubs,
+                )
+            }
+            None => {
+                dir_stubs.extend(depth_stubs.into_iter().map(|(stub_path, _oid)| stub_path));
+
+                (flat, dir_stubs)
+            }
         };
 
         // The walk already bounded depth, so every collected path is within
@@ -1985,7 +2083,11 @@ impl GitFiles {
 
         let nodes: Vec<TreeNode> = tree.into_iter().skip(offset).take(per_page).collect();
 
-        Ok((nodes, has_more))
+        Ok(Listing {
+            nodes,
+            has_more,
+            partial,
+        })
     }
 
     /// Lists the in-scope tree narrowed to files whose git date falls inside
@@ -1994,8 +2096,17 @@ impl GitFiles {
     /// file is dated against commit history, and the surviving set is
     /// paginated over its root-level entries. Directories survive only as the
     /// structure leading to a surviving file, so an emptied directory is
-    /// pruned. `maximum_depth` and `include_hidden_files` bound the walk
-    /// exactly as elsewhere; files below the depth limit are never candidates.
+    /// pruned. `include_hidden_files` bounds the walk exactly as elsewhere.
+    ///
+    /// `maximum_depth` bounds the *result* rather than the walk: a directory
+    /// sitting at the limit renders as a childless stub, exactly as the plain
+    /// listing renders it, but only when the subtree below it holds an
+    /// in-window file — which is why the walk has to go past the limit even
+    /// though nothing below it is ever rendered. Bounding the walk instead
+    /// would drop every directory from a depth-limited listing (nothing below
+    /// the limit is walked, so nothing below it can be dated), leaving a
+    /// caller that browses one level at a time with no folder to descend
+    /// into.
     #[allow(clippy::too_many_arguments)]
     fn list_with_date_filter(
         repo: &Repository,
@@ -2007,14 +2118,16 @@ impl GitFiles {
         order_options: Option<OrderOptions>,
         page: usize,
         per_page: usize,
-    ) -> Result<(Vec<TreeNode>, bool), AppError> {
-        let flat = Self::collect_flat_files(walk_tree, maximum_depth, include_hidden_files)?;
-        let matched = Self::retain_by_date(repo, path_prefix, flat, date_filter)?;
+    ) -> Result<Listing, AppError> {
+        let flat = Self::collect_flat_files(walk_tree, None, include_hidden_files)?;
+        let (matched, partial) = Self::retain_by_date(repo, path_prefix, flat, date_filter)?;
 
-        // Depth was already applied during collection, so `build_tree` needs
-        // no depth handling of its own, and there are no stubs (a directory we
-        // could not descend into cannot be date-classified, so it is dropped).
-        let mut tree = GitUtils::build_tree(matched, Vec::new(), None);
+        // `build_tree` applies the depth limit, so a surviving file below it
+        // is not rendered but still puts the directory it sits under on the
+        // page, as the childless stub the plain listing would show. A
+        // directory whose whole subtree fell outside the window contributes no
+        // path at all and is therefore pruned, exactly like an emptied one.
+        let mut tree = GitUtils::build_tree(matched, Vec::new(), maximum_depth);
 
         // The whole surviving tree is in hand before pagination here, so
         // ordering is applied to it in full and the page window is sliced from
@@ -2029,7 +2142,11 @@ impl GitFiles {
 
         let nodes: Vec<TreeNode> = tree.into_iter().skip(offset).take(per_page).collect();
 
-        Ok((nodes, has_more))
+        Ok(Listing {
+            nodes,
+            has_more,
+            partial,
+        })
     }
 
     /// Collects every in-scope file as a flat path relative to `tree`,
@@ -2082,17 +2199,25 @@ impl GitFiles {
         Ok(flat)
     }
 
-    /// Keeps only those `flat` paths (relative to the listing root) whose git
-    /// date falls inside `date_filter`'s window. The date map returned by
+    /// Which of those `flat` paths (relative to the listing root) have a git
+    /// date inside `date_filter`'s window. The date map returned by
     /// `file_dates` is keyed by repo-root paths, so the listing-root
     /// `path_prefix` is re-joined before each lookup. A path with no date in
     /// history (which cannot happen for a file present in HEAD) is dropped.
-    fn retain_by_date(
+    ///
+    /// A set rather than a filtered list because a caller may be asking about
+    /// two different things at once: which files to render, and whether some
+    /// *other* file — one below a depth limit — puts its directory on the page.
+    ///
+    /// The flag beside it is the one [`Self::file_dates`] returns: the time
+    /// budget ran out, so paths left undated are absent from the set and the
+    /// listing built from it is short.
+    fn surviving_by_date(
         repo: &Repository,
         path_prefix: Option<&str>,
-        flat: Vec<String>,
+        flat: &[String],
         date_filter: DateFilter,
-    ) -> Result<Vec<String>, AppError> {
+    ) -> Result<(HashSet<String>, bool), AppError> {
         let to_full = |leaf: &str| -> String {
             match path_prefix {
                 Some(prefix) if !prefix.is_empty() => format!("{}/{}", prefix, leaf),
@@ -2103,19 +2228,47 @@ impl GitFiles {
         let full_paths: HashSet<String> = flat.iter().map(|leaf| to_full(leaf)).collect();
 
         if full_paths.is_empty() {
-            return Ok(Vec::new());
+            return Ok((HashSet::new(), false));
         }
 
-        let dates = Self::file_dates(repo, &full_paths, date_filter.kind)?;
+        let (dates, exhausted) = Self::file_dates(
+            repo,
+            &full_paths,
+            date_filter.kind,
+            path_prefix.filter(|prefix| !prefix.is_empty()),
+            date_filter.budget,
+        )?;
 
-        Ok(flat
-            .into_iter()
-            .filter(|leaf| {
-                dates
-                    .get(&to_full(leaf))
-                    .is_some_and(|date| date_filter.matches(*date))
-            })
-            .collect())
+        Ok((
+            flat.iter()
+                .filter(|leaf| {
+                    dates
+                        .get(&to_full(leaf))
+                        .is_some_and(|date| date_filter.matches(*date))
+                })
+                .cloned()
+                .collect(),
+            exhausted,
+        ))
+    }
+
+    /// [`Self::surviving_by_date`] applied to a list the caller owns, keeping
+    /// the surviving paths in the order they came in.
+    fn retain_by_date(
+        repo: &Repository,
+        path_prefix: Option<&str>,
+        flat: Vec<String>,
+        date_filter: DateFilter,
+    ) -> Result<(Vec<String>, bool), AppError> {
+        let (surviving, exhausted) =
+            Self::surviving_by_date(repo, path_prefix, &flat, date_filter)?;
+
+        Ok((
+            flat.into_iter()
+                .filter(|leaf| surviving.contains(leaf))
+                .collect(),
+            exhausted,
+        ))
     }
 
     /// Walks commit history once (newest-first, diffing each commit against
@@ -2132,22 +2285,77 @@ impl GitFiles {
     ///   requested path has a date.
     /// - `Created`: the oldest commit that *added* a path; the walk must reach
     ///   the root of history, so this is the heavier of the two.
+    ///
+    /// The returned flag says the walk gave its budget up rather than running
+    /// out of history: the dates in hand are kept and the rest of history is
+    /// left unread, so a caller that filters on them gets fewer files than
+    /// the window really holds. Worth knowing for `Created`, where a date is
+    /// only final once the walk has reached the root of history — a path
+    /// added, deleted and added again can be left holding the later of its
+    /// two additions, which is a *wrong* date rather than a missing one.
+    ///
+    /// `scope` is the listing's `prefix_path`, and every requested path lives
+    /// under it. Handing it to the diff as a pathspec is what keeps a scoped
+    /// listing cheap: without it each commit is diffed in full and the deltas
+    /// of every *other* directory are produced only to be discarded here, so a
+    /// repository holding one sub-tree per locale pays for all of them on
+    /// every commit of its history. With it, libgit2 prunes the tree walk to
+    /// the sub-tree in scope and never reads the objects behind the rest.
+    /// `disable_pathspec_match` is what makes that pruning happen at all —
+    /// libgit2 hands the pathspec to its tree iterators only when it is set,
+    /// and matching then compares literal path prefixes rather than globs,
+    /// which is what a directory path should mean here anyway.
     fn file_dates(
         repo: &Repository,
         paths: &HashSet<String>,
         kind: DateKind,
-    ) -> Result<HashMap<String, DateTime<Utc>>, AppError> {
+        scope: Option<&str>,
+        budget: Option<Duration>,
+    ) -> Result<(HashMap<String, DateTime<Utc>>, bool), AppError> {
         let mut dates: HashMap<String, DateTime<Utc>> = HashMap::new();
+        let mut exhausted = false;
+        let deadline = budget.map(|budget| Instant::now() + budget);
 
         let mut revwalk = repo.revwalk()?;
 
         revwalk.push_head()?;
         revwalk.set_sorting(Sort::TIME | Sort::TOPOLOGICAL)?;
 
+        // Built once and reused: the options are the same for every commit,
+        // and a scoped walk would otherwise re-allocate its pathspec on each
+        // of them.
+        let mut diff_options = DiffOptions::new();
+
+        diff_options.include_untracked(false);
+
+        if let Some(scope) = scope {
+            diff_options.disable_pathspec_match(true);
+            diff_options.pathspec(scope);
+        }
+
         for oid_result in revwalk {
             // Updated: once every requested path is dated, every older commit
             // can only hold an older (irrelevant) touch — nothing left to find.
             if matches!(kind, DateKind::Updated) && dates.len() == paths.len() {
+                break;
+            }
+
+            // The safety timer, checked per commit because a commit is the
+            // unit of work here — one tree-to-tree diff, bounded by what that
+            // commit changed inside the scope. Whatever has been dated by now
+            // is kept: the caller is told the answer is partial rather than
+            // handed an error, since a listing that arrives short is more use
+            // than none at all.
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                tracing::warn!(
+                    dated = dates.len(),
+                    wanted = paths.len(),
+                    budget_ms = budget.map(|budget| budget.as_millis() as u64),
+                    "date filter gave up its time budget, answering partially"
+                );
+
+                exhausted = true;
+
                 break;
             }
 
@@ -2164,10 +2372,6 @@ impl GitFiles {
             // The root commit has no parent — diff against an empty tree
             // (`None`), so its entries register as additions.
             let parent_tree = commit.parent(0).and_then(|parent| parent.tree()).ok();
-
-            let mut diff_options = DiffOptions::new();
-
-            diff_options.include_untracked(false);
 
             let diff = match repo.diff_tree_to_tree(
                 parent_tree.as_ref(),
@@ -2212,7 +2416,7 @@ impl GitFiles {
             }
         }
 
-        Ok(dates)
+        Ok((dates, exhausted))
     }
 
     /// Counts files and directories reachable from the listing root, with

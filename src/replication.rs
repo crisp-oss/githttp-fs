@@ -144,11 +144,23 @@ const INCOMPLETE_RESCAN_MIN_SECS: u64 = 5;
 /// has aged. Below it the replica is merely `lagging`.
 const STALLED_AFTER_FAILURES: u32 = 3;
 
-/// A roster row whose stream is down *and* whose last contact is older than
-/// this makes the master report `degraded`. Two poll intervals at the default
-/// setting: a replica polling normally with its stream down is heard from
-/// well inside it.
-const REPLICA_SILENT_SECS: i64 = 120;
+/// How many of a replica's own poll intervals of silence make a master call
+/// that replica `degraded`. Two, so that one missed or slow poll — a retry, a
+/// long pack, a blip — never flips a node that is converging perfectly well.
+const REPLICA_SILENT_INTERVALS: i64 = 2;
+
+/// The floor under that threshold, and what it is for a replica that does not
+/// say how often it polls: an older peer predating [`POLL_INTERVAL_HEADER`],
+/// or one whose header was unreadable. Two intervals at the default
+/// `poll_interval_secs`, which is what this rule was before it was derived.
+const REPLICA_SILENT_MINIMUM_SECS: i64 = 120;
+
+/// The ceiling over it. The threshold is sized from a number the *replica*
+/// asserts, and a self-asserted number that can grow without bound could
+/// switch off the only thing on a master that notices a follower going dark.
+/// Fifteen minutes is past any sane polling cadence and still well inside the
+/// window in which an operator wants to hear about a silent node.
+const REPLICA_SILENT_MAXIMUM_SECS: i64 = 900;
 
 /// The mass-deletion guard. A complete listing that would have a replica
 /// delete *more than half* of the repositories it holds is refused outright
@@ -409,6 +421,16 @@ pub const SYNC_HEADER: &str = "x-replication-sync";
 /// reconnecting; the same node id with a different instance is two replicas
 /// sharing a name, which the master refuses.
 pub const INSTANCE_HEADER: &str = "x-replication-instance";
+/// How often the replica polls, in seconds — its own `poll_interval_secs`.
+///
+/// The master cannot know this: it is a replica-only config key, meaningless
+/// on the node reading it, and on a chained replica it describes that node's
+/// *own* upstream cadence rather than its followers'. So the replica states
+/// it, next to the other facts only it can know, and the master sizes each
+/// row's silence threshold from the row's own cadence — see
+/// [`REPLICA_SILENT_INTERVALS`]. Absent on peers predating this header, which
+/// simply fall back to [`REPLICA_SILENT_MINIMUM_SECS`].
+pub const POLL_INTERVAL_HEADER: &str = "x-replication-poll-interval";
 
 // ---------------------------------------------------------------------------
 // Health — what a node can honestly say about the set it belongs to
@@ -526,6 +548,13 @@ pub struct ReplicaPresence {
     pub sync: Option<String>,
     #[serde(default, with = "rfc3339::option")]
     pub reported_at: Option<i64>,
+    /// How often the replica says it polls, in seconds. Internal: it sizes
+    /// the silence threshold this row is judged against, and is deliberately
+    /// never serialised — it describes the replica's *configuration*, which
+    /// is its operator's business, not its condition, which is what the
+    /// health body is for.
+    #[serde(skip)]
+    pub poll_interval_secs: Option<u64>,
     /// The instance token of the process holding the stream. Internal:
     /// what tells "this replica reconnected" from "another replica claims
     /// this name". Never serialised.
@@ -1461,14 +1490,15 @@ impl ReplicaRegistry {
     }
 
     /// Records a request from a replica, creating its row on first sight.
-    /// `repositories`, `pending` and `sync` are whatever it volunteered this
-    /// time.
+    /// `repositories`, `pending`, `sync` and `poll_interval_secs` are
+    /// whatever it volunteered this time.
     pub fn note_request(
         &self,
         node_id: &str,
         repositories: Option<usize>,
         pending: Option<usize>,
         sync: Option<String>,
+        poll_interval_secs: Option<u64>,
     ) {
         let now = chrono::Utc::now().timestamp();
         let mut presence = self.entry(node_id);
@@ -1482,6 +1512,15 @@ impl ReplicaRegistry {
             presence.pending_repositories = pending;
             presence.sync = sync;
             presence.reported_at = Some(now);
+        }
+
+        // Kept rather than overwritten when a request omits it: the cadence
+        // is configuration, so the last value stated stays true until the
+        // replica states another one, and a request that happens not to
+        // carry the header must not widen this row's threshold back to the
+        // floor.
+        if poll_interval_secs.is_some() {
+            presence.poll_interval_secs = poll_interval_secs;
         }
     }
 
@@ -1600,6 +1639,7 @@ impl ReplicaRegistry {
                 pending_repositories: None,
                 sync: None,
                 reported_at: None,
+                poll_interval_secs: None,
                 instance: None,
                 last_collision_at: None,
                 collision_since: None,
@@ -3445,7 +3485,13 @@ impl ReplicaFollower {
     ///
     /// Every request the follower makes goes through here, so identity can
     /// never be attached to some requests and forgotten on others — the
-    /// master's roster would then show a replica flickering in and out.
+    /// master's roster would then show a replica flickering in and out. The
+    /// polling cadence rides here too, rather than on the reporting request
+    /// below: it is fixed configuration rather than a number that moves, and
+    /// stamping it on every request means the master can size this replica's
+    /// silence threshold from its very first contact — including one that
+    /// only ever opened a notification stream, which is precisely the node
+    /// the threshold has to judge once that stream drops.
     fn request(&self, client: &Client, url: &str) -> reqwest::RequestBuilder {
         client
             .get(url)
@@ -3453,6 +3499,10 @@ impl ReplicaFollower {
             .header(NODE_ID_HEADER, &self.node_id)
             .header(INSTANCE_HEADER, &self.instance)
             .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+            .header(
+                POLL_INTERVAL_HEADER,
+                self.replication.poll_interval_secs.to_string(),
+            )
     }
 
     /// The same, plus the two numbers only this node can know: how many
@@ -3631,14 +3681,43 @@ pub fn build_health(state: &AppState, repositories: usize) -> ReplicationHealth 
     }
 }
 
+/// How long a roster row may go quiet before its silence means something,
+/// derived from the cadence that row reported.
+///
+/// A replica converging by polling with its notification stream down is
+/// healthy, and it is heard from once per `poll_interval_secs` — so the
+/// threshold has to follow that key, which lives on the replica and is
+/// ignored on the node judging it. Hence the derivation from what the replica
+/// stated, between a floor (also the fallback for a peer that stated nothing)
+/// and a ceiling (so a self-asserted number cannot disable the rule).
+///
+/// The row is refreshed by *any* request, not only the state poll — a pack
+/// download and a health probe stamp it too — so this only ever fires on a
+/// replica that has genuinely gone quiet.
+pub(crate) fn silent_after_secs(poll_interval_secs: Option<u64>) -> i64 {
+    poll_interval_secs
+        // Saturating rather than checked, so a cadence too large to multiply
+        // reads as the enormous number it is and meets the ceiling — the same
+        // answer an ordinary large value gets. Falling back to the floor here
+        // instead would make one absurd value alert sooner than a merely
+        // excessive one, which is a rule no operator could predict.
+        .map(|secs| {
+            i64::try_from(secs)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(REPLICA_SILENT_INTERVALS)
+        })
+        .unwrap_or(REPLICA_SILENT_MINIMUM_SECS)
+        .clamp(REPLICA_SILENT_MINIMUM_SECS, REPLICA_SILENT_MAXIMUM_SECS)
+}
+
 /// A master's verdict folds in every replica it knows of, so the one probe
 /// an operator points at the master reports the worst thing in the set.
 ///
 /// A replica reporting `halted` makes the master `halted`. One reporting
 /// `stalled`, or one whose stream is down and that has not been heard from
-/// for [`REPLICA_SILENT_SECS`], makes it `degraded`. `lagging` is normal
-/// operation and changes nothing. A master's own open issues make it
-/// `halted` regardless of its replicas.
+/// for [`silent_after_secs`] of its own polling cadence, makes it `degraded`.
+/// `lagging` is normal operation and changes nothing. A master's own open
+/// issues make it `halted` regardless of its replicas.
 fn master_status(replicas: &[ReplicaPresence], no_issues: bool, now: i64) -> NodeStatus {
     if !no_issues {
         return NodeStatus::Halted;
@@ -3653,9 +3732,11 @@ fn master_status(replicas: &[ReplicaPresence], no_issues: bool, now: i64) -> Nod
             Some(SyncStatus::Halted) => NodeStatus::Halted,
             Some(SyncStatus::Stalled) => NodeStatus::Degraded,
             _ => {
+                let threshold = silent_after_secs(replica.poll_interval_secs);
+
                 let silent = replica
                     .last_contact_at
-                    .map(|at| now - at > REPLICA_SILENT_SECS)
+                    .map(|at| now - at > threshold)
                     .unwrap_or(true);
 
                 if !replica.stream_connected && silent {

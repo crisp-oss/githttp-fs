@@ -22,13 +22,13 @@ You might find it convenient to run githttp-fs via Docker. You can find the pre-
 First, pull the `crispim/githttp-fs` image:
 
 ```bash
-docker pull crispim/githttp-fs:v1.11.3
+docker pull crispim/githttp-fs:v1.11.4
 ```
 
 Then, provide a configuration file and run it (replace `/path/to/your/githttp-fs/config.toml` with the path to your configuration file):
 
 ```bash
-docker run -p 5355:5355 -v /path/to/your/githttp-fs/config.toml:/etc/githttp-fs.cfg crispim/githttp-fs:v1.11.3
+docker run -p 5355:5355 -v /path/to/your/githttp-fs/config.toml:/etc/githttp-fs.cfg crispim/githttp-fs:v1.11.4
 ```
 
 In the configuration file, ensure that:
@@ -119,7 +119,12 @@ Use the sample [config.toml](https://github.com/crisp-oss/githttp-fs/blob/master
 * `log_level` (type: _string_, allowed: `debug`, `info`, `warn`, `error`, default: `info`) — Verbosity of logging, set it to `error` in production
 * `checkout_files` (type: _boolean_, allowed: `true`, `false`, default: `true`) — Whether each tenant's files are kept on the working tree, so a human can `ls` a repository; nothing githttp-fs serves reads them, so turning this off saves the uncompressed size of all content (see [Considerations](CONSIDERATIONS.md#files-on-disk))
 * `checkout_files_autoheal` (type: _boolean_, allowed: `true`, `false`, default: `false`) — Whether startup checks every tenant out to its HEAD, healing files that are missing or stale on disk; opt-in because it walks the whole store and removes files HEAD no longer names, so enable it for one restart after turning `checkout_files` on
+
+**[limits]**
+
 * `allowed_extensions` (type: _array[string]_, allowed: file extensions eg. `["md", "mdx"]`, default: none) — Optional whitelist of file extensions accepted for file writes and move destinations; when unset, all extensions are accepted
+* `batch_read_maximum_files` (type: _integer_, allowed: any number above zero, default: `100`) — Maximum number of files one batch read request may ask for; larger requests are rejected
+* `date_filter_maximum_ms` (type: _integer_, allowed: any number, default: `10000`) — Safety timer, in milliseconds, on the commit-history walk a date-filtered file listing runs; a listing that exhausts it answers with the entries it had dated by then, flagged `partial`, and `0` turns the timer off so the walk always runs to completion
 
 **[hooks]**
 
@@ -141,7 +146,7 @@ Use the sample [config.toml](https://github.com/crisp-oss/githttp-fs/blob/master
 * `port` (type: _string_, allowed: TCP ports, default: `5356`) — Port the replication server binds; must differ from `server.port`
 * `node_id` (type: _string_, allowed: up to 64 characters of `A-Z`, `a-z`, `0-9`, `.`, `_`, `-`, `:` and IPv6 brackets, no default) — How this node names itself to its peers: its row in the master's roster and its name in every log line. **Required, and unique per deployment** — a master refuses a second notification stream claiming a node id that is already connected from another process (`409`), since two replicas sharing a row would hide each other from an operator. It is telemetry, not authentication (`secret` is what guards the surface)
 * `master_url` (type: _string_, allowed: URL, no default) — Base URL of the master's **replication** server (its `[replication] host`/`port`), not its content API — Base URL of the master to follow; required when `role` is `replica`, and rejected when it is `master`
-* `poll_interval_secs` (type: _number_, allowed: seconds, default: `60`) — How often a replica compares its whole repository set against the master's; this is what bounds how stale a replica can get, since change notifications are only a latency hint
+* `poll_interval_secs` (type: _number_, allowed: seconds, default: `60`) — How often a replica compares its whole repository set against the master's; this is what bounds how stale a replica can get, since change notifications are only a latency hint. A replica reports it to its master, which sizes the silence that makes it call this replica `degraded` from it, so raising it never turns a healthy replica into an alert
 * `parallelism` (type: _number_, allowed: any number, default: `4`) — How many repositories a replica pulls concurrently while catching up
 * `reconnect_backoff_ms` (type: _number_, allowed: time in milliseconds, default: `1000`) — Base delay before a replica re-dials a dropped notification stream; doubles up to a minute
 * `deletion_guard` (type: _boolean_, allowed: `true`, `false`, default: `true`) — The mass-deletion guard: while on, a replica refuses a master listing that would delete more than half of the repositories it holds, keeps every local copy, and reports a `deletion_refused` issue instead. Nothing clears a refused deletion on its own, since a restarted replica still holds what it held; to accept one on purpose, set this to `false` for a single restart, then turn it back on
@@ -155,6 +160,8 @@ Use the sample [config.toml](https://github.com/crisp-oss/githttp-fs/blob/master
 
 ### Read more
 
+* [API.md](API.md) — the complete HTTP API and webhook payload reference
+* [DESIGN.md](DESIGN.md) — the annotated configuration reference and the reasoning behind every design decision
 * [CONSIDERATIONS.md](CONSIDERATIONS.md) — how read-only replicas behave, why two health routes are public, and the one file githttp-fs reserves inside a tenant repository
 * [REPLICATION.md](REPLICATION.md) — the replication peer protocol: wire formats, reconciliation, safety guarantees, failure handling, and the promotion runbook
 

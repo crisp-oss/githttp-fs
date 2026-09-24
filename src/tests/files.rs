@@ -1229,6 +1229,46 @@ async fn a_date_filter_prunes_directories_left_holding_nothing() {
 }
 
 #[tokio::test]
+async fn a_depth_limited_date_filter_keeps_the_directories_holding_a_match() {
+    use crate::tests::fixture::{at, commit_files_at};
+
+    let server = TestServer::start().await;
+
+    server.write_file(TENANT, "seed.md", "seed").await;
+
+    let repo = server.repo_path("docs", "acme");
+
+    commit_files_at(
+        &repo,
+        at("2020-01-01T00:00:00Z"),
+        "old",
+        &[("old/deep/a.md", b"x")],
+    );
+    commit_files_at(
+        &repo,
+        at("2022-01-01T00:00:00Z"),
+        "new",
+        &[("new/deep/b.md", b"x")],
+    );
+
+    let body = server
+        .get(&format!(
+            "{}/files?maximum_depth=1&include_date_from=2021-01-01T00:00:00Z&include_date_to=2023-01-01T00:00:00Z",
+            TENANT
+        ))
+        .await
+        .json();
+
+    // "`maximum_depth` bounds what is *returned* rather than what is looked
+    // at: a directory sitting at the limit comes back as the same childless
+    // stub the plain listing returns, but only when the subtree below it holds
+    // an in-window file." Both directories hold their file below the limit;
+    // only `new`'s is inside the window, and `seed.md` is stamped now.
+    assert_eq!(names(&body["files"]), vec!["new"]);
+    assert_eq!(children(&body["files"], "new").as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn a_date_filter_intersects_with_a_name_search() {
     let server = TestServer::start().await;
 
@@ -1254,6 +1294,154 @@ async fn a_date_filter_intersects_with_a_name_search() {
         .json();
 
     assert_eq!(names(&body["files"]), vec!["b.md"]);
+}
+
+#[tokio::test]
+async fn a_name_matched_directory_at_the_depth_limit_still_needs_an_in_window_file() {
+    use crate::tests::fixture::{at, commit_files_at};
+
+    let server = TestServer::start().await;
+
+    let repo = server.repo_path("docs", "acme");
+
+    server.write_file(TENANT, "seed.md", "seed").await;
+
+    commit_files_at(
+        &repo,
+        at("2020-01-01T00:00:00Z"),
+        "old",
+        &[("guides-old/deep/a.md", b"x")],
+    );
+    commit_files_at(
+        &repo,
+        at("2022-01-01T00:00:00Z"),
+        "new",
+        &[("guides-new/deep/b.md", b"x")],
+    );
+
+    let body = server
+        .get(&format!(
+            "{}/files?file_name_starts_with=guides&maximum_depth=1&include_date_from=2021-01-01T00:00:00Z&include_date_to=2023-01-01T00:00:00Z",
+            TENANT
+        ))
+        .await
+        .json();
+
+    // Both directories match the name and sit at the depth limit, so the
+    // date window is what separates them — the stub rule is the same one the
+    // plain date-filtered listing follows.
+    assert_eq!(names(&body["files"]), vec!["guides-new"]);
+    assert_eq!(
+        children(&body["files"], "guides-new")
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+// --- The date filter's safety timer ---------------------------------------
+
+/// A tenant whose history is long enough that dating every one of its files
+/// takes real time: one commit per file, so the `updated` walk cannot stop
+/// early — the oldest file is only dated by the oldest commit.
+async fn seed_long_history(server: &TestServer) -> usize {
+    use crate::tests::fixture::{at, commit_files_at};
+
+    const COMMITS: usize = 500;
+
+    server.write_file(TENANT, "seed.md", "seed").await;
+
+    let repo = server.repo_path("docs", "acme");
+    let when = at("2020-01-01T00:00:00Z");
+
+    for index in 0..COMMITS {
+        let path = format!("file-{:04}.md", index);
+
+        commit_files_at(&repo, when, "add one", &[(path.as_str(), b"x")]);
+    }
+
+    COMMITS
+}
+
+#[tokio::test]
+async fn a_date_filter_that_spends_its_budget_answers_with_what_it_dated() {
+    // `limits.date_filter_maximum_ms` is a safety timer, not a deadline the
+    // request fails on: the walk stops, the entries dated so far are the
+    // answer, and `partial` says so.
+    let server = TestServer::builder()
+        .date_filter_maximum_ms(1)
+        .start()
+        .await;
+
+    let commits = seed_long_history(&server).await;
+
+    let body = server
+        .get(&format!(
+            "{}/files?include_date_from=2019-01-01T00:00:00Z&include_date_to=2021-01-01T00:00:00Z&per_page=500",
+            TENANT
+        ))
+        .await
+        .json();
+
+    assert_eq!(body["partial"], true);
+
+    // Every file is inside the window, so a complete answer would hold all of
+    // them — the short one holds fewer, and nothing that was not asked for.
+    let returned = body["files"].as_array().unwrap().len();
+
+    assert!(
+        returned < commits,
+        "a budget of 1ms dated all {} files",
+        commits
+    );
+
+    for name in names(&body["files"]) {
+        assert!(name.starts_with("file-"), "unexpected entry {}", name);
+    }
+}
+
+#[tokio::test]
+async fn a_date_filter_answers_in_full_under_the_default_budget() {
+    // The same history under the shipped ten-second timer, which no walk of
+    // this size comes close to spending: the answer is complete, and says so.
+    // The default is only a guard against the pathological case, never
+    // something an ordinary listing notices.
+    let server = TestServer::start().await;
+
+    let commits = seed_long_history(&server).await;
+
+    let body = server
+        .get(&format!(
+            "{}/files?include_date_from=2019-01-01T00:00:00Z&include_date_to=2021-01-01T00:00:00Z&per_page=500",
+            TENANT
+        ))
+        .await
+        .json();
+
+    assert_eq!(body["partial"], false);
+    assert_eq!(body["has_more"], false);
+
+    // Every commit of the fixture, and only those: the tenant's seed file is
+    // stamped now and sits outside the window.
+    assert_eq!(body["files"].as_array().unwrap().len(), commits);
+}
+
+#[tokio::test]
+async fn a_listing_without_a_date_filter_is_never_partial() {
+    // No date filter walks no history, so the timer has nothing to cut short
+    // — the field is there whatever the listing did, so a client can read it
+    // without knowing which mode produced the answer.
+    let server = TestServer::builder()
+        .date_filter_maximum_ms(1)
+        .start()
+        .await;
+
+    seed_tree(&server).await;
+
+    let body = server.get(&format!("{}/files", TENANT)).await.json();
+
+    assert_eq!(body["partial"], false);
 }
 
 // --- Search and depth composition ----------------------------------------

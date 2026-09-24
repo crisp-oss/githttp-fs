@@ -73,6 +73,8 @@ Each replica process also generates a random instance token at startup and sends
 
 A restarting replica presents a *new* token, so it would collide with its own previous connection if that connection outlived it. It does not: the stream task watches for its peer going away and releases the node id the moment the socket dies, so a restart reconnects immediately. A refusal is therefore reported — logged as an error, raised as `node_id_collision` on both sides — only once it has persisted for two heartbeats (40 s), which covers the one case where a dead socket is not seen at once: a `FIN` that never arrives, through a proxy or a partition that leaves the old socket half-open. Until then it is a warning on both sides and the replica keeps re-dialling with its ordinary backoff.
 
+A replica also states its own `poll_interval_secs` as `X-Replication-Poll-Interval` on every request. The master cannot know it otherwise — it is a replica-only key, ignored on the node reading it, and on a chained replica it describes that node's own upstream cadence rather than its followers' — and the master needs it to decide how long a given replica may go quiet before its silence means something (see [Status, and what to alert on](#status-and-what-to-alert-on)). Like every other header here it is self-asserted telemetry: absent on a peer predating it, and bounded when acted on.
+
 The default polling interval bounds normal eventual-consistency delay. `parallelism` bounds the number of repositories pulled at once. A dropped event stream is re-dialed with exponential backoff, capped at 60 seconds.
 
 ## Versioning
@@ -249,10 +251,12 @@ Every timestamp in this body — and in every other body on this API — is an R
 | `status` | Meaning | Action |
 |---|---|---|
 | `healthy` | Nothing is wrong that will not fix itself within a poll interval. | None. |
-| `degraded` | Converging, but not well: a replica is `stalled` (three consecutive failed passes), a replica's stream is down and it has been silent for over two minutes, or a cold replica is still bootstrapping. | Warn. Usually a master or network outage in progress. |
+| `degraded` | Converging, but not well: a replica is `stalled` (three consecutive failed passes), a replica's stream is down and it has been silent for longer than two of its own poll intervals, or a cold replica is still bootstrapping. | Warn. Usually a master or network outage in progress. |
 | `halted` | An `issue` is open and nothing will close it but a person. | Page. Read `issues`. |
 
 On a replica, `status` follows its own follower state. On a master, it folds in every roster row: a replica reporting `halted` makes the master `halted`, a `stalled` or silent one makes it `degraded`, so one probe against the master covers the whole set. `lagging` is normal operation and never degrades anything.
+
+"Silent" is measured against the cadence that replica reported in `X-Replication-Poll-Interval`, not against a fixed number: a replica converging by polling with its stream down is heard from once per interval, so a deployment that raises `poll_interval_secs` must not thereby alert on a node that is working. The threshold is two of those intervals, clamped to a floor of 120 seconds — which is also what a replica that reports no cadence is judged by — and a ceiling of 900, since the value is self-asserted and an unbounded one would disable the check. A row is refreshed by *any* request from the replica, a pack download and a health probe included, not only by the state poll.
 
 `issues` lists every condition the node has stopped acting on by itself. Each entry carries a `kind`, the repository it concerns where that applies, and `since` (when it first appeared — an issue re-raised on every pass keeps its original timestamp):
 

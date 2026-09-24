@@ -43,7 +43,7 @@
 //! hook work. What it *does* share with every write handler is the tenant
 //! write lock, and for a reason that is not cosmetic — see below.
 //!
-//! Three properties are worth stating explicitly:
+//! Four properties are worth stating explicitly:
 //!
 //! **The snapshot is taken under the write lock.** Reads normally skip the
 //! lock, but a replay does not, because it enqueues. Without the lock a PUT
@@ -58,6 +58,13 @@
 //! hook consumer reads each file just before its POST. That bounds memory to
 //! a chunk rather than the whole corpus, which matters because a throttled
 //! replay of a large repository can occupy its queue for hours.
+//!
+//! **Delivery follows the tree, top down.** Paths are sorted before they are
+//! enqueued (see [`crate::traverse`]): a folder's own files first, hidden
+//! ones leading, then each sub-folder in turn under the same rule — so a
+//! receiver is never told about a file before the files of the folders above
+//! it. It holds in both directions and whatever order the caller listed its
+//! `files` in, and the order phase lists its directories the same way.
 //!
 //! **`delay_ms` throttles, it does not order.** Delivery is already strictly
 //! sequential per repository. The delay exists to spare a receiver from a
@@ -77,6 +84,7 @@ use crate::{
     hooks::{HookJob, ReplayJob, ReplayKind},
     order,
     state::AppState,
+    traverse,
     util::run_blocking,
     validate,
 };
@@ -225,7 +233,7 @@ pub async fn replay_hook(
     let tenant_id_for_orders = tenant_id.clone();
     let prefix_for_orders = prefix_path.clone();
 
-    let order_directories = run_blocking(move || {
+    let mut order_directories = run_blocking(move || {
         git::GitOrder::list_order_directories(
             &repo_path_for_orders,
             &tenant_id_for_orders,
@@ -245,11 +253,21 @@ pub async fn replay_hook(
     let candidates: &[String] = files.as_deref().unwrap_or(&present_paths);
     let keeps_present = direction.keeps_present();
 
-    let affected: Vec<String> = candidates
+    let mut affected: Vec<String> = candidates
         .iter()
         .filter(|path| present.contains(path.as_str()) == keeps_present)
         .cloned()
         .collect();
+
+    // Delivery order is part of the contract: a folder's own files first
+    // (hidden ones leading), then each of its sub-folders in turn, so the
+    // receiver sees the tree rebuilt the way a user would build it by hand.
+    // Sorted here rather than walked, because neither source is in that order
+    // — a caller's list is in whatever order it was sent, git's walk descends
+    // into a folder before finishing its siblings — and because the `delete`
+    // direction replays paths no walk could reach. See `traverse.rs`.
+    traverse::sort_files(&mut affected);
+    traverse::sort_directories(&mut order_directories);
 
     let file_count = affected.len();
     let order_count = order_directories.len();

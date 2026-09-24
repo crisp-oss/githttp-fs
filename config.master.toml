@@ -31,27 +31,6 @@ allowed_extensions = ["html", "txt", "toml", "json", "md", "mdx"]
 
 batch_read_maximum_files = 100
 
-[hooks]
-
-url = "https://webhook.site/c086f90d-e2d6-40dc-a925-38179cc33e8d"
-
-events = [
-  "file.created",
-  "file.updated",
-  "file.deleted",
-  "file.moved",
-  "order.updated",
-  "order.deleted"
-]
-
-retry_attempts = 5
-retry_backoff_ms = 2000
-
-[hooks.auth]
-
-header = "Authorization"
-value = "Bearer your-hook-receiver-secret"
-
 [maintenance]
 
 enabled = true

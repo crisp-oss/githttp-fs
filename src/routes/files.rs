@@ -23,6 +23,7 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use crate::{
     error::AppError,
@@ -290,6 +291,7 @@ fn parse_date_filter(
     from: Option<&str>,
     to: Option<&str>,
     date_type: Option<&str>,
+    budget: Option<Duration>,
 ) -> Result<Option<git::DateFilter>, AppError> {
     let kind = match date_type {
         None | Some("updated") => git::DateKind::Updated,
@@ -325,7 +327,12 @@ fn parse_date_filter(
         }
     }
 
-    Ok(Some(git::DateFilter { from, to, kind }))
+    Ok(Some(git::DateFilter {
+        from,
+        to,
+        kind,
+        budget,
+    }))
 }
 
 /// GET /:collection_id/:tenant_id/files
@@ -386,6 +393,12 @@ pub async fn list_files(
         query.include_date_from.as_deref(),
         query.include_date_to.as_deref(),
         query.include_date_type.as_deref(),
+        // Zero is the operator turning the timer off, which is the one way
+        // back to a walk that always runs to completion.
+        match state.config.limits.date_filter_maximum_ms {
+            0 => None,
+            maximum => Some(Duration::from_millis(maximum)),
+        },
     )?;
 
     // The options object *is* the opt-in: absent, the git layer does not read a
@@ -415,7 +428,7 @@ pub async fn list_files(
 
     let tenant_id_for_task = tenant_id.clone();
 
-    let (tree, has_more) = run_tenant_read(&repo_path.clone(), &tenant_id, move || {
+    let listing = run_tenant_read(&repo_path.clone(), &tenant_id, move || {
         git::GitFiles::list_files(
             &repo_path,
             &tenant_id_for_task,
@@ -431,13 +444,14 @@ pub async fn list_files(
     })
     .await?;
 
-    tracing::debug!(tenant_id = %tenant_id, page = page, returned = tree.len(), has_more = has_more, "list files tree response ready");
+    tracing::debug!(tenant_id = %tenant_id, page = page, returned = listing.nodes.len(), has_more = listing.has_more, partial = listing.partial, "list files tree response ready");
 
     Ok(Json(json!({
         "page": page,
         "per_page": per_page,
-        "has_more": has_more,
-        "files": tree,
+        "has_more": listing.has_more,
+        "partial": listing.partial,
+        "files": listing.nodes,
     })))
 }
 
