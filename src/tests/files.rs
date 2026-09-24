@@ -591,6 +591,340 @@ async fn file_name_starts_with_rejects_empty_and_malformed_values() {
     }
 }
 
+// --- Exact-path selection ------------------------------------------------
+
+/// URL-encodes a JSON array of paths for the `file_paths` query parameter, so
+/// the tests below read as the paths they select rather than as percent escapes.
+fn file_paths_query(paths: &[&str]) -> String {
+    let json = serde_json::to_string(paths).expect("paths are serialisable");
+
+    json.bytes()
+        .map(|byte| match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                (byte as char).to_string()
+            }
+            other => format!("%{:02X}", other),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn file_paths_selects_exactly_the_named_paths_and_skips_missing_ones() {
+    let server = TestServer::start().await;
+
+    seed_tree(&server).await;
+
+    let body = server
+        .get(&format!(
+            "{}/files?file_paths={}",
+            TENANT,
+            file_paths_query(&["docs/intro.md", "nowhere.md", "README.md"])
+        ))
+        .await
+        .json();
+
+    // Documented: "a path HEAD does not hold is left out of the result rather
+    // than erroring" — so `nowhere.md` costs the request nothing.
+    assert_eq!(names(&body["files"]), vec!["docs", "README.md"]);
+
+    // A named file is a leaf, its ancestor directory present purely as the
+    // structure leading to it — the same shape `file_name_starts_with` returns.
+    assert_eq!(names(children(&body["files"], "docs")), vec!["intro.md"]);
+
+    // Naming nothing that exists is an empty listing, not a 404.
+    let empty = server
+        .get(&format!(
+            "{}/files?file_paths={}",
+            TENANT,
+            file_paths_query(&["nowhere.md"])
+        ))
+        .await;
+
+    empty.expect_status(StatusCode::OK);
+
+    assert_eq!(names(&empty.json()["files"]), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn file_paths_accepts_a_bare_path_and_tolerates_a_trailing_slash() {
+    let server = TestServer::start().await;
+
+    seed_tree(&server).await;
+
+    // The bare-string spelling, exactly as `file_name_starts_with` accepts one.
+    let bare = server
+        .get(&format!("{}/files?file_paths=README.md", TENANT))
+        .await
+        .json();
+
+    assert_eq!(names(&bare["files"]), vec!["README.md"]);
+
+    // A folder spelled with a trailing slash is the same folder.
+    let folder = server
+        .get(&format!(
+            "{}/files?file_paths={}",
+            TENANT,
+            file_paths_query(&["notes/"])
+        ))
+        .await
+        .json();
+
+    assert_eq!(names(&folder["files"]), vec!["notes"]);
+    assert_eq!(names(children(&folder["files"], "notes")), vec!["todo.md"]);
+}
+
+#[tokio::test]
+async fn file_paths_are_relative_to_prefix_path() {
+    let server = TestServer::start().await;
+
+    seed_tree(&server).await;
+
+    let body = server
+        .get(&format!(
+            "{}/files?prefix_path=/docs&file_paths={}",
+            TENANT,
+            file_paths_query(&["intro.md", "guides/basics.md"])
+        ))
+        .await
+        .json();
+
+    // Paths are spelled against the listing root, and reported against it.
+    assert_eq!(names(&body["files"]), vec!["guides", "intro.md"]);
+    assert_eq!(names(children(&body["files"], "guides")), vec!["basics.md"]);
+
+    // A path spelled from the repository root therefore selects nothing under
+    // a prefix.
+    let root_spelling = server
+        .get(&format!(
+            "{}/files?prefix_path=/docs&file_paths={}",
+            TENANT,
+            file_paths_query(&["docs/intro.md"])
+        ))
+        .await
+        .json();
+
+    assert_eq!(names(&root_spelling["files"]), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_named_directory_brings_its_whole_subtree() {
+    let server = TestServer::start().await;
+
+    seed_tree(&server).await;
+
+    let body = server
+        .get(&format!(
+            "{}/files?file_paths={}",
+            TENANT,
+            file_paths_query(&["docs/guides"])
+        ))
+        .await
+        .json();
+
+    assert_eq!(names(&body["files"]), vec!["docs"]);
+
+    // Every descendant shows, exactly as a name-matched directory expands.
+    assert_eq!(
+        names(children(children(&body["files"], "docs"), "guides")),
+        vec!["advanced.md", "basics.md"]
+    );
+}
+
+#[tokio::test]
+async fn file_paths_excludes_hidden_paths_unless_they_are_asked_for() {
+    let server = TestServer::start().await;
+
+    seed_tree(&server).await;
+
+    // Hidden entries are gated by path, not just by leaf name: naming a file
+    // inside a hidden directory is not a way around the flag.
+    let hidden = server
+        .get(&format!(
+            "{}/files?file_paths={}",
+            TENANT,
+            file_paths_query(&[".dotfile.md", ".hidden/secret.md"])
+        ))
+        .await
+        .json();
+
+    assert_eq!(names(&hidden["files"]), Vec::<String>::new());
+
+    let shown = server
+        .get(&format!(
+            "{}/files?include_hidden_files=true&file_paths={}",
+            TENANT,
+            file_paths_query(&[".dotfile.md", ".hidden/secret.md"])
+        ))
+        .await
+        .json();
+
+    assert_eq!(names(&shown["files"]), vec![".hidden", ".dotfile.md"]);
+    assert_eq!(
+        names(children(&shown["files"], ".hidden")),
+        vec!["secret.md"]
+    );
+}
+
+#[tokio::test]
+async fn file_paths_never_selects_an_order_index() {
+    let server = TestServer::start().await;
+
+    seed_tree(&server).await;
+
+    server
+        .put(
+            &format!("{}/order", TENANT),
+            json!({ "author": author(), "order": ["README.md", "docs/"] }),
+        )
+        .await
+        .expect_status(StatusCode::OK);
+
+    // Documented: the order index "is invisible to every `/files` route",
+    // whatever `include_hidden_files` says — so it is not selectable by path
+    // either.
+    let body = server
+        .get(&format!(
+            "{}/files?include_hidden_files=true&file_paths={}",
+            TENANT,
+            file_paths_query(&[".order.json"])
+        ))
+        .await
+        .json();
+
+    assert_eq!(names(&body["files"]), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn file_paths_is_bounded_by_maximum_depth() {
+    let server = TestServer::start().await;
+
+    seed_tree(&server).await;
+
+    // A named path deeper than the limit is not returned at all — a name
+    // search would never have walked to it either.
+    let bounded = server
+        .get(&format!(
+            "{}/files?maximum_depth=1&file_paths={}",
+            TENANT,
+            file_paths_query(&["README.md", "docs/intro.md"])
+        ))
+        .await
+        .json();
+
+    assert_eq!(names(&bounded["files"]), vec!["README.md"]);
+
+    // A named directory sitting *at* the limit renders as a childless stub,
+    // exactly as the plain listing stubs it.
+    let stub = server
+        .get(&format!(
+            "{}/files?maximum_depth=1&file_paths={}",
+            TENANT,
+            file_paths_query(&["docs"])
+        ))
+        .await
+        .json();
+
+    assert_eq!(names(&stub["files"]), vec!["docs"]);
+    assert_eq!(
+        children(&stub["files"], "docs").as_array().unwrap().len(),
+        0
+    );
+
+    // One level further down, the expansion is itself depth-bounded.
+    let nested = server
+        .get(&format!(
+            "{}/files?maximum_depth=2&file_paths={}",
+            TENANT,
+            file_paths_query(&["docs"])
+        ))
+        .await
+        .json();
+
+    assert_eq!(
+        names(children(&nested["files"], "docs")),
+        vec!["guides", "intro.md"]
+    );
+    assert_eq!(
+        children(children(&nested["files"], "docs"), "guides")
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_date_window_intersects_an_exact_path_selection() {
+    let server = TestServer::start().await;
+
+    seed_tree(&server).await;
+
+    let query = format!(
+        "file_paths={}&include_date_from=2000-01-01T00:00:00Z",
+        file_paths_query(&["docs/intro.md"])
+    );
+
+    let kept = server
+        .get(&format!("{}/files?{}", TENANT, query))
+        .await
+        .json();
+
+    assert_eq!(names(&kept["files"]), vec!["docs"]);
+
+    let dropped = server
+        .get(&format!(
+            "{}/files?{}&include_date_to=2001-01-01T00:00:00Z",
+            TENANT, query
+        ))
+        .await
+        .json();
+
+    assert_eq!(names(&dropped["files"]), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn file_paths_and_file_name_starts_with_must_not_be_combined() {
+    let server = TestServer::start().await;
+
+    seed_tree(&server).await;
+
+    // Two selections over the same tree: one request carries at most one, so a
+    // caller cannot be left guessing which one shaped an empty result.
+    server
+        .get(&format!(
+            "{}/files?file_name_starts_with=intro&file_paths={}",
+            TENANT,
+            file_paths_query(&["README.md"])
+        ))
+        .await
+        .expect_status(StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn file_paths_rejects_empty_and_unsafe_values() {
+    let server = TestServer::start().await;
+
+    seed_tree(&server).await;
+
+    for value in [
+        // An empty value, an empty array, and an empty path.
+        "",
+        "%5B%5D",
+        "%5B%22%22%5D",
+        // Malformed array spellings.
+        "%5B1%5D",
+        "%5B",
+        // Paths are sanitised exactly as the read route's `*path` is.
+        "docs/../../etc/passwd",
+        "%5B%22..%2Fetc%22%5D",
+    ] {
+        server
+            .get(&format!("{}/files?file_paths={}", TENANT, value))
+            .await
+            .expect_status(StatusCode::BAD_REQUEST);
+    }
+}
+
 #[tokio::test]
 async fn date_bounds_are_validated_strictly() {
     let server = TestServer::start().await;

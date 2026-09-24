@@ -1497,6 +1497,12 @@ impl GitFiles {
     /// apply — matches can be nested anywhere, so the whole in-scope tree is
     /// walked before pagination.
     ///
+    /// When `file_paths` is set, the listing is narrowed to exactly those paths
+    /// (relative to `path_prefix`, and absent from the result when HEAD does not
+    /// hold them); see `select_by_file_paths`. It is mutually exclusive with
+    /// `file_name_starts_with` — the route rejects both together — and it is the
+    /// one mode that walks nothing it was not asked for.
+    ///
     /// When `date_filter` is set, the listing is narrowed to files whose git
     /// created/updated date falls inside the window (see `file_dates`). Like
     /// name search it forgoes the off-page optimisation — a file's date can
@@ -1527,12 +1533,13 @@ impl GitFiles {
         maximum_depth: Option<usize>,
         include_hidden_files: bool,
         file_name_starts_with: Option<&[String]>,
+        file_paths: Option<&[String]>,
         date_filter: Option<DateFilter>,
         order_options: Option<OrderOptions>,
         page: usize,
         per_page: usize,
     ) -> Result<Listing, AppError> {
-        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, file_name_starts_with = ?file_name_starts_with, date_filter = ?date_filter, order_options = ?order_options, page = page, per_page = per_page, "listing files");
+        tracing::debug!(tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, file_name_starts_with = ?file_name_starts_with, file_paths = ?file_paths, date_filter = ?date_filter, order_options = ?order_options, page = page, per_page = per_page, "listing files");
 
         let repo = GitUtils::open_tenant_repo(repo_path, tenant_id)?;
         let head_commit = repo.head()?.peel_to_commit()?;
@@ -1553,6 +1560,24 @@ impl GitFiles {
             },
             None => head_tree,
         };
+
+        // An exact-path selection needs no walk at all: every entry it can
+        // return is named, so it is one tree lookup per path and the result is
+        // paginated like any other filtered listing.
+        if let Some(wanted) = file_paths {
+            return Self::select_by_file_paths(
+                &repo,
+                &walk_tree,
+                path_prefix,
+                wanted,
+                maximum_depth,
+                include_hidden_files,
+                date_filter,
+                order_options,
+                page,
+                per_page,
+            );
+        }
 
         // Name search takes a different route entirely: matches may be nested
         // arbitrarily deep, so the "decide the page window before opening any
@@ -1821,6 +1846,24 @@ impl GitFiles {
         max_depth: Option<usize>,
         include_hidden_files: bool,
     ) -> Result<Vec<TreeNode>, AppError> {
+        let (flat, dir_stubs) =
+            Self::collect_flat_with_stubs(subtree, max_depth, include_hidden_files)?;
+
+        Ok(GitUtils::build_tree(flat, dir_stubs, max_depth))
+    }
+
+    /// The walk behind [`Self::collect_subtree`], stopped one step short of
+    /// building a tree: the in-scope files as flat paths relative to `subtree`,
+    /// plus the directories descent stopped at (kept as stubs so a
+    /// depth-limited folder still shows, childless). Split out because the
+    /// exact-path selection has to *prefix* both lists with the path it
+    /// expanded before they reach `build_tree` — something a built tree can no
+    /// longer be given.
+    fn collect_flat_with_stubs(
+        subtree: &git2::Tree<'_>,
+        max_depth: Option<usize>,
+        include_hidden_files: bool,
+    ) -> Result<(Vec<String>, Vec<String>), AppError> {
         let mut flat: Vec<String> = Vec::new();
         let mut dir_stubs: Vec<String> = Vec::new();
 
@@ -1867,7 +1910,7 @@ impl GitFiles {
             git2::TreeWalkResult::Ok
         })?;
 
-        Ok(GitUtils::build_tree(flat, dir_stubs, max_depth))
+        Ok((flat, dir_stubs))
     }
 
     /// Walks `walk_tree` in full and returns the tree of entries whose *leaf
@@ -1997,11 +2040,196 @@ impl GitFiles {
             git2::TreeWalkResult::Ok
         })?;
 
-        // A date filter, when present, composes with the name search: only
-        // name matches that also fall inside the date window survive. Because
-        // directories carry no date, the matched tree is rebuilt from the
-        // surviving *files* alone — a name-matched directory left with no
-        // in-window file is pruned.
+        Self::finish_filtered_listing(
+            repo,
+            walk_tree,
+            path_prefix,
+            flat,
+            dir_stubs,
+            depth_stubs,
+            include_hidden_files,
+            date_filter,
+            order_options,
+            page,
+            per_page,
+        )
+    }
+
+    /// Returns the tree of exactly the entries `wanted` names, each path
+    /// relative to the listing root (so relative to `prefix_path` when one is
+    /// set, which is what the caller spelled them against). A path HEAD does
+    /// not hold is simply absent from the result rather than an error: a
+    /// selection states what the caller is interested in, not what it believes
+    /// exists.
+    ///
+    /// Every other rule is the one [`Self::search_by_file_name`] follows, since
+    /// this is the same listing mode reached by a different predicate — an
+    /// entry is selected by its exact path instead of its leaf name:
+    ///
+    /// - a named **file** is returned as a leaf, its ancestor directories
+    ///   present purely as the structure leading to it;
+    /// - a named **directory** is returned with its whole subtree expanded, so
+    ///   naming a folder reads it in one call;
+    /// - `include_hidden_files` gates hidden entries the same way, and it gates
+    ///   them by *path*: a named entry is dropped when any of its components is
+    ///   dot-prefixed, which is what the search's wholesale pruning of a hidden
+    ///   directory's subtree amounts to;
+    /// - `maximum_depth` bounds the result the same way — a named path deeper
+    ///   than the limit is not returned at all (the search would never have
+    ///   walked to it), and a named directory sitting *at* the limit renders as
+    ///   a childless stub;
+    /// - an order index is never selectable, exactly as it is never listed;
+    /// - a date filter intersects, pagination stays parent-based over the
+    ///   root-level entries of the selected tree, and no blob is ever opened.
+    ///
+    /// Duplicate paths are harmless rather than rejected (the tree is built by
+    /// name, so naming a path twice builds the same node once), and the cost of
+    /// this mode is one tree lookup per path — the only listing mode cheaper
+    /// than the plain one, since nothing is walked that was not asked for.
+    #[allow(clippy::too_many_arguments)]
+    fn select_by_file_paths(
+        repo: &Repository,
+        walk_tree: &git2::Tree<'_>,
+        path_prefix: Option<&str>,
+        wanted: &[String],
+        maximum_depth: Option<usize>,
+        include_hidden_files: bool,
+        date_filter: Option<DateFilter>,
+        order_options: Option<OrderOptions>,
+        page: usize,
+        per_page: usize,
+    ) -> Result<Listing, AppError> {
+        let mut flat: Vec<String> = Vec::new();
+        let mut dir_stubs: Vec<String> = Vec::new();
+        let mut depth_stubs: Vec<(String, Oid)> = Vec::new();
+
+        for wanted_path in wanted {
+            let Ok(entry) = walk_tree.get_path(Path::new(wanted_path)) else {
+                continue;
+            };
+
+            let components: Vec<&str> = wanted_path.split('/').collect();
+
+            // Hidden entries (Unix dot convention) are excluded by path, not
+            // just by leaf name: a file inside a hidden directory is one the
+            // walking modes never reach, so naming it explicitly must not be a
+            // way around the flag.
+            if !include_hidden_files
+                && components
+                    .iter()
+                    .any(|component| component.starts_with('.'))
+            {
+                continue;
+            }
+
+            // Depth of the named entry relative to the listing root: a
+            // root-level entry is depth 1, `docs/intro.md` depth 2, …
+            let depth = components.len();
+
+            // A path the depth limit puts out of reach is not returned, exactly
+            // as a name match below the limit is never found.
+            if maximum_depth.is_some_and(|max| depth > max) {
+                continue;
+            }
+
+            match entry.kind() {
+                // Order indexes are a separate resource, never listed as
+                // content — and so never selectable by path either.
+                Some(git2::ObjectType::Blob) => {
+                    if components.last() != Some(&order::ORDER_FILE_NAME) {
+                        flat.push(wanted_path.clone());
+                    }
+                }
+
+                Some(git2::ObjectType::Tree) => {
+                    // Sitting *at* the limit: on the page as a childless stub,
+                    // its contents never opened (a date filter is the one thing
+                    // that looks inside, and it takes the oid to do it).
+                    if maximum_depth == Some(depth) {
+                        depth_stubs.push((wanted_path.clone(), entry.id()));
+
+                        continue;
+                    }
+
+                    // Stubbed as well as expanded, so a named directory still
+                    // shows when everything inside it is hidden or filtered out
+                    // — it is itself what the caller asked for.
+                    dir_stubs.push(wanted_path.clone());
+
+                    let subtree = repo.find_tree(entry.id())?;
+
+                    // The depth limit below is relative to this subtree, which
+                    // sits `depth` levels down from the listing root.
+                    let subtree_max_depth = maximum_depth.map(|max| max - depth);
+
+                    let (leaves, stubs) = Self::collect_flat_with_stubs(
+                        &subtree,
+                        subtree_max_depth,
+                        include_hidden_files,
+                    )?;
+
+                    flat.extend(
+                        leaves
+                            .into_iter()
+                            .map(|leaf| format!("{}/{}", wanted_path, leaf)),
+                    );
+
+                    dir_stubs.extend(
+                        stubs
+                            .into_iter()
+                            .map(|stub| format!("{}/{}", wanted_path, stub)),
+                    );
+                }
+
+                _ => {}
+            }
+        }
+
+        Self::finish_filtered_listing(
+            repo,
+            walk_tree,
+            path_prefix,
+            flat,
+            dir_stubs,
+            depth_stubs,
+            include_hidden_files,
+            date_filter,
+            order_options,
+            page,
+            per_page,
+        )
+    }
+
+    /// The half of a filtered listing that follows the walk, shared by the two
+    /// modes that filter — name search and exact-path selection — because it is
+    /// identical for both: the date window is intersected with what was
+    /// selected, the surviving paths are built into a tree, that tree is ordered
+    /// in full, and the page window is sliced from it.
+    ///
+    /// `flat` holds the selected files as paths relative to the listing root,
+    /// `dir_stubs` the directories that must show even when childless, and
+    /// `depth_stubs` those the depth limit cut short — kept apart from
+    /// `dir_stubs` because only a date filter needs to look inside them, and it
+    /// needs their subtree oid to do it.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_filtered_listing(
+        repo: &Repository,
+        walk_tree: &git2::Tree<'_>,
+        path_prefix: Option<&str>,
+        flat: Vec<String>,
+        mut dir_stubs: Vec<String>,
+        depth_stubs: Vec<(String, Oid)>,
+        include_hidden_files: bool,
+        date_filter: Option<DateFilter>,
+        order_options: Option<OrderOptions>,
+        page: usize,
+        per_page: usize,
+    ) -> Result<Listing, AppError> {
+        // A date filter, when present, composes with whichever selection ran:
+        // only selected entries that also fall inside the date window survive.
+        // Because directories carry no date, the tree is rebuilt from the
+        // surviving *files* alone — a selected directory left with no in-window
+        // file is pruned.
         //
         // A directory the depth limit cut the walk short at is the one case
         // that needs more than `flat`: it is on the page as a childless stub,
@@ -2065,12 +2293,12 @@ impl GitFiles {
 
         // The walk already bounded depth, so every collected path is within
         // scope and `build_tree` needs no depth handling of its own (`None`);
-        // the stubs it receives are matched directories that were not (or
-        // could not be) expanded. The matched tree is then paginated over its
-        // root-level entries, exactly like the plain listing.
+        // the stubs it receives are directories that were not (or could not be)
+        // expanded. The tree is then paginated over its root-level entries,
+        // exactly like the plain listing.
         let mut tree = GitUtils::build_tree(flat, dir_stubs, None);
 
-        // The whole matched tree is in hand before pagination here, so
+        // The whole tree is in hand before pagination here, so
         // ordering is applied to it in full and the page window is sliced from
         // the ordered result.
         if let Some(order_options) = order_options {

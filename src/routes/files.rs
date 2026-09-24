@@ -56,6 +56,16 @@ pub struct ListFilesQuery {
     /// `["intro", "readme"]` — an entry matches if its leaf name begins with
     /// *any* of them. Empty is rejected (`400`).
     pub file_name_starts_with: Option<String>,
+    /// When set, narrows the listing to exactly the paths named, each relative
+    /// to `prefix_path` when one is set. Same two spellings as
+    /// `file_name_starts_with` (a bare string or a JSON-array string, e.g.
+    /// `["intro.md", "docs/guides/setup.md"]`), and the same `400` on an empty
+    /// value. A path HEAD does not hold is left out of the result rather than
+    /// erroring — the parameter says what the caller wants, not what it
+    /// believes exists. Mutually exclusive with `file_name_starts_with`: they
+    /// are two ways of selecting, and combining them would only ever
+    /// intersect one with the other.
+    pub file_paths: Option<String>,
     /// Lower bound (inclusive) of the created/updated date-range filter, as an
     /// RFC 3339 date-time (e.g. `2026-06-16T10:00:00Z`).
     pub include_date_from: Option<String>,
@@ -266,6 +276,40 @@ fn parse_file_name_prefixes(raw: &str) -> Result<Vec<String>, AppError> {
     Ok(prefixes)
 }
 
+/// Decodes the `file_paths` query value into its list of paths, accepting the
+/// same two spellings as `file_name_starts_with` (a JSON array of strings, or a
+/// bare value taken as a single path) and sanitising each one with the rules of
+/// the read route's `*path` — with folder paths tolerated, since naming a folder
+/// is a legitimate way to ask for its subtree. An empty value or an empty array
+/// is rejected (`400`): both can only be caller bugs, the first selecting
+/// nothing and the second indistinguishable from omitting the parameter.
+///
+/// Duplicates are *not* rejected, unlike on the batch read route: a listing is
+/// a tree built by name rather than an index-aligned array, so naming the same
+/// path twice builds the same node once and asks a question with one answer.
+fn parse_file_paths(raw: &str) -> Result<Vec<String>, AppError> {
+    let paths = if raw.trim_start().starts_with('[') {
+        serde_json::from_str::<Vec<String>>(raw).map_err(|_err| AppError::InvalidOperation {
+            reason:
+                "file_paths must be a string or a JSON array of strings, e.g. [\"intro.md\", \"docs/setup.md\"]"
+                    .to_string(),
+        })?
+    } else {
+        vec![raw.to_string()]
+    };
+
+    if paths.is_empty() {
+        return Err(AppError::InvalidOperation {
+            reason: "file_paths must contain at least one path".to_string(),
+        });
+    }
+
+    paths
+        .iter()
+        .map(|path| validate::file_or_folder_path(path).map(str::to_string))
+        .collect()
+}
+
 /// Parses a single RFC 3339 date-time query value into UTC, mapping any
 /// malformed value to a `400` naming the parameter (strict validation — only
 /// the RFC 3339 spelling is accepted).
@@ -389,6 +433,24 @@ pub async fn list_files(
         .map(parse_file_name_prefixes)
         .transpose()?;
 
+    // Two selections over the same tree, so one request carries at most one:
+    // together they could only intersect, which no caller asking for exact
+    // paths wants and which would hide a typo behind an empty result.
+    if query.file_name_starts_with.is_some() && query.file_paths.is_some() {
+        return Err(AppError::InvalidOperation {
+            reason: "file_name_starts_with and file_paths must not be combined".to_string(),
+        });
+    }
+
+    // Paths are relative to `prefix_path` when one is set — the caller spells
+    // them against the listing root it asked for, exactly as the response
+    // reports them against it.
+    let file_paths: Option<Vec<String>> = query
+        .file_paths
+        .as_deref()
+        .map(parse_file_paths)
+        .transpose()?;
+
     let date_filter = parse_date_filter(
         query.include_date_from.as_deref(),
         query.include_date_to.as_deref(),
@@ -417,7 +479,7 @@ pub async fn list_files(
         .unwrap_or(DEFAULT_PER_PAGE)
         .clamp(1, MAX_PER_PAGE);
 
-    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, file_name_starts_with = ?file_name_starts_with, date_filter = ?date_filter, order_options = ?order_options, page = page, per_page = per_page, "handling list files request");
+    tracing::debug!(collection_id = %collection_id, tenant_id = %tenant_id, path_prefix = ?path_prefix, maximum_depth = ?maximum_depth, include_hidden_files = include_hidden_files, file_name_starts_with = ?file_name_starts_with, file_paths = ?file_paths, date_filter = ?date_filter, order_options = ?order_options, page = page, per_page = per_page, "handling list files request");
 
     let repo_path = state
         .config
@@ -436,6 +498,7 @@ pub async fn list_files(
             maximum_depth,
             include_hidden_files,
             file_name_starts_with.as_deref(),
+            file_paths.as_deref(),
             date_filter,
             order_options,
             page,
