@@ -70,10 +70,14 @@ use crate::validate;
 pub enum TreeNode {
     File {
         name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        position: Option<i64>,
     },
     Directory {
         name: String,
         children: Vec<TreeNode>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        position: Option<i64>,
     },
 }
 
@@ -82,7 +86,19 @@ impl TreeNode {
     /// a directory's stored order.
     fn name(&self) -> &str {
         match self {
-            Self::File { name } | Self::Directory { name, .. } => name,
+            Self::File { name, .. } | Self::Directory { name, .. } => name,
+        }
+    }
+
+    /// Attaches the entry's stored-order position to an ordered listing.
+    fn set_position(&mut self, position: i64) {
+        match self {
+            Self::File {
+                position: current, ..
+            }
+            | Self::Directory {
+                position: current, ..
+            } => *current = Some(position),
         }
     }
 }
@@ -701,7 +717,10 @@ impl GitUtils {
         // every level (the BTreeMap already yields names alphabetically).
         fn convert(name: String, node: NodeBuilder) -> TreeNode {
             match node {
-                NodeBuilder::File => TreeNode::File { name },
+                NodeBuilder::File => TreeNode::File {
+                    name,
+                    position: None,
+                },
                 NodeBuilder::Dir(children) => {
                     let mut dirs: Vec<TreeNode> = Vec::new();
                     let mut files: Vec<TreeNode> = Vec::new();
@@ -716,6 +735,7 @@ impl GitUtils {
                     TreeNode::Directory {
                         name,
                         children: dirs.into_iter().chain(files).collect(),
+                        position: None,
                     }
                 }
             }
@@ -1662,14 +1682,18 @@ impl GitFiles {
         let has_more = total > offset + per_page;
 
         enum RootEntry {
-            Directory(String, Oid),
-            File(String),
+            Directory(String, Oid, Option<i64>),
+            File(String, Option<i64>),
         }
 
         let mut root_entries: Vec<RootEntry> = root_dirs
             .into_iter()
-            .map(|(name, oid)| RootEntry::Directory(name, oid))
-            .chain(root_files.into_iter().map(RootEntry::File))
+            .map(|(name, oid)| RootEntry::Directory(name, oid, None))
+            .chain(
+                root_files
+                    .into_iter()
+                    .map(|name| RootEntry::File(name, None)),
+            )
             .collect();
 
         // The listing root's own order is applied *before* the page window is
@@ -1677,13 +1701,29 @@ impl GitFiles {
         // afterwards would page over the wrong sequence. Only one index is
         // read here; off-page directories are still never opened.
         if let Some(order_options) = order_options {
-            if let Some(order) = GitOrder::stored_order(&repo, &walk_tree, "") {
-                let ranks = Self::order_ranks(&order);
+            let order = GitOrder::stored_order(&repo, &walk_tree, "");
+            let ranks = order.as_deref().map(Self::order_ranks);
 
+            for root_entry in root_entries.iter_mut() {
+                let (name, position) = match root_entry {
+                    RootEntry::Directory(name, _, position) => (name.as_str(), position),
+                    RootEntry::File(name, position) => (name.as_str(), position),
+                };
+
+                *position = Some(
+                    ranks
+                        .as_ref()
+                        .and_then(|ranks| ranks.get(name))
+                        .copied()
+                        .unwrap_or(order::UNLISTED_POSITION),
+                );
+            }
+
+            if let Some(ranks) = ranks {
                 root_entries.sort_by_key(|root_entry| {
                     let name = match root_entry {
-                        RootEntry::Directory(name, _oid) => name.as_str(),
-                        RootEntry::File(name) => name.as_str(),
+                        RootEntry::Directory(name, _oid, _position) => name.as_str(),
+                        RootEntry::File(name, _position) => name.as_str(),
                     };
 
                     Self::order_rank(&ranks, name, &order_options)
@@ -1701,8 +1741,8 @@ impl GitFiles {
 
         for root_entry in page_entries {
             match root_entry {
-                RootEntry::File(name) => nodes.push(TreeNode::File { name }),
-                RootEntry::Directory(name, oid) => {
+                RootEntry::File(name, position) => nodes.push(TreeNode::File { name, position }),
+                RootEntry::Directory(name, oid, position) => {
                     // maximum_depth counts levels from the listing root, so a
                     // depth-1 listing renders every directory as a childless
                     // stub without opening its subtree.
@@ -1710,6 +1750,7 @@ impl GitFiles {
                         nodes.push(TreeNode::Directory {
                             name,
                             children: Vec::new(),
+                            position,
                         });
 
                         continue;
@@ -1723,7 +1764,11 @@ impl GitFiles {
                     let children =
                         Self::collect_subtree(&subtree, subtree_max_depth, include_hidden_files)?;
 
-                    nodes.push(TreeNode::Directory { name, children });
+                    nodes.push(TreeNode::Directory {
+                        name,
+                        children,
+                        position,
+                    });
                 }
             }
         }
@@ -1732,7 +1777,7 @@ impl GitFiles {
         // is ordered here, walking only the subtrees that made the page.
         if let Some(order_options) = order_options {
             for node in nodes.iter_mut() {
-                if let TreeNode::Directory { name, children } = node {
+                if let TreeNode::Directory { name, children, .. } = node {
                     Self::apply_order(&repo, &walk_tree, name, children, &order_options);
                 }
             }
@@ -1818,14 +1863,25 @@ impl GitFiles {
         // A directory with no index is left in its ordinary order, whatever
         // `implicit_default_index` says: with nothing listed, every entry is
         // implicit, so a common fallback index cannot reorder any of them.
-        if let Some(order) = GitOrder::stored_order(repo, base_tree, directory) {
-            let ranks = Self::order_ranks(&order);
+        let order = GitOrder::stored_order(repo, base_tree, directory);
+        let ranks = order.as_deref().map(Self::order_ranks);
 
+        for node in nodes.iter_mut() {
+            node.set_position(
+                ranks
+                    .as_ref()
+                    .and_then(|ranks| ranks.get(node.name()))
+                    .copied()
+                    .unwrap_or(order::UNLISTED_POSITION),
+            );
+        }
+
+        if let Some(ranks) = ranks {
             nodes.sort_by_key(|node| Self::order_rank(&ranks, node.name(), order_options));
         }
 
         for node in nodes.iter_mut() {
-            if let TreeNode::Directory { name, children } = node {
+            if let TreeNode::Directory { name, children, .. } = node {
                 let child_directory = if directory.is_empty() {
                     name.clone()
                 } else {

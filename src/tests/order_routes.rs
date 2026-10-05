@@ -36,6 +36,15 @@ fn names(nodes: &Value) -> Vec<String> {
         .collect()
 }
 
+fn positions(nodes: &Value) -> Vec<Option<i64>> {
+    nodes
+        .as_array()
+        .expect("listing level is not an array")
+        .iter()
+        .map(|node| node.get("position").and_then(Value::as_i64))
+        .collect()
+}
+
 /// Writes an order index for a directory and asserts it committed.
 async fn put_order(server: &TestServer, directory: &str, order: &[&str]) -> String {
     let response = server
@@ -352,6 +361,20 @@ async fn apply_order_index_orders_a_level_and_interleaves_kinds() {
         names(&plain["files"]),
         vec!["getting-started", "advanced.mdx", "intro.md", "zebra.md"]
     );
+    assert_eq!(positions(&plain["files"]), vec![None, None, None, None]);
+
+    let unindexed = server
+        .get(&format!(
+            "{}/files?prefix_path=/docs&apply_order_index=true",
+            TENANT
+        ))
+        .await
+        .json();
+
+    assert_eq!(
+        positions(&unindexed["files"]),
+        vec![Some(-1), Some(-1), Some(-1), Some(-1)]
+    );
 
     put_order(
         &server,
@@ -373,6 +396,10 @@ async fn apply_order_index_orders_a_level_and_interleaves_kinds() {
     assert_eq!(
         names(&ordered["files"]),
         vec!["intro.md", "getting-started", "advanced.mdx", "zebra.md"]
+    );
+    assert_eq!(
+        positions(&ordered["files"]),
+        vec![Some(0), Some(1), Some(2), Some(-1)]
     );
 }
 
