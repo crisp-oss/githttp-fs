@@ -1,6 +1,12 @@
 Changelog
 =========
 
+## v1.14.0
+
+### New Features
+
+* File listings using `apply_order_index=true` now report each entry's `position` in its directory's stored order, or `-1` when the entry is not explicitly ordered. The field is omitted when ordering is not requested, and reuses the indexes already read for sorting without additional Git reads.
+
 ## v1.13.0
 
 ### New Features
