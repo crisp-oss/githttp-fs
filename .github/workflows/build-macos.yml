@@ -1,0 +1,70 @@
+name: Build macOS Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Build macOS binary
+        id: build
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          asset="v${version}-macos-aarch64.zip"
+
+          cargo build --release --target aarch64-apple-darwin
+
+          mkdir package
+          cp target/aarch64-apple-darwin/release/githttp-fs package/
+          codesign --force --sign - package/githttp-fs
+          (cd package && zip "../$asset" githttp-fs)
+
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          for _ in {1..60}; do
+            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "Release $RELEASE_TAG was not created in time" >&2
+          exit 1
+
+      - name: Upload macOS binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: gh release upload "$RELEASE_TAG" "${{ steps.build.outputs.asset }}" --clobber
