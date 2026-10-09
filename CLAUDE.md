@@ -199,7 +199,7 @@ To bump the version to `vX.Y.Z`:
 git log --oneline $(git describe --tags --abbrev=0)..HEAD
 ```
 
-Do not add a changelog section for an unreleased version, and do not add entries to it while working on changes: a section only exists once its version number has been decided and the release is being cut. Entries describe what the change means to an API user or operator (a new route, a new parameter, a changed response, a new config key), not the commit messages; housekeeping commits with no user-visible effect (Pawfile bumps, formatting passes, comment-only changes) are not listed. Entries for a version that was released with no notes are filled in from its commits in the same way.
+Do not add a changelog section for an unreleased version, and do not add entries to it while working on changes: a section only exists once its version number has been decided and the release is being cut. Entries describe what the change means to an API user or operator (a new route, a new parameter, a changed response, a new config key), not the commit messages; housekeeping commits with no user-visible effect (formatting passes, comment-only changes) are not listed. Entries for a version that was released with no notes are filled in from its commits in the same way.
 
 ### Format
 
