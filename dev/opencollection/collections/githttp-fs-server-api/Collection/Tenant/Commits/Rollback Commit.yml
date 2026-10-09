@@ -13,7 +13,13 @@ http:
       value: "{{authorization}}"
   body:
     type: json
-    data: '{"author":{"name":"{{author_name}}","email":"{{author_email}}"}}'
+    data: |-
+      {
+        "author": {
+          "name": "{{author_name}}",
+          "email": "{{author_email}}"
+        }
+      }
   auth: inherit
 
 settings:
