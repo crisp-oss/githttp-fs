@@ -1,0 +1,60 @@
+info:
+  name: List Files
+  type: http
+  seq: 1
+
+http:
+  method: GET
+  url: "{{endpoint}}/{{collection}}/{{tenant_id}}/files?prefix_path={{base_path}}&maximum_depth=1"
+  headers:
+    - name: Authorization
+      value: "{{authorization}}"
+  params:
+    - name: prefix_path
+      value: "{{base_path}}"
+      type: query
+    - name: maximum_depth
+      value: "1"
+      type: query
+    - name: apply_order_index
+      value: "true"
+      type: query
+      disabled: true
+    - name: implicit_order_default_index
+      value: "-1"
+      type: query
+      disabled: true
+    - name: include_hidden_files
+      value: "true"
+      type: query
+      disabled: true
+    - name: include_date_type
+      value: updated
+      type: query
+      disabled: true
+    - name: include_date_from
+      value: 2026-09-20T10:00:00.000Z
+      type: query
+      disabled: true
+    - name: include_date_to
+      value: 2026-12-01T10:00:00.000Z
+      type: query
+      disabled: true
+    - name: file_name_starts_with
+      value: '["how-to"]'
+      type: query
+      disabled: true
+    - name: file_paths
+      value: '["how-to-use-crisp.md"]'
+      type: query
+      disabled: true
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: false
+  maxRedirects: 5
+  forwardAuthorizationHeader: false
+
+docs: List all tracked files (path + size)

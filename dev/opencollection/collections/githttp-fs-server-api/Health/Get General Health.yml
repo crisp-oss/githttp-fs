@@ -1,0 +1,18 @@
+info:
+  name: Get General Health
+  type: http
+  seq: 1
+
+http:
+  method: GET
+  url: "{{endpoint}}/_health/status"
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: false
+  maxRedirects: 5
+  forwardAuthorizationHeader: false
+
+docs: Acquires the general health status of the server (public route).

@@ -1,0 +1,25 @@
+info:
+  name: Check File
+  type: http
+  seq: 2
+
+http:
+  method: HEAD
+  url: "{{endpoint}}/{{collection}}/{{tenant_id}}/files/{{file_path}}?check_prefix_path=true"
+  headers:
+    - name: Authorization
+      value: "{{authorization}}"
+  params:
+    - name: check_prefix_path
+      value: "true"
+      type: query
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: false
+  maxRedirects: 5
+  forwardAuthorizationHeader: false
+
+docs: Read a file's raw content

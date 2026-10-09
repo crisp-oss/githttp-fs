@@ -1,0 +1,34 @@
+info:
+  name: Move File
+  type: http
+  seq: 5
+
+http:
+  method: POST
+  url: "{{endpoint}}/{{collection}}/{{tenant_id}}/files/{{file_path}}/move"
+  headers:
+    - name: Content-Type
+      value: application/json
+    - name: Authorization
+      value: "{{authorization}}"
+  body:
+    type: json
+    data: |-
+      {
+        "author": {
+          "name": "{{author_name}}",
+          "email": "{{author_email}}"
+        },
+        "destination": "en/articles/test-from-md/fourth-md-test/index.md",
+        "allow_prefix_path_recurse": true
+      }
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: false
+  maxRedirects: 5
+  forwardAuthorizationHeader: false
+
+docs: Move / rename a file

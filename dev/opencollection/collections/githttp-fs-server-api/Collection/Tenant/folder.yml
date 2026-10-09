@@ -1,0 +1,22 @@
+info:
+  name: Tenant
+  type: folder
+  seq: 1
+
+request:
+  auth: inherit
+  variables:
+    - name: tenant_id
+      value: 66811aaf-e406-43eb-ab95-599375c14432
+    - name: base_path
+      value: en/articles
+    - name: directory_path
+      value: "{{base_path}}"
+    - name: file_name
+      value: why-should-i-integrate-shopify-flow-with-nabu-for-the-amazon-feed-app.md
+    - name: file_path
+      value: "{{directory_path}}/{{file_name}}"
+    - name: author_name
+      value: Valerian Saliou
+    - name: author_email
+      value: valerian@valeriansaliou.name

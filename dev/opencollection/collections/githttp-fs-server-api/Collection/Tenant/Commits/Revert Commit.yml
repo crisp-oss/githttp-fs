@@ -1,0 +1,32 @@
+info:
+  name: Revert Commit
+  type: http
+  seq: 3
+
+http:
+  method: POST
+  url: "{{endpoint}}/{{collection}}/{{tenant_id}}/commits/{{commit_sha}}/revert"
+  headers:
+    - name: Content-Type
+      value: application/json
+    - name: Authorization
+      value: "{{authorization}}"
+  body:
+    type: json
+    data: |-
+      {
+        "author": {
+          "name": "{{author_name}}",
+          "email": "{{author_email}}"
+        }
+      }
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: false
+  maxRedirects: 5
+  forwardAuthorizationHeader: false
+
+docs: Revert a commit

@@ -1,0 +1,59 @@
+info:
+  name: Batch Read Files
+  type: http
+  seq: 1
+
+http:
+  method: POST
+  url: "{{endpoint}}/{{collection}}/{{tenant_id}}/batch/files/read"
+  headers:
+    - name: Content-Type
+      value: application/json
+    - name: Authorization
+      value: "{{authorization}}"
+  params:
+    - name: seek_from_line_starts_with
+      value: '["---", "+++"]'
+      type: query
+      disabled: true
+    - name: seek_to_line_starts_with
+      value: $seek_from_line_starts_with
+      type: query
+      disabled: true
+    - name: seek_lines_maximum
+      value: "100"
+      type: query
+      disabled: true
+  body:
+    type: json
+    data: |-
+      {
+        "files": [
+          "{{file_path}}",
+          "this/file/does/not/exist.md",
+          {
+            "path": "this/file/has/custom/path.md",
+            "seek": {
+              "lines_maximum": 10
+            }
+          }
+        ],
+        "seek": {
+          "from_line_starts_with": [
+            "---",
+            "+++"
+          ],
+          "to_line_starts_with": "$seek_from_line_starts_with",
+          "lines_maximum": 100
+        }
+      }
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: false
+  maxRedirects: 5
+  forwardAuthorizationHeader: false
+
+docs: Read multiple files raw content

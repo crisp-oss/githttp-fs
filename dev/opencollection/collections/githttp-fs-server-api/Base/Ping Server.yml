@@ -1,0 +1,21 @@
+info:
+  name: Ping Server
+  type: http
+  seq: 1
+
+http:
+  method: GET
+  url: "{{endpoint}}"
+  headers:
+    - name: Authorization
+      value: "{{authorization}}"
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: false
+  maxRedirects: 5
+  forwardAuthorizationHeader: false
+
+docs: Check if Git HTTP FS server is up and authentication works OK.

@@ -1,0 +1,21 @@
+info:
+  name: Delete Repository
+  type: http
+  seq: 1
+
+http:
+  method: DELETE
+  url: "{{endpoint}}/{{collection}}/{{tenant_id}}"
+  headers:
+    - name: Authorization
+      value: "{{authorization}}"
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: false
+  maxRedirects: 5
+  forwardAuthorizationHeader: false
+
+docs: Delete an entire tenant repository

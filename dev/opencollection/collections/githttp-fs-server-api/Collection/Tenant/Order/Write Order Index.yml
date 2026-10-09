@@ -1,0 +1,36 @@
+info:
+  name: Write Order Index
+  type: http
+  seq: 2
+
+http:
+  method: PUT
+  url: "{{endpoint}}/{{collection}}/{{tenant_id}}/order/{{directory_path}}"
+  headers:
+    - name: Content-Type
+      value: application/json
+    - name: Authorization
+      value: "{{authorization}}"
+  body:
+    type: json
+    data: |-
+      {
+        "author": {
+          "name": "{{author_name}}",
+          "email": "{{author_email}}"
+        },
+        "order": [
+          "how-to-import-export-analytics-dashboards.md",
+          "how-to-create-custom-analytics-reports-with-the-analytics-dashboard.md"
+        ]
+      }
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: false
+  maxRedirects: 5
+  forwardAuthorizationHeader: false
+
+docs: Write a directory files order index

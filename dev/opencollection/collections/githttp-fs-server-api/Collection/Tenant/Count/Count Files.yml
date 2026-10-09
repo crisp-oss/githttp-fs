@@ -1,0 +1,38 @@
+info:
+  name: Count Files
+  type: http
+  seq: 1
+
+http:
+  method: GET
+  url: "{{endpoint}}/{{collection}}/{{tenant_id}}/count/files"
+  headers:
+    - name: Authorization
+      value: "{{authorization}}"
+  params:
+    - name: prefix_path
+      value: /en
+      type: query
+      disabled: true
+    - name: maximum_depth
+      value: "10"
+      type: query
+      disabled: true
+    - name: include_hidden_files
+      value: "true"
+      type: query
+      disabled: true
+    - name: restrict_file_extensions
+      value: '["md", "mdx"]'
+      type: query
+      disabled: true
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: false
+  maxRedirects: 5
+  forwardAuthorizationHeader: false
+
+docs: List all tracked files (path + size)

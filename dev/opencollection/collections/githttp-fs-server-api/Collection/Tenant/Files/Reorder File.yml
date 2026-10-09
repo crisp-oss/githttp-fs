@@ -1,0 +1,35 @@
+info:
+  name: Reorder File
+  type: http
+  seq: 6
+
+http:
+  method: POST
+  url: "{{endpoint}}/{{collection}}/{{tenant_id}}/files/{{file_path}}/reorder"
+  headers:
+    - name: Content-Type
+      value: application/json
+    - name: Authorization
+      value: "{{authorization}}"
+  body:
+    type: json
+    data: |-
+      {
+        "author": {
+          "name": "{{author_name}}",
+          "email": "{{author_email}}"
+        },
+        "position": 0,
+        "allow_prefix_path": true,
+        "implicit_order_default_index": -1
+      }
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: false
+  maxRedirects: 5
+  forwardAuthorizationHeader: false
+
+docs: Re-order a file or folder in its parent (using a numerical position)

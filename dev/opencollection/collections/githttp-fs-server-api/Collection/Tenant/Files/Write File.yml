@@ -1,0 +1,33 @@
+info:
+  name: Write File
+  type: http
+  seq: 4
+
+http:
+  method: PUT
+  url: "{{endpoint}}/{{collection}}/{{tenant_id}}/files/{{file_path}}"
+  headers:
+    - name: Content-Type
+      value: application/json
+    - name: Authorization
+      value: "{{authorization}}"
+  body:
+    type: json
+    data: |-
+      {
+        "author": {
+          "name": "{{author_name}}",
+          "email": "{{author_email}}"
+        },
+        "content": "title = \"Category Name\"\ndescription = \"Install the Mailchimp plugin from the Crisp Dashboard.\"\npublished = true\nhidden = false\nfeatured = false"
+      }
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: false
+  maxRedirects: 5
+  forwardAuthorizationHeader: false
+
+docs: Create or update a file

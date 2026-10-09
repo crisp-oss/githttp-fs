@@ -1,0 +1,12 @@
+opencollection: 1.0.0
+info:
+  name: "githttp-fs-api"
+  type: workspace
+
+collections:
+  - name: "GitHTTP FS (Server API)"
+    path: "collections/githttp-fs-server-api"
+
+specs:
+
+docs: ''

@@ -1,0 +1,35 @@
+info:
+  name: List Commits
+  type: http
+  seq: 1
+
+http:
+  method: GET
+  url: "{{endpoint}}/{{collection}}/{{tenant_id}}/commits?page=1&per_page=20&include_statistics=true"
+  headers:
+    - name: Authorization
+      value: "{{authorization}}"
+  params:
+    - name: page
+      value: "1"
+      type: query
+    - name: per_page
+      value: "20"
+      type: query
+    - name: file_path
+      value: en/articles/why-should-i-integrate-shopify-flow-with-nabu-for-the-amazon-feed-app.md
+      type: query
+      disabled: true
+    - name: include_statistics
+      value: "true"
+      type: query
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: false
+  maxRedirects: 5
+  forwardAuthorizationHeader: false
+
+docs: List commits (paged, ?page=&per_page=)

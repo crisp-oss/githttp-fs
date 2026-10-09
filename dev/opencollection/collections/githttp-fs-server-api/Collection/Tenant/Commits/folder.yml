@@ -1,0 +1,10 @@
+info:
+  name: Commits
+  type: folder
+  seq: 5
+
+request:
+  auth: inherit
+  variables:
+    - name: commit_sha
+      value: 56909d236f913562c30ccede868ee01b4204644f
