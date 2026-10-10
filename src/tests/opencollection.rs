@@ -33,17 +33,6 @@ use yaml_rust2::{Yaml, YamlLoader};
 const COLLECTION: &str = "dev/opencollection/collections/githttp-fs-server-api";
 const ENDPOINT: &str = "{{endpoint}}";
 
-/// Routes deliberately left out of the collection. The repository root's
-/// order index has routes of its own only because axum's `{*path}` wildcard
-/// needs at least one segment; they share their implementation with the
-/// `/order/{*path}` routes, so a second set of requests would only duplicate
-/// those. Each entry is still checked to exist, so a stale one fails too.
-const NOT_IN_COLLECTION: &[(&str, &str)] = &[
-    ("GET", "/{collection_id}/{tenant_id}/order"),
-    ("PUT", "/{collection_id}/{tenant_id}/order"),
-    ("DELETE", "/{collection_id}/{tenant_id}/order"),
-];
-
 /// A request struct's wire fields, each mapped to whether a caller may leave
 /// it out (`Option<…>` or `#[serde(default)]`).
 type Fields = BTreeMap<String, bool>;
@@ -708,28 +697,10 @@ fn collection_mirrors_the_api() {
     for operation in &operations {
         let key = (operation.method.as_str(), operation.path.as_str());
 
-        if !covered.contains(&key) && !NOT_IN_COLLECTION.contains(&key) {
+        if !covered.contains(&key) {
             problems.push(format!(
                 "{} {} has no request in the collection",
                 operation.method, operation.path
-            ));
-        }
-    }
-
-    for (method, path) in NOT_IN_COLLECTION {
-        let served = operations
-            .iter()
-            .any(|operation| operation.method == *method && operation.path == *path);
-
-        if !served {
-            problems.push(format!(
-                "{} {} is listed in NOT_IN_COLLECTION, but the API no longer serves it",
-                method, path
-            ));
-        } else if covered.contains(&(*method, *path)) {
-            problems.push(format!(
-                "{} {} is listed in NOT_IN_COLLECTION, but the collection has a request for it",
-                method, path
             ));
         }
     }

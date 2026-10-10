@@ -1,0 +1,30 @@
+info:
+  name: Read Root Order Index
+  type: http
+  seq: 4
+  tags:
+    - read
+
+http:
+  method: GET
+  url: "{{endpoint}}/{{collection}}/{{tenant_id}}/order"
+  auth: inherit
+
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.directory
+      operator: isEmpty
+    - expression: res.body.order
+      operator: isArray
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: false
+  maxRedirects: 5
+  forwardAuthorizationHeader: false
+
+docs: Read the repository root's files order index

@@ -1,0 +1,38 @@
+info:
+  name: Delete Root Order Index
+  type: http
+  seq: 6
+  tags:
+    - destructive
+
+http:
+  method: DELETE
+  url: "{{endpoint}}/{{collection}}/{{tenant_id}}/order"
+  body:
+    type: json
+    data: |-
+      {
+        "author": {
+          "name": "{{author_name}}",
+          "email": "{{author_email}}"
+        }
+        // "message": "Delete order index from API client"
+      }
+  auth: inherit
+
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.commit_sha
+      operator: isString
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: false
+  maxRedirects: 5
+  forwardAuthorizationHeader: false
+
+docs: Delete the repository root's files order index

@@ -1,0 +1,42 @@
+info:
+  name: Write Root Order Index
+  type: http
+  seq: 5
+  tags:
+    - write
+
+http:
+  method: PUT
+  url: "{{endpoint}}/{{collection}}/{{tenant_id}}/order"
+  body:
+    type: json
+    data: |-
+      {
+        "author": {
+          "name": "{{author_name}}",
+          "email": "{{author_email}}"
+        },
+        "order": [
+          "en/"
+        ]
+        // "allow_hidden_files": true,
+        // "message": "Write order index from API client"
+      }
+  auth: inherit
+
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.commit_sha
+      operator: isString
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: false
+  maxRedirects: 5
+  forwardAuthorizationHeader: false
+
+docs: Write the repository root's files order index
