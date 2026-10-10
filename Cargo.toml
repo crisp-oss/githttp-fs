@@ -38,6 +38,8 @@ clap = { version = "4", features = ["derive"] }
 [dev-dependencies]
 # Isolated repository stores per test, cleaned up when the test ends.
 tempfile = "3"
+# Parses the OpenCollection request files the API-coverage test checks.
+yaml-rust2 = "0.13"
 
 [profile.dev]
 opt-level = 0

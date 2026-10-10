@@ -11,6 +11,8 @@
 //! [`config`], [`traverse`]), and everything whose contract is an HTTP
 //! contract is tested through a real server on a real socket (see
 //! [`harness`]).
+//! One module tests no code at all: [`opencollection`] checks that the API
+//! client collection in `dev/opencollection/` still mirrors the router.
 //!
 //! The behaviour asserted here is the behaviour documented in `API.md`.
 //! Where a test's expectation looks surprising, the documented rule it comes
@@ -27,6 +29,7 @@ mod files;
 mod fixture;
 mod hooks;
 mod maintenance;
+mod opencollection;
 mod order_index;
 mod order_routes;
 mod prefix_path;
