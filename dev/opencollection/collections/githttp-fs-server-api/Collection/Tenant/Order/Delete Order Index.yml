@@ -6,9 +6,6 @@ info:
 http:
   method: DELETE
   url: "{{endpoint}}/{{collection}}/{{tenant_id}}/order/{{directory_path}}"
-  headers:
-    - name: Content-Type
-      value: application/json
   body:
     type: json
     data: |-

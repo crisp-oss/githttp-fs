@@ -6,9 +6,6 @@ info:
 http:
   method: POST
   url: "{{endpoint}}/{{collection}}/{{tenant_id}}/commits/{{commit_sha}}/rollback"
-  headers:
-    - name: Content-Type
-      value: application/json
   body:
     type: json
     data: |-

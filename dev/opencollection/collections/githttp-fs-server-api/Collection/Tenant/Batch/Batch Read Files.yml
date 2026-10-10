@@ -6,9 +6,6 @@ info:
 http:
   method: POST
   url: "{{endpoint}}/{{collection}}/{{tenant_id}}/batch/files/read"
-  headers:
-    - name: Content-Type
-      value: application/json
   params:
     - name: seek_from_line_starts_with
       value: '["---", "+++"]'
