@@ -2,6 +2,8 @@ info:
   name: Rollback Commit
   type: http
   seq: 4
+  tags:
+    - destructive
 
 http:
   method: POST
@@ -14,6 +16,7 @@ http:
           "name": "{{author_name}}",
           "email": "{{author_email}}"
         }
+        // "message": "Roll back commit from API client"
       }
   auth: inherit
 
@@ -24,4 +27,4 @@ settings:
   maxRedirects: 5
   forwardAuthorizationHeader: false
 
-docs: Revert a commit
+docs: Roll the files a commit touched back to the state they had at that commit

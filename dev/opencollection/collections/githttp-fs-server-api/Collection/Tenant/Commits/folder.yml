@@ -8,3 +8,5 @@ request:
   variables:
     - name: commit_sha
       value: 56909d236f913562c30ccede868ee01b4204644f
+
+docs: Commit history. List and read commits, revert one, or roll its files back to that point. Sets commit_sha.

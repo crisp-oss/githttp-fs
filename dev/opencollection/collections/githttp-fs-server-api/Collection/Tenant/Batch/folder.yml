@@ -5,3 +5,5 @@ info:
 
 request:
   auth: inherit
+
+docs: Multi-file operations, a batch read and the webhook replay used to reconcile a downstream mirror.

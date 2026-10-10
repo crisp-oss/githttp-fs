@@ -2,31 +2,21 @@ info:
   name: Batch Hook Replay
   type: http
   seq: 2
+  tags:
+    - destructive
 
 http:
   method: POST
   url: "{{endpoint}}/{{collection}}/{{tenant_id}}/batch/replay/hook"
-  params:
-    - name: seek_from_line_starts_with
-      value: '["---", "+++"]'
-      type: query
-      disabled: true
-    - name: seek_to_line_starts_with
-      value: $seek_from_line_starts_with
-      type: query
-      disabled: true
-    - name: seek_lines_maximum
-      value: "100"
-      type: query
-      disabled: true
   body:
     type: json
     data: |-
       {
-        "direction": "create",
-        "delay_ms": 200,
-        "include_hidden_files": true,
-        "prefix_path": "{{directory_path}}"
+        "direction": "create"
+        // "files": ["{{file_path}}"],
+        // "prefix_path": "{{directory_path}}",
+        // "include_hidden_files": true,
+        // "delay_ms": 200
       }
   auth: inherit
 
@@ -37,4 +27,4 @@ settings:
   maxRedirects: 5
   forwardAuthorizationHeader: false
 
-docs: Re-play hooks for deletions, based on list of files the external state has
+docs: Replay file hooks to reconcile a downstream mirror with the files it holds

@@ -2,6 +2,8 @@ info:
   name: Read File
   type: http
   seq: 3
+  tags:
+    - read
 
 http:
   method: GET
@@ -9,14 +11,17 @@ http:
   params:
     - name: seek_from_line_starts_with
       value: '["---", "+++"]'
+      description: Start the window at the first line starting with any of these prefixes (JSON array)
       type: query
       disabled: true
     - name: seek_to_line_starts_with
       value: $seek_from_line_starts_with
+      description: End the window at the next line starting with any of these prefixes (JSON array), or $seek_from_line_starts_with for the marker that opened it
       type: query
       disabled: true
     - name: seek_lines_maximum
       value: "100"
+      description: Cap the window to this many lines (at least 1)
       type: query
       disabled: true
   auth: inherit

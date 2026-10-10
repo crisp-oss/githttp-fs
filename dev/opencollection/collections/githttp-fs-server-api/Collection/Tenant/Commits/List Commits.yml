@@ -2,6 +2,8 @@ info:
   name: List Commits
   type: http
   seq: 1
+  tags:
+    - read
 
 http:
   method: GET
@@ -9,16 +11,20 @@ http:
   params:
     - name: page
       value: "1"
+      description: Page number, from 1
       type: query
     - name: per_page
       value: "20"
+      description: Commits per page (default 100, max 500)
       type: query
     - name: file_path
-      value: en/articles/why-should-i-integrate-shopify-flow-with-nabu-for-the-amazon-feed-app.md
+      value: "{{file_path}}"
+      description: Only commits touching this file, following renames backward
       type: query
       disabled: true
     - name: include_statistics
       value: "true"
+      description: Add per-commit insertion, deletion and files-changed counts
       type: query
   auth: inherit
 

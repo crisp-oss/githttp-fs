@@ -2,6 +2,8 @@ info:
   name: Read Commit
   type: http
   seq: 2
+  tags:
+    - read
 
 http:
   method: GET
@@ -15,4 +17,4 @@ settings:
   maxRedirects: 5
   forwardAuthorizationHeader: false
 
-docs: List commits (paged, ?page=&per_page=)
+docs: Read a commit, with its per-file diffs and snapshots

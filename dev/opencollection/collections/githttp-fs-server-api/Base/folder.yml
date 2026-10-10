@@ -5,3 +5,5 @@ info:
 
 request:
   auth: inherit
+
+docs: The authenticated API root, to check that the API key works.

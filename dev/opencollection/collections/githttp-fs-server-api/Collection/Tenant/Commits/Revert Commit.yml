@@ -2,6 +2,8 @@ info:
   name: Revert Commit
   type: http
   seq: 3
+  tags:
+    - destructive
 
 http:
   method: POST
@@ -14,6 +16,7 @@ http:
           "name": "{{author_name}}",
           "email": "{{author_email}}"
         }
+        // "message": "Revert commit from API client"
       }
   auth: inherit
 

@@ -5,3 +5,5 @@ info:
 
 request:
   auth: inherit
+
+docs: The per-directory file order index (.order.json), read and written as a whole.

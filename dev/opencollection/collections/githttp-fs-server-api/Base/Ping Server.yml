@@ -2,6 +2,8 @@ info:
   name: Ping Server
   type: http
   seq: 1
+  tags:
+    - read
 
 http:
   method: GET

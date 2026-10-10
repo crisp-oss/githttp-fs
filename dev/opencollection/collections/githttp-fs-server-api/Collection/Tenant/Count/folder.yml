@@ -5,3 +5,5 @@ info:
 
 request:
   auth: inherit
+
+docs: File and directory counts, with the listing's scoping options.

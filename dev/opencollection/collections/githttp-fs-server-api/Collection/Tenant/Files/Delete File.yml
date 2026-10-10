@@ -2,6 +2,8 @@ info:
   name: Delete File
   type: http
   seq: 7
+  tags:
+    - destructive
 
 http:
   method: DELETE
@@ -13,8 +15,9 @@ http:
         "author": {
           "name": "{{author_name}}",
           "email": "{{author_email}}"
-        },
-        "allow_prefix_path_recurse": true
+        }
+        // "message": "Delete file from API client",
+        // "allow_prefix_path_recurse": true
       }
   auth: inherit
 

@@ -2,6 +2,8 @@ info:
   name: Move File
   type: http
   seq: 5
+  tags:
+    - write
 
 http:
   method: POST
@@ -14,8 +16,9 @@ http:
           "name": "{{author_name}}",
           "email": "{{author_email}}"
         },
-        "destination": "en/articles/test-from-md/fourth-md-test/index.md",
-        "allow_prefix_path_recurse": true
+        "destination": "{{directory_path}}/moved-{{file_name}}"
+        // "message": "Move file from API client",
+        // "allow_prefix_path_recurse": true
       }
   auth: inherit
 

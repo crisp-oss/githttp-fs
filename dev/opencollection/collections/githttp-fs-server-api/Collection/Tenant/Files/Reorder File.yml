@@ -2,6 +2,8 @@ info:
   name: Reorder File
   type: http
   seq: 6
+  tags:
+    - write
 
 http:
   method: POST
@@ -14,9 +16,11 @@ http:
           "name": "{{author_name}}",
           "email": "{{author_email}}"
         },
-        "position": 0,
-        "allow_prefix_path": true,
-        "implicit_order_default_index": -1
+        "position": 0
+        // "implicit_order_default_index": -1,
+        // "implicit_allow_hidden_files": true,
+        // "message": "Reorder file from API client",
+        // "allow_prefix_path": true
       }
   auth: inherit
 

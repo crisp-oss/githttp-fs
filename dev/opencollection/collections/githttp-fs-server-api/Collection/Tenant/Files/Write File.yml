@@ -2,6 +2,8 @@ info:
   name: Write File
   type: http
   seq: 4
+  tags:
+    - write
 
 http:
   method: PUT
@@ -15,6 +17,7 @@ http:
           "email": "{{author_email}}"
         },
         "content": "title = \"Category Name\"\ndescription = \"Install the Mailchimp plugin from the Crisp Dashboard.\"\npublished = true\nhidden = false\nfeatured = false"
+        // "message": "Write file from API client"
       }
   auth: inherit
 

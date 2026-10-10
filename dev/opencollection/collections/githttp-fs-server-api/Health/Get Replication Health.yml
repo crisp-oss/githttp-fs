@@ -2,6 +2,9 @@ info:
   name: Get Replication Health
   type: http
   seq: 2
+  tags:
+    - read
+    - public
 
 http:
   method: GET

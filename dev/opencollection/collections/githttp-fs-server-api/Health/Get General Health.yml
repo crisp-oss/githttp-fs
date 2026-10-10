@@ -2,6 +2,9 @@ info:
   name: Get General Health
   type: http
   seq: 1
+  tags:
+    - read
+    - public
 
 http:
   method: GET

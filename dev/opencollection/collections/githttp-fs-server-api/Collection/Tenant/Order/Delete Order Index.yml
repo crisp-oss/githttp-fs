@@ -2,6 +2,8 @@ info:
   name: Delete Order Index
   type: http
   seq: 3
+  tags:
+    - destructive
 
 http:
   method: DELETE
@@ -13,8 +15,8 @@ http:
         "author": {
           "name": "{{author_name}}",
           "email": "{{author_email}}"
-        },
-        "allow_prefix_path_recurse": true
+        }
+        // "message": "Delete order index from API client"
       }
   auth: inherit
 

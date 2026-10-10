@@ -2,6 +2,8 @@ info:
   name: Delete Repository
   type: http
   seq: 1
+  tags:
+    - destructive
 
 http:
   method: DELETE

@@ -2,6 +2,8 @@ info:
   name: Read Order Index
   type: http
   seq: 1
+  tags:
+    - read
 
 http:
   method: GET

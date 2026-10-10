@@ -2,6 +2,8 @@ info:
   name: Write Order Index
   type: http
   seq: 2
+  tags:
+    - write
 
 http:
   method: PUT
@@ -18,6 +20,8 @@ http:
           "how-to-import-export-analytics-dashboards.md",
           "how-to-create-custom-analytics-reports-with-the-analytics-dashboard.md"
         ]
+        // "allow_hidden_files": true,
+        // "message": "Write order index from API client"
       }
   auth: inherit
 

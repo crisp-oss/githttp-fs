@@ -20,3 +20,5 @@ request:
       value: Valerian Saliou
     - name: author_email
       value: valerian@valeriansaliou.name
+
+docs: Routes scoped to one tenant repository. Sets tenant_id, the file and directory paths, and the commit author every request below uses.

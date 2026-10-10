@@ -5,3 +5,5 @@ info:
 
 request:
   auth: inherit
+
+docs: Read, check, write, move, reorder and delete files. The .order.json index is invisible to every route here.

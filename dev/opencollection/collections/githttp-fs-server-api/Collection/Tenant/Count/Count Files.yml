@@ -2,6 +2,8 @@ info:
   name: Count Files
   type: http
   seq: 1
+  tags:
+    - read
 
 http:
   method: GET
@@ -9,18 +11,22 @@ http:
   params:
     - name: prefix_path
       value: /en
+      description: Scope the count to a sub-directory
       type: query
       disabled: true
     - name: maximum_depth
       value: "10"
+      description: How many directory levels deep to count
       type: query
       disabled: true
     - name: include_hidden_files
       value: "true"
+      description: Count dot-prefixed entries (default false)
       type: query
       disabled: true
     - name: restrict_file_extensions
       value: '["md", "mdx"]'
+      description: Only count files with one of these extensions (JSON array)
       type: query
       disabled: true
   auth: inherit
@@ -32,4 +38,4 @@ settings:
   maxRedirects: 5
   forwardAuthorizationHeader: false
 
-docs: List all tracked files (path + size)
+docs: Count files and directories

@@ -2,23 +2,12 @@ info:
   name: Batch Read Files
   type: http
   seq: 1
+  tags:
+    - read
 
 http:
   method: POST
   url: "{{endpoint}}/{{collection}}/{{tenant_id}}/batch/files/read"
-  params:
-    - name: seek_from_line_starts_with
-      value: '["---", "+++"]'
-      type: query
-      disabled: true
-    - name: seek_to_line_starts_with
-      value: $seek_from_line_starts_with
-      type: query
-      disabled: true
-    - name: seek_lines_maximum
-      value: "100"
-      type: query
-      disabled: true
   body:
     type: json
     data: |-
@@ -32,15 +21,12 @@ http:
               "lines_maximum": 10
             }
           }
-        ],
-        "seek": {
-          "from_line_starts_with": [
-            "---",
-            "+++"
-          ],
-          "to_line_starts_with": "$seek_from_line_starts_with",
-          "lines_maximum": 100
-        }
+        ]
+        // "seek": {
+        //   "from_line_starts_with": ["---", "+++"],
+        //   "to_line_starts_with": "$seek_from_line_starts_with",
+        //   "lines_maximum": 100
+        // }
       }
   auth: inherit
 

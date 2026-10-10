@@ -8,3 +8,5 @@ request:
   variables:
     - name: collection
       value: helpdesk
+
+docs: Routes scoped to one collection. Sets collection.

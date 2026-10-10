@@ -5,3 +5,5 @@ info:
 
 request:
   auth: inherit
+
+docs: Public health routes under /_health. They need no API key, so they answer even when the credential is in doubt.

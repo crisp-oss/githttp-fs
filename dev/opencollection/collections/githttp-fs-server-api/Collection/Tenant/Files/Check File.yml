@@ -2,6 +2,8 @@ info:
   name: Check File
   type: http
   seq: 2
+  tags:
+    - read
 
 http:
   method: HEAD
@@ -9,6 +11,7 @@ http:
   params:
     - name: check_prefix_path
       value: "true"
+      description: Count a folder at this path as existing too (default false)
       type: query
   auth: inherit
 
@@ -19,4 +22,4 @@ settings:
   maxRedirects: 5
   forwardAuthorizationHeader: false
 
-docs: Read a file's raw content
+docs: Check that a file exists (or a folder, with check_prefix_path)
