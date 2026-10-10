@@ -25,6 +25,11 @@ checkout_files = true
 # HEAD no longer names, so it is opt-in (enable it for one restart when you
 # need the repair). Inert when checkout_files is off.
 checkout_files_autoheal = false
+# The content API endpoints (…/v1) of the other nodes in this deployment,
+# pinged by GET /v1/ping/all with this node's api_key. No node otherwise knows
+# its peers' content API addresses, so they are listed here. Defaults to [],
+# which makes that route ping this node alone.
+# peer_endpoints = ["http://replica.internal:5355/v1"]
 
 [limits]              # optional; request-level guard rails
 # Optional whitelist of file extensions (compared case-insensitively) accepted

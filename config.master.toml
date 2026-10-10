@@ -25,6 +25,9 @@ api_key = "MySecretAPIKey"
 repos_path = "./dev/repositories/master"
 log_level = "debug"
 
+# The replica's content API, pinged by GET /v1/ping/all.
+peer_endpoints = ["http://localhost:5365/v1"]
+
 [limits]
 
 allowed_extensions = ["html", "txt", "toml", "json", "md", "mdx"]

@@ -9,6 +9,7 @@ All routes are prefixed `/v1` and require `Authorization: Bearer <api_key>` — 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/v1` | Check that the API key is valid (`200` with body `{ "pong": true }`, or `401`) |
+| `GET` | `/v1/ping/all` | Ping this node and every node in `server.peer_endpoints`, reporting each answer |
 | `GET` | `/v1/_health/status` | **No auth.** Basic server status: name, version, role, whether this node accepts writes, uptime |
 | `GET` | `/v1/_health/replication` | **No auth.** Replication status: this node's role, the master's health, and every replica following it. Answers on every node, including a standalone one |
 | `DELETE` | `/v1/:collection_id/:tenant_id` | Delete entire tenant repository |
@@ -228,6 +229,20 @@ One assumption the `create` direction makes about the receiver: since its replay
 { "pong": true }
 ```
 Touches no tenant or repository state — safe as a credential probe or liveness check for monitors that hold the key.
+
+**GET** `/v1/ping/all` — broadcast ping. Sends `GET /v1` to every endpoint listed in `server.peer_endpoints` concurrently, authenticated with this node's own `api_key` (a deployment shares one), and answers with this node's own ping body next to each peer's:
+```json
+{
+  "pong": true,
+  "self": { "pong": true },
+  "servers": [
+    { "endpoint": "http://replica.internal:5355/v1", "pong": true, "status": 200, "response": { "pong": true, "replica": { "state": "ready" } } },
+    { "endpoint": "http://replica-2.internal:5355/v1", "pong": false, "status": null, "error": "error sending request" }
+  ]
+}
+```
+
+Always `200` once this node is reached: a peer that is down, times out (after five seconds), or answers anything but `200` is reported in its own entry with `pong: false` — `status` is its HTTP status, or `null` with an `error` when it could not be reached. `servers` is empty when `server.peer_endpoints` is unset.
 
 On a **replica** the body gains a `replica` object, and only there — a master and a standalone node answer exactly the body above, as they always have:
 ```json

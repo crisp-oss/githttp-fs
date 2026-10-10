@@ -292,6 +292,10 @@ fn build_router(app_state: AppState) -> Router {
         // rather than `get()`, which would implicitly answer HEAD as well —
         // this endpoint is deliberately GET-only.
         .route("/", on(MethodFilter::GET, routes::root::ping))
+        // Broadcast ping: the ping above, sent to this node and to every
+        // `server.peer_endpoints` entry concurrently. A literal two-segment
+        // path no tenant route answers a GET on.
+        .route("/ping/all", on(MethodFilter::GET, routes::root::ping_all))
         // Tenant management
         .route(
             "/{collection_id}/{tenant_id}",

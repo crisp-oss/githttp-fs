@@ -20,6 +20,7 @@
 
 use axum::{extract::State, response::Redirect, Json};
 use serde_json::json;
+use std::time::Duration;
 
 use crate::state::AppState;
 
@@ -73,6 +74,69 @@ pub async fn ping(State(state): State<AppState>) -> Json<serde_json::Value> {
             // story — what is halted and why — is on /v1/_health/replication.
             "sync": state.replica_status.sync_status().as_str(),
         }
+    }))
+}
+
+/// How long a broadcast ping waits on one peer before reporting it
+/// unreachable, so one dead node cannot hold the whole answer open.
+const PING_ALL_TIMEOUT_SECS: u64 = 5;
+
+/// GET /ping/all (relative to the `/v1` nest, i.e. `GET /v1/ping/all`)
+///
+/// Sends the ping above to every `server.peer_endpoints` entry concurrently,
+/// with this node's own API key (a deployment shares one), and reports each
+/// answer next to this node's own. A peer that cannot be reached, or answers
+/// anything but `200`, is reported as such rather than failing the request:
+/// the route is `200` whenever this node is up, and `servers` says who else is.
+pub async fn ping_all(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let Json(own) = ping(State(state.clone())).await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(PING_ALL_TIMEOUT_SECS))
+        .build()
+        .unwrap_or_default();
+
+    let probes = state.config.server.peer_endpoints.iter().map(|endpoint| {
+        let endpoint = endpoint.clone();
+        let request = client
+            .get(endpoint.trim_end_matches('/'))
+            .bearer_auth(&state.config.server.api_key);
+
+        async move {
+            match request.send().await {
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    let body = response.json::<serde_json::Value>().await.ok();
+
+                    json!({
+                        "endpoint": endpoint,
+                        "pong": status == 200,
+                        "status": status,
+                        "response": body,
+                    })
+                }
+                Err(err) => json!({
+                    "endpoint": endpoint,
+                    "pong": false,
+                    "status": null,
+                    "error": err.to_string(),
+                }),
+            }
+        }
+    });
+
+    let mut servers = Vec::new();
+
+    for probe in probes.map(tokio::spawn).collect::<Vec<_>>() {
+        if let Ok(result) = probe.await {
+            servers.push(result);
+        }
+    }
+
+    Json(json!({
+        "pong": true,
+        "self": own,
+        "servers": servers,
     }))
 }
 
