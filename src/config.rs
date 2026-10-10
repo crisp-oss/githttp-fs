@@ -191,13 +191,6 @@ pub struct ServerConfig {
     /// nothing on a listing.
     #[serde(default)]
     pub checkout_files_autoheal: bool,
-    /// The content API endpoints (`…/v1`) of the other nodes in this
-    /// deployment, pinged by `GET /v1/ping/all`. No node otherwise knows its
-    /// peers' content API addresses — a master only sees replicas dial in
-    /// over the replication port — so they are listed here. Defaults to
-    /// empty, which makes that route ping this node alone.
-    #[serde(default)]
-    pub peer_endpoints: Vec<String>,
 }
 
 /// Serde default for a flag whose absence must mean "as it always was".
@@ -274,15 +267,6 @@ impl ServerConfig {
 
         if self.api_key.trim().is_empty() {
             errors.push("server.api_key must not be empty".to_string());
-        }
-
-        for endpoint in &self.peer_endpoints {
-            if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
-                errors.push(format!(
-                    "server.peer_endpoints entry '{}' must start with http:// or https://",
-                    endpoint
-                ));
-            }
         }
 
         if let Some(level) = &self.log_level {

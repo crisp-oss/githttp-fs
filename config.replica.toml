@@ -25,9 +25,6 @@ api_key = "MySecretAPIKey"
 repos_path = "./dev/repositories/replica"
 log_level = "debug"
 
-# The master's content API, pinged by GET /v1/ping/all.
-peer_endpoints = ["http://localhost:5355/v1"]
-
 [limits]
 
 # The only limit a replica reads. POST /batch/files/read is the one

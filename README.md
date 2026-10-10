@@ -119,7 +119,6 @@ Use the sample [config.toml](https://github.com/crisp-oss/githttp-fs/blob/master
 * `log_level` (type: _string_, allowed: `debug`, `info`, `warn`, `error`, default: `info`) — Verbosity of logging, set it to `error` in production
 * `checkout_files` (type: _boolean_, allowed: `true`, `false`, default: `true`) — Whether each tenant's files are kept on the working tree, so a human can `ls` a repository; nothing githttp-fs serves reads them, so turning this off saves the uncompressed size of all content (see [Considerations](CONSIDERATIONS.md#files-on-disk))
 * `checkout_files_autoheal` (type: _boolean_, allowed: `true`, `false`, default: `false`) — Whether startup checks every tenant out to its HEAD, healing files that are missing or stale on disk; opt-in because it walks the whole store and removes files HEAD no longer names, so enable it for one restart after turning `checkout_files` on
-* `peer_endpoints` (type: _array[string]_, allowed: content API endpoints such as `http://replica.internal:5355/v1`, default: `[]`) — The other nodes of this deployment, pinged by `GET /v1/ping/all`
 
 **[limits]**
 
