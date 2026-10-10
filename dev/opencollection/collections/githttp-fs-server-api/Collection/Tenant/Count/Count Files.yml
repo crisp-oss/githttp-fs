@@ -10,7 +10,7 @@ http:
   url: "{{endpoint}}/{{collection}}/{{tenant_id}}/count/files"
   params:
     - name: prefix_path
-      value: /en
+      value: "{{base_path}}"
       description: Scope the count to a sub-directory
       type: query
       disabled: true

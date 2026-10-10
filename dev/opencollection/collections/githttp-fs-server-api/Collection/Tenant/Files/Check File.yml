@@ -7,12 +7,13 @@ info:
 
 http:
   method: HEAD
-  url: "{{endpoint}}/{{collection}}/{{tenant_id}}/files/{{file_path}}?check_prefix_path=true"
+  url: "{{endpoint}}/{{collection}}/{{tenant_id}}/files/{{file_path}}"
   params:
     - name: check_prefix_path
       value: "true"
       description: Count a folder at this path as existing too (default false)
       type: query
+      disabled: true
   auth: inherit
 
 runtime:

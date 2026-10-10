@@ -7,16 +7,18 @@ info:
 
 http:
   method: GET
-  url: "{{endpoint}}/{{collection}}/{{tenant_id}}/files?prefix_path={{base_path}}&maximum_depth=1"
+  url: "{{endpoint}}/{{collection}}/{{tenant_id}}/files"
   params:
     - name: prefix_path
       value: "{{base_path}}"
       description: Scope the listing to a sub-directory
       type: query
+      disabled: true
     - name: maximum_depth
       value: "1"
       description: How many directory levels deep to list
       type: query
+      disabled: true
     - name: include_hidden_files
       value: "true"
       description: Include dot-prefixed entries (default false)

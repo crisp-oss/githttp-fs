@@ -7,16 +7,18 @@ info:
 
 http:
   method: GET
-  url: "{{endpoint}}/{{collection}}/{{tenant_id}}/commits?page=1&per_page=20&include_statistics=true"
+  url: "{{endpoint}}/{{collection}}/{{tenant_id}}/commits"
   params:
     - name: page
       value: "1"
       description: Page number, from 1
       type: query
+      disabled: true
     - name: per_page
       value: "20"
       description: Commits per page (default 100, max 500)
       type: query
+      disabled: true
     - name: file_path
       value: "{{file_path}}"
       description: Only commits touching this file, following renames backward
@@ -26,6 +28,7 @@ http:
       value: "true"
       description: Add per-commit insertion, deletion and files-changed counts
       type: query
+      disabled: true
   auth: inherit
 
 runtime:
