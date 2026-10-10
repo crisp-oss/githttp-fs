@@ -10,6 +10,17 @@ http:
   url: "{{endpoint}}/{{collection}}/{{tenant_id}}/commits/{{commit_sha}}"
   auth: inherit
 
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.sha
+      operator: startsWith
+      value: "{{commit_sha}}"
+    - expression: res.body.files
+      operator: isArray
+
 settings:
   encodeUrl: true
   timeout: 0

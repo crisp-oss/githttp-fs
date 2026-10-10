@@ -10,6 +10,15 @@ http:
   url: "{{endpoint}}"
   auth: inherit
 
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.pong
+      operator: eq
+      value: "true"
+
 settings:
   encodeUrl: true
   timeout: 0

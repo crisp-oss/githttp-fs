@@ -24,6 +24,14 @@ http:
       }
   auth: inherit
 
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.commit_sha
+      operator: isString
+
 settings:
   encodeUrl: true
   timeout: 0

@@ -11,6 +11,18 @@ http:
   url: "{{endpoint}}/_health/status"
   auth: inherit
 
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.status
+      operator: isString
+    - expression: res.body.role
+      operator: isString
+    - expression: res.body.writable
+      operator: isBoolean
+
 settings:
   encodeUrl: true
   timeout: 0

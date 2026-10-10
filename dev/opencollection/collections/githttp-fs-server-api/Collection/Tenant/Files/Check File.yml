@@ -15,6 +15,12 @@ http:
       type: query
   auth: inherit
 
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+
 settings:
   encodeUrl: true
   timeout: 0

@@ -10,6 +10,15 @@ http:
   url: "{{endpoint}}/{{collection}}/{{tenant_id}}"
   auth: inherit
 
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.deleted
+      operator: eq
+      value: "{{tenant_id}}"
+
 settings:
   encodeUrl: true
   timeout: 0

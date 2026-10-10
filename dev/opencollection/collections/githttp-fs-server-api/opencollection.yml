@@ -34,5 +34,6 @@ docs: |-
   - **Optional query parameters** are listed with an illustrative value and disabled. Tick one to send it.
   - **Optional body keys** follow the required ones as `//` comment lines. Uncomment one to send it, and fix up the commas by hand.
   - **Tags** say what a request does to the repository. `read` changes nothing, `write` commits, `destructive` removes content or rewrites it from history (or, for the hook replay, fires webhooks downstream). `public` needs no API key.
+  - **Assertions** check every response's status and documented shape. Run the collection (or the `read` requests only, which are safe against any server) to smoke-test a node.
 
   The `/_replication/*` peer protocol is not part of this collection. It is served on a separate listener behind its own secret.

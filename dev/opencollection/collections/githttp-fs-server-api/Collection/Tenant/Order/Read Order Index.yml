@@ -10,6 +10,17 @@ http:
   url: "{{endpoint}}/{{collection}}/{{tenant_id}}/order/{{directory_path}}"
   auth: inherit
 
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.directory
+      operator: eq
+      value: "{{directory_path}}"
+    - expression: res.body.order
+      operator: isArray
+
 settings:
   encodeUrl: true
   timeout: 0

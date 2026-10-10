@@ -20,6 +20,18 @@ http:
       }
   auth: inherit
 
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.commit_sha
+      operator: isString
+    - expression: res.body.files
+      operator: isNumber
+    - expression: res.body.orders
+      operator: isNumber
+
 settings:
   encodeUrl: true
   timeout: 0

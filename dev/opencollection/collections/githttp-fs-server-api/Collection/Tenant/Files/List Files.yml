@@ -69,6 +69,18 @@ http:
       disabled: true
   auth: inherit
 
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.files
+      operator: isArray
+    - expression: res.body.page
+      operator: isNumber
+    - expression: res.body.has_more
+      operator: isBoolean
+
 settings:
   encodeUrl: true
   timeout: 0

@@ -26,6 +26,20 @@ http:
       disabled: true
   auth: inherit
 
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.path
+      operator: eq
+      value: "{{file_path}}"
+    - expression: res.body.content
+      operator: isString
+    - expression: res.body.position
+      operator: gte
+      value: "-1"
+
 settings:
   encodeUrl: true
   timeout: 0
