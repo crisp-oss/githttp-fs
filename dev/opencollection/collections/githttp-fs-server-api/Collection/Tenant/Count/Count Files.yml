@@ -6,9 +6,6 @@ info:
 http:
   method: GET
   url: "{{endpoint}}/{{collection}}/{{tenant_id}}/count/files"
-  headers:
-    - name: Authorization
-      value: "{{authorization}}"
   params:
     - name: prefix_path
       value: /en

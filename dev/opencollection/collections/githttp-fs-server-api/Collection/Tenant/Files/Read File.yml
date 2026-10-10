@@ -6,9 +6,6 @@ info:
 http:
   method: GET
   url: "{{endpoint}}/{{collection}}/{{tenant_id}}/files/{{file_path}}"
-  headers:
-    - name: Authorization
-      value: "{{authorization}}"
   params:
     - name: seek_from_line_starts_with
       value: '["---", "+++"]'

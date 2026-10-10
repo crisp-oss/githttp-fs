@@ -6,9 +6,6 @@ info:
 http:
   method: GET
   url: "{{endpoint}}"
-  headers:
-    - name: Authorization
-      value: "{{authorization}}"
   auth: inherit
 
 settings:

@@ -6,9 +6,6 @@ info:
 http:
   method: HEAD
   url: "{{endpoint}}/{{collection}}/{{tenant_id}}/files/{{file_path}}?check_prefix_path=true"
-  headers:
-    - name: Authorization
-      value: "{{authorization}}"
   params:
     - name: check_prefix_path
       value: "true"

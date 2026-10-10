@@ -6,9 +6,6 @@ info:
 http:
   method: GET
   url: "{{endpoint}}/{{collection}}/{{tenant_id}}/commits?page=1&per_page=20&include_statistics=true"
-  headers:
-    - name: Authorization
-      value: "{{authorization}}"
   params:
     - name: page
       value: "1"
