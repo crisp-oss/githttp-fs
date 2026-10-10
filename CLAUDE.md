@@ -56,6 +56,7 @@ Rules that hold everywhere, in one line each:
 - A replica never destroys its own data on its own: it locks the repository, raises an issue, and waits for a human.
 - A new default must preserve what a deployment already did; bulk or destructive behaviour is opt-in.
 - Every timestamp on the wire is RFC 3339 and named `*_at`.
+- Any API change in the Rust code is mirrored in `dev/opencollection/` in the same change — new route, new request file; removed route, removed file (see [API client collection](#api-client-collection-opencollection)).
 
 ## Running
 
@@ -122,6 +123,35 @@ reminder that "write-shaped" and "write" are different questions on this API.
 ## Development workflow
 
 After applying code changes, always run `cargo fmt` before `cargo build`.
+
+### API client collection (OpenCollection)
+
+**Every change to the API surface in the Rust code must be mirrored in the OpenCollection YAML in the same change — no exceptions.** This covers any kind of change: a route added, removed, renamed or re-pathed; a method changed; a query parameter, request body field or flag added, removed or renamed; a changed default. Add a new `.yml` request file for a new route, delete the file of a removed route, and edit the existing file for everything else. `API.md` and the collection are updated together; neither is allowed to drift from the code.
+
+The collection lives in `dev/opencollection/` (OpenCollection 1.0.0, opened with Bruno):
+
+```
+dev/opencollection/
+  workspace.yml                              — workspace, points at the one collection
+  collections/githttp-fs-server-api/
+    opencollection.yml                       — collection root: bearer auth from {{api_key}}
+    environments/{Master,Replica}.yml        — {{endpoint}} (…/v1) and the secret {{api_key}}
+    Health/                                  — public /_health/* routes
+    Base/                                    — GET / (ping)
+    Collection/                              — sets {{collection}}
+      Tenant/                                — sets {{tenant_id}}, {{file_path}}, {{author_name}}, …
+        Repository/ Count/ Files/ Order/ Commits/ Batch/
+```
+
+One request per file, named by its Title Case action (`Read File.yml`, `Write Order Index.yml`), in the folder matching its route group. Each folder has a `folder.yml` holding its `info` (`name`, `type: folder`, `seq`) and any shared `request.variables`. **A new `.yml` file is never written from scratch: copy an existing one — a sibling request of the same method, or an existing `folder.yml` for a new folder — and replace only the values that differ.** Bruno writes a set of constant keys into every file (the `settings` block, `auth: inherit`, `request.auth` in folders, and so on) that look redundant because they are identical everywhere, but Bruno relies on them being present. Do not simplify, reorder or drop any key from the copied file, even one that seems to hold only a default. Keep its shape exactly:
+
+- `info`: `name` (same as the file name), `type: http`, and the next free `seq` in its folder — renumber the remaining siblings when one is removed so there are no gaps.
+- `http.url` built from variables only — `{{endpoint}}/{{collection}}/{{tenant_id}}/…` — never a hard-coded host, collection, tenant or path; a new path-shaped value goes into the nearest `folder.yml` as a variable.
+- `http.params`: every supported query parameter is listed, with an illustrative value; optional ones carry `disabled: true`, so the request runs with the defaults and the options are one click away. Keep them in the order `API.md` documents them.
+- `http.body` (`type: json`) for writes, with `author` filled from `{{author_name}}` / `{{author_email}}`, and every optional body flag present.
+- `auth: inherit`, the same `settings` block as its siblings, and a one-line `docs` saying what the route does (noting `(public route)` for health routes).
+
+The `/_replication/*` peer protocol is not in the collection: it is served on a separate listener behind its own secret, and is not part of the client API.
 
 ### Commit messages
 
