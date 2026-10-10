@@ -1,0 +1,6 @@
+name: SSH Tunnel Master
+variables:
+  - name: endpoint
+    value: http://localhost:15355/v1
+  - secret: true
+    name: api_key

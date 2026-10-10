@@ -1,4 +1,4 @@
-name: Replica
+name: SSH Tunnel Replica
 variables:
   - name: endpoint
     value: http://localhost:15365/v1

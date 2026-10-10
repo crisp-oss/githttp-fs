@@ -1,0 +1,6 @@
+name: Local Replica
+variables:
+  - name: endpoint
+    value: http://localhost:5365/v1
+  - secret: true
+    name: api_key

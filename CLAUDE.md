@@ -135,7 +135,9 @@ dev/opencollection/
   workspace.yml                              — workspace, points at the one collection
   collections/githttp-fs-server-api/
     opencollection.yml                       — collection root: bearer auth from {{api_key}}
-    environments/{Master,Replica}.yml        — {{endpoint}} (…/v1) and the secret {{api_key}}
+    environments/                            — {{endpoint}} (…/v1) and the secret {{api_key}}, per role and path:
+      Local {Master,Replica}.yml             —   the dev ports (5355, 5365)
+      SSH Tunnel {Master,Replica}.yml        —   the same nodes forwarded over SSH (15355, 15365)
     Health/                                  — public /_health/* routes
     Base/                                    — GET / (ping)
     Collection/                              — sets {{collection}}

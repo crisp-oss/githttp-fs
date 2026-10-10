@@ -1,6 +1,6 @@
-name: Master
+name: Local Master
 variables:
   - name: endpoint
-    value: http://localhost:15355/v1
+    value: http://localhost:5355/v1
   - secret: true
     name: api_key

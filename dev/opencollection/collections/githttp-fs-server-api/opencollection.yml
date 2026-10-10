@@ -29,7 +29,7 @@ extensions:
 docs: |-
   # githttp-fs Server API
 
-  Every route of the githttp-fs content API, as documented in `API.md`. Pick the **Master** or **Replica** environment and set its secret `api_key`. Every request inherits Bearer auth from it, and only the `Health` routes ignore it. Writes to a replica answer `423`.
+  Every route of the githttp-fs content API, as documented in `API.md`. Pick an environment and set its secret `api_key`: **Local Master** or **Local Replica** for the dev ports (`5355`, `5365`), or **SSH Tunnel Master** or **SSH Tunnel Replica** for the same nodes forwarded over SSH (`15355`, `15365`). Every request inherits Bearer auth from it, and only the `Health` routes ignore it. Writes to a replica answer `423`.
 
   - **Optional query parameters** are listed with an illustrative value and disabled. Tick one to send it.
   - **Optional body keys** follow the required ones as `//` comment lines. Uncomment one to send it, and fix up the commas by hand.
